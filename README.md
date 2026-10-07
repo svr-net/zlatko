@@ -28,6 +28,32 @@ ctest --test-dir build            # or ./build/ccr_tests [name-filter]
 Options: `-DCCR_BUILD_TESTS=OFF` and `-DCCR_BUILD_EXAMPLES=OFF`. `cmake --install` installs the
 headers and a `ccr::ccr` CMake target.
 
+## Docker
+
+The multi-stage `Dockerfile` builds everything from source. Each stage runs its tests, so a successful build means they passed.
+
+```sh
+docker build -t zlatko-ccr .                       # WASM from source + Node checks -> nginx image (default)
+docker run --rm -p 8080:80 zlatko-ccr              # web front end at http://localhost:8080
+
+docker build --target native -t zlatko-ccr:native .   # native C++ build, ctest
+docker run --rm zlatko-ccr:native                     # end-to-end demo
+
+docker build --target e2e .                        # every page in headless Chromium, WebGPU on SwiftShader
+docker build --target wasm-artifacts --output web/wasm .   # export ccr.js / ccr.wasm to the host
+```
+
+| Target | Base image | Contents |
+|---|---|---|
+| `native` | `ubuntu:24.04` | Library, unit tests and demo binary; installed headers and CMake package in `/opt/ccr` |
+| `wasm` | `emscripten/emsdk:4.0.10` | Embind module built from source and checked with `web/tests/wasm.test.mjs` |
+| `wasm-artifacts` | `scratch` | Only `ccr.js` and `ccr.wasm`, for `--output` |
+| `e2e` | `mcr.microsoft.com/playwright` | Browser test of all pages, including GPU-vs-WASM agreement |
+| `web` (default) | `nginx:1.27-alpine` | Static site, about 75 MB; `.wasm` is served as `application/wasm` |
+
+If the network goes through a TLS-intercepting proxy, give the `e2e` stage the proxy's CA so npm can reach the registry:
+`docker build --target e2e --secret id=ca,src=/path/to/ca.pem .`
+
 ## Web front end (WebAssembly + WebGPU)
 
 `web/` contains one interactive page per library context. Each page runs the C++ library compiled to WebAssembly,
@@ -70,7 +96,7 @@ Three compute kernels then run on these tables:
 
 The GPU works in f32 with its own random number generator, so it agrees with WASM within Monte Carlo error. Bermudans need AMC regression and stay in WASM.
 
-**Rebuilding the WASM module.** The built `web/wasm/ccr.{js,wasm}` is committed. To rebuild it with Emscripten:
+**Rebuilding the WASM module.** The built `web/wasm/ccr.{js,wasm}` is committed. Rebuild it with Docker (`--target wasm-artifacts` above), or with a local Emscripten:
 
 ```sh
 emcmake cmake -S . -B build-wasm -DCMAKE_BUILD_TYPE=Release
