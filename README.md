@@ -28,6 +28,57 @@ ctest --test-dir build            # or ./build/ccr_tests [name-filter]
 Options: `-DCCR_BUILD_TESTS=OFF` and `-DCCR_BUILD_EXAMPLES=OFF`. `cmake --install` installs the
 headers and a `ccr::ccr` CMake target.
 
+## Web front end (WebAssembly + WebGPU)
+
+`web/` contains one interactive page per library context. Each page runs the C++ library compiled to WebAssembly,
+and the exposure pipeline also runs as fused WebGPU compute kernels.
+
+```sh
+python3 -m http.server -d web 8000      # any static server; file:// will not load WASM or module workers
+# open http://localhost:8000
+```
+
+| Page | Context | Entry point |
+|---|---|---|
+| `core.html` | Cholesky correlation, regression, time grids, Brent, quantiles | `coreDemo` |
+| `market.html` | Yield curve, CDS pricing, hazard bootstrapping | `marketDemo` |
+| `models.html` | Hull–White, FX/equity, CIR++ fan charts and martingale tests | `simulate` |
+| `instruments.html` | Swaps, forwards, options, Bermudans on scenarios | `priceTrades` |
+| `amc.html` | Longstaff–Schwartz policy, physical vs cash exposure | `amc` |
+| `exposure.html` | EE/ENE/PFE/EPE/EEPE, netting benefit, distribution | `exposure` |
+| `collateral.html` | Thresholds, MTA, independent amount, margin period of risk | `exposure` |
+| `allocation.html` | Marginal (Euler), incremental and standalone CVA | `allocation` |
+| `cva.html` | Unilateral/bilateral CVA, term structure, running spread | `cva` |
+| `wwr.html` | Pathwise CVA against exposure–intensity correlation | `wrongWayRisk` |
+| `hedging.html` | CS01 buckets, CDS hedge, CRN vs independent-seed deltas | `hedging` |
+| `gpu.html` | Fused WebGPU kernels validated against WASM, with a benchmark | `gpuPlan` + `web/js/gpu` |
+
+The pages share one specification: market, models, correlation, portfolio, CSA and simulation settings. You edit it on any
+page, and the browser's local storage keeps it. The WASM module runs in a module worker, so long Monte Carlo runs don't block the page.
+
+**WebGPU fused kernels.** `gpuPlan(spec)` uses the library's own models to compile the netting set into flat tables:
+- exact Hull–White step coefficients;
+- per-date bond terms `A·e^(−Bx)`, fixing records and option terms;
+- the margin-call look-back;
+- the Cholesky factor and the CIR++ shift.
+
+Three compute kernels then run on these tables:
+1. **fused-exposure** runs once per path. It draws counter-based normals, correlates them, steps rates, FX and CIR++,
+   revalues the netting set, applies the CSA and reduces EE/ENE/EE*/pathwise-CVA across the workgroup. It never builds a scenario cube.
+2. **reduce-partials** sums the workgroup results.
+3. **pfe-quantile** builds a histogram per date and reads off the quantile.
+
+The GPU works in f32 with its own random number generator, so it agrees with WASM within Monte Carlo error. Bermudans need AMC regression and stay in WASM.
+
+**Rebuilding the WASM module.** The built `web/wasm/ccr.{js,wasm}` is committed. To rebuild it with Emscripten:
+
+```sh
+emcmake cmake -S . -B build-wasm -DCMAKE_BUILD_TYPE=Release
+cmake --build build-wasm                 # writes web/wasm/ccr.js and ccr.wasm
+node web/tests/wasm.test.mjs             # every entry point plus invariant checks, in Node
+node web/tests/e2e.mjs                   # every page in headless Chromium (Playwright; WebGPU via SwiftShader)
+```
+
 ## How the library maps onto the book
 
 | Topic | Module | What is implemented |

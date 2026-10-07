@@ -51,6 +51,26 @@ elseif(MSVC)
   target_compile_options(ccr PRIVATE /W4)
 endif()
 
+if(EMSCRIPTEN)
+  # WebAssembly build of the library with the Embind wrapper used by the web front end:
+  #   emcmake cmake -S . -B build-wasm && cmake --build build-wasm
+  # produces web/wasm/ccr.js + ccr.wasm.
+  set(CCR_WASM_FLAGS -fwasm-exceptions -msimd128)
+  target_compile_options(ccr PRIVATE ${CCR_WASM_FLAGS})
+  add_executable(ccr_wasm wasm/bindings.cpp)
+  target_compile_options(ccr_wasm PRIVATE ${CCR_WASM_FLAGS})
+  target_link_libraries(ccr_wasm PRIVATE ccr)
+  target_link_options(ccr_wasm PRIVATE
+    -lembind -fwasm-exceptions
+    -sMODULARIZE=1 -sEXPORT_ES6=1 -sEXPORT_NAME=createCcrModule
+    -sALLOW_MEMORY_GROWTH=1 -sENVIRONMENT=web,worker,node)
+  set_target_properties(ccr_wasm PROPERTIES
+    OUTPUT_NAME ccr SUFFIX ".js"
+    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/web/wasm)
+  set(CCR_BUILD_TESTS OFF)
+  set(CCR_BUILD_EXAMPLES OFF)
+endif()
+
 if(CCR_BUILD_TESTS)
   enable_testing()
   add_executable(ccr_tests
