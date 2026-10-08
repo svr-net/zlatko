@@ -1,5 +1,6 @@
 import { run } from '../ccr-client.js';
 import { barChart, fmt, lineChart } from '../charts.js';
+import { engineNote, engineSelector, gpuCva, runWithEngine } from '../gpu/backend.js';
 import { card, grid, initPage, runButton, specEditor, table, tiles } from '../ui.js';
 
 const page = initPage({
@@ -13,8 +14,11 @@ const page = initPage({
 });
 specEditor(page, ['market', 'assets', 'credit', 'own', 'correlation', 'simulation', 'portfolio', 'csa']);
 
-runButton(page, 'Price CVA', async (spec) => {
-  const r = await run('cva', spec);
+const button = runButton(page, 'Price CVA', async (spec) => {
+  const t0 = performance.now();
+  const runResult = await runWithEngine(spec, { wasm: () => run('cva', spec), gpu: () => gpuCva(spec) });
+  const r = runResult.result;
+  window.__ccrEngineRun = { page: 'cva', engine: runResult.engine, cva: r.cva, pathwiseCva: r.pathwiseCva, dva: r.bilateral?.dva };
   const p = r.profile;
   const t = Array.from(p.times);
   tiles(page.content, [
@@ -52,4 +56,6 @@ runButton(page, 'Price CVA', async (spec) => {
     ['CSA', spec.csa.enabled ? 'enabled' : 'none'],
     ['recovery', fmt.pct(spec.credits[spec.counterparty || 0].recovery, 0)],
   ]);
+  return engineNote(runResult, performance.now() - t0);
 });
+engineSelector(page, () => button.click());

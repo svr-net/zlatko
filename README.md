@@ -131,6 +131,8 @@ python3 -m http.server -d web 8000      # any static server; file:// will not lo
 The pages share one specification: market, models, correlation, portfolio, CSA and simulation settings. You edit it on any
 page, and the browser's local storage keeps it. The WASM module runs in a module worker, so long Monte Carlo runs don't block the page.
 
+**Compute engine.** The Exposure, Collateral, CVA/DVA and Wrong-way risk pages have an *Engine* selector: **Auto** (the default) uses the WebGPU kernels on phones and tablets that support WebGPU and WebAssembly elsewhere; **WebGPU** or **WebAssembly** forces one. On the GPU, the kernels compute the exposure profile and pathwise CVA, and the WASM library applies the closed-form CVA/DVA analytics (`cvaFromProfile`), so CVA/DVA and wrong-way risk show the same views on either engine. Views that need individual paths (sample paths, the netting benefit, per-trade profiles, the exposure histogram) are WebAssembly-only. Unsupported portfolios (Bermudans need AMC) and GPU errors fall back to WebAssembly, and the status line names the engine that ran and why.
+
 **WebGPU fused kernels.** `gpuPlan(spec)` uses the library's own models to compile the netting set into flat tables:
 - exact Hull–White step coefficients;
 - per-date bond terms `A·e^(−Bx)`, fixing records and option terms;

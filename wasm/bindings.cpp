@@ -861,55 +861,87 @@ val allocation(val spec) {
 }
 
 // CVA, DVA, term structure, running spread, pathwise CVA.
+// Closed-form CVA analytics on an exposure profile: unilateral CVA and its term structure,
+// bilateral CVA/DVA, running spread and recovery sensitivity. Shared by cva() and
+// cvaFromProfile(), so a profile simulated on the GPU gets exactly the same analytics.
+val cvaAnalytics(const val& spec, const Env& env, const ExposureProfile& profile) {
+  const CreditCurve& cc = env.cptyCurve();
+  const double rec = env.cptyRecovery();
+  const auto& times = profile.times;
+
+  val out = val::object();
+  out.set("profile", profileToJs(profile));
+  out.set("cva", unilateralCva(profile, cc, rec));
+  out.set("termStructure", arr(cvaTermStructure(times, profile.discountedExpectedExposure, cc, rec)));
+  std::vector<double> surv, own;
+  for (double t : times) {
+    surv.push_back(cc.survival(t));
+    if (env.ownCurve) own.push_back(env.ownCurve->survival(t));
+  }
+  out.set("counterpartySurvival", arr(surv));
+  if (env.ownCurve) {
+    const auto b = bilateralCva(profile, cc, rec, *env.ownCurve, env.ownRecovery);
+    val bo = val::object();
+    bo.set("cva", b.cva);
+    bo.set("dva", b.dva);
+    bo.set("total", b.total());
+    out.set("bilateral", bo);
+    out.set("ownSurvival", arr(own));
+  }
+  double maturity = 0.0, notional = 0.0;
+  for (const auto& t : env.trades) {
+    maturity = std::max(maturity, t.trade->maturity());
+    notional = std::max(notional, std::fabs(t.notional));
+  }
+  notional = num(spec, "spreadNotional", notional);
+  if (maturity > 0.0 && notional > 0.0) {
+    out.set("runningSpread", cvaRunningSpread(unilateralCva(profile, cc, rec), *env.domestic, cc, maturity, notional));
+    out.set("spreadNotional", notional);
+    out.set("spreadMaturity", maturity);
+  }
+  // CVA as a function of recovery (linear in LGD under independence).
+  std::vector<double> recs, cvas;
+  for (int i = 0; i <= 10; ++i) {
+    recs.push_back(i / 10.0);
+    cvas.push_back(unilateralCva(profile, cc, recs.back()));
+  }
+  out.set("recoveryGrid", arr(recs));
+  out.set("cvaByRecovery", arr(cvas));
+  return out;
+}
+
+// CVA, DVA, term structure, running spread, pathwise CVA.
 val cva(val spec) {
   return guarded([&] {
     const Env env = parseEnv(spec);
     const ExposureEngine engine(env.generator(), env.sim, env.baseGrid);
     const ExposureResult r = engine.run(env.nettingSet(true), env.pfeQuantile);
-    const CreditCurve& cc = env.cptyCurve();
-    const double rec = env.cptyRecovery();
-    const auto& times = r.profile.times;
-
-    val out = val::object();
-    out.set("profile", profileToJs(r.profile));
-    out.set("cva", unilateralCva(r.profile, cc, rec));
-    out.set("termStructure", arr(cvaTermStructure(times, r.profile.discountedExpectedExposure, cc, rec)));
-    std::vector<double> surv, own;
-    for (double t : times) {
-      surv.push_back(cc.survival(t));
-      if (env.ownCurve) own.push_back(env.ownCurve->survival(t));
-    }
-    out.set("counterpartySurvival", arr(surv));
-    if (env.ownCurve) {
-      const auto b = bilateralCva(r.profile, cc, rec, *env.ownCurve, env.ownRecovery);
-      val bo = val::object();
-      bo.set("cva", b.cva);
-      bo.set("dva", b.dva);
-      bo.set("total", b.total());
-      out.set("bilateral", bo);
-      out.set("ownSurvival", arr(own));
-    }
-    double maturity = 0.0, notional = 0.0;
-    for (const auto& t : env.trades) {
-      maturity = std::max(maturity, t.trade->maturity());
-      notional = std::max(notional, std::fabs(t.notional));
-    }
-    notional = num(spec, "spreadNotional", notional);
-    if (maturity > 0.0 && notional > 0.0) {
-      out.set("runningSpread", cvaRunningSpread(unilateralCva(r.profile, cc, rec), *env.domestic, cc, maturity, notional));
-      out.set("spreadNotional", notional);
-      out.set("spreadMaturity", maturity);
-    }
-    out.set("pathwiseCva", pathwiseCva(r.scenarios, r.exposureValue, env.counterparty, rec, r.reportingIndices));
-    // CVA as a function of recovery (linear in LGD under independence).
-    std::vector<double> recs, cvas;
-    for (int i = 0; i <= 10; ++i) {
-      recs.push_back(i / 10.0);
-      cvas.push_back(unilateralCva(r.profile, cc, recs.back()));
-    }
-    out.set("recoveryGrid", arr(recs));
-    out.set("cvaByRecovery", arr(cvas));
+    val out = cvaAnalytics(spec, env, r.profile);
+    out.set("pathwiseCva", pathwiseCva(r.scenarios, r.exposureValue, env.counterparty, env.cptyRecovery(), r.reportingIndices));
     return out;
+  });
+}
+
+// CVA analytics on an exposure profile computed elsewhere (the WebGPU kernels):
+// spec.profile = { times, ee, ene, pfe, discountedEe, discountedEne, expectedValue }.
+val cvaFromProfile(val spec) {
+  return guarded([&] {
+    const Env env = parseEnv(spec);
+    const val p = spec["profile"];
+    ExposureProfile profile;
+    profile.times = vec(p["times"]);
+    profile.expectedExposure = vec(p["ee"]);
+    profile.expectedNegativeExposure = vec(p["ene"]);
+    profile.discountedExpectedExposure = vec(p["discountedEe"]);
+    profile.discountedExpectedNegativeExposure = vec(p["discountedEne"]);
+    profile.potentialFutureExposure = has(p, "pfe") ? vec(p["pfe"]) : std::vector<double>(profile.times.size(), 0.0);
+    profile.expectedValue = has(p, "expectedValue") ? vec(p["expectedValue"]) : std::vector<double>(profile.times.size(), 0.0);
+    profile.pfeQuantile = env.pfeQuantile;
+    const std::size_t n = profile.times.size();
+    if (n == 0 || profile.expectedExposure.size() != n || profile.discountedExpectedExposure.size() != n ||
+        profile.discountedExpectedNegativeExposure.size() != n || profile.expectedNegativeExposure.size() != n)
+      throw std::invalid_argument("cvaFromProfile: profile arrays must have one value per date");
+    return cvaAnalytics(spec, env, profile);
   });
 }
 
@@ -1252,6 +1284,7 @@ EMSCRIPTEN_BINDINGS(ccr) {
   emscripten::function("exposure", &exposure);
   emscripten::function("allocation", &allocation);
   emscripten::function("cva", &cva);
+  emscripten::function("cvaFromProfile", &cvaFromProfile);
   emscripten::function("wrongWayRisk", &wrongWayRisk);
   emscripten::function("hedging", &hedging);
   emscripten::function("gpuPlan", &gpuPlan);

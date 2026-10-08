@@ -43,6 +43,15 @@ const alloc = run('allocation', () => ccr.allocation(spec));
 if (alloc) near(alloc.trades.reduce((s, t) => s + t.marginalCva, 0), alloc.totalCva, 1e-6 * alloc.totalCva, 'Euler allocation adds up');
 const cva = run('cva', () => ccr.cva(spec));
 if (cva) check(cva.bilateral && cva.bilateral.dva > 0 && cva.cva > 0, 'CVA and DVA positive');
+// The analytics applied to a profile from elsewhere (the WebGPU kernels) must match exactly.
+const fromProfile = cva && run('cvaFromProfile', () => ccr.cvaFromProfile({ ...spec, profile: cva.profile }));
+if (fromProfile) {
+  near(fromProfile.cva, cva.cva, 1e-9 * cva.cva, 'cvaFromProfile CVA');
+  near(fromProfile.bilateral.dva, cva.bilateral.dva, 1e-9 * cva.bilateral.dva, 'cvaFromProfile DVA');
+  near(fromProfile.runningSpread, cva.runningSpread, 1e-15, 'cvaFromProfile running spread');
+}
+check(typeof ccr.cvaFromProfile({ ...spec, profile: { times: [0, 1], ee: [0], ene: [0], discountedEe: [0], discountedEne: [0] } }).error === 'string',
+  'cvaFromProfile rejects mismatched arrays');
 const wwr = run('wrongWayRisk', () => ccr.wrongWayRisk({ ...spec, sim: { ...spec.sim, numPaths: 1000 }, rhos: [-0.5, 0, 0.5] }));
 if (wwr) check(wwr.results[2].pathwiseCva > wwr.results[0].pathwiseCva, 'WWR increases CVA');
 const hedge = run('hedging', () => ccr.hedging({ ...spec, sim: { ...spec.sim, numPaths: 500 }, bumps: [0.02, 0.01] }));

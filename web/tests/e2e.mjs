@@ -19,7 +19,7 @@ const option = (name) => { const i = argv.indexOf(name); return i >= 0 ? argv[i 
 const fileMode = argv.includes('--file');
 const root = path.resolve(option('--root') || path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..'));
 const filter = argv.find((a, i) => !a.startsWith('--') && argv[i - 1] !== '--root');
-const { chromium } = await import(process.env.PLAYWRIGHT_MODULE || 'playwright').catch(() =>
+const { chromium, devices } = await import(process.env.PLAYWRIGHT_MODULE || 'playwright').catch(() =>
   import('/opt/node22/lib/node_modules/playwright/index.mjs'));
 
 const types = { '.html': 'text/html', '.js': 'text/javascript', '.mjs': 'text/javascript', '.css': 'text/css', '.wasm': 'application/wasm', '.png': 'image/png' };
@@ -41,29 +41,42 @@ const browser = await chromium.launch({
 // Small path counts keep the run fast; the pages pick the spec up from localStorage.
 const testSpec = { sim: { numPaths: 1000, seed: 11, antithetic: true } };
 const gpuSpec = { sim: { numPaths: 8000, seed: 11, antithetic: true } };
+const pairSpec = { sim: { numPaths: 4000, seed: 11, antithetic: true } };
 const cases = [
   ...['index', 'core', 'market', 'models', 'instruments', 'amc', 'exposure', 'collateral', 'allocation', 'cva', 'wwr', 'hedging']
     .map((name) => ({ name, file: name, spec: testSpec })),
   { name: 'gpu', file: 'gpu', spec: gpuSpec },
   // Collateralised netting set: exercises the margin-call look-back inside the fused kernel.
   { name: 'gpu-csa', file: 'gpu', spec: { ...gpuSpec, csa: { enabled: true, thresholdCounterparty: 250e3, thresholdOwn: 250e3, mta: 50e3, independentAmount: 0, mpr: 10 / 250 } } },
+  // Engine selector: the Monte Carlo pages forced onto the WebGPU kernels (no silent fallback),
+  // and WASM/GPU pairs at 4,000 paths whose headline numbers must agree within Monte Carlo error.
+  ...['collateral', 'wwr'].map((name) => ({ name: `${name}-gpu`, file: name, spec: testSpec, engine: 'gpu', expectEngine: 'WebGPU' })),
+  ...['exposure', 'cva'].flatMap((name) => [
+    { name: `${name}-wasm-4k`, file: name, spec: pairSpec, engine: 'wasm', expectEngine: 'WebAssembly', pair: name },
+    { name: `${name}-gpu-4k`, file: name, spec: pairSpec, engine: 'gpu', expectEngine: 'WebGPU', pair: name },
+  ]),
+  // A phone: Auto must pick WebGPU, and the collapsed menu must leave the page content in view.
+  { name: 'exposure-mobile', file: 'exposure', spec: testSpec, engine: 'auto', expectEngine: 'WebGPU', device: 'iPhone 14' },
 ];
+const pairs = {};
 let failures = 0;
 console.log(`testing ${root} ${fileMode ? 'from file:// (no server)' : `over ${base}`}`);
 
-for (const { name, file, spec } of cases.filter((c) => !filter || c.name.includes(filter))) {
-  const page = await browser.newPage({ viewport: { width: 1400, height: 1000 } });
+for (const { name, file, spec, engine, expectEngine, pair, device } of cases.filter((c) => !filter || c.name.includes(filter))) {
+  const context = await browser.newContext(device ? { ...devices[device] } : { viewport: { width: 1400, height: 1000 } });
+  const page = await context.newPage();
   const errors = [];
   page.on('pageerror', (e) => errors.push(e.message));
   page.on('console', (m) => { if (m.type() === 'error') errors.push(m.text()); });
   const network = [];
   page.on('request', (r) => { if (!/^(file|data|blob):/.test(r.url())) network.push(r.url()); });
-  await page.addInitScript((spec) => {
+  await page.addInitScript(({ spec, engine }) => {
     if (!sessionStorage.getItem('seeded')) {
       localStorage.setItem('ccr-spec-v1', JSON.stringify(spec));
+      if (engine) localStorage.setItem('ccr-engine', engine); else localStorage.removeItem('ccr-engine');
       sessionStorage.setItem('seeded', '1');
     }
-  }, spec);
+  }, { spec, engine });
   const t0 = Date.now();
   await page.goto(fileMode ? pathToFileURL(path.join(root, `${file}.html`)).href : `${base}/${file}.html`);
   let status = '';
@@ -81,6 +94,20 @@ for (const { name, file, spec } of cases.filter((c) => !filter || c.name.include
   if (/Error|timeout/.test(status)) problems.push('status: ' + status);
   if (charts === 0) problems.push('no charts rendered');
   if (fileMode && network.length) problems.push(`network requests from a file:// page: ${network.slice(0, 3).join(', ')}`);
+  if (expectEngine && !status.includes(`· ${expectEngine}`)) problems.push(`expected the ${expectEngine} engine: ${status}`);
+  if (pair) pairs[pair] = { ...(pairs[pair] || {}), [engine]: await page.evaluate(() => window.__ccrEngineRun) };
+  if (device) {
+    const layout = await page.evaluate(() => ({
+      menuHidden: document.getElementById('nav-links').offsetParent === null,
+      titleTop: document.querySelector('main h1').getBoundingClientRect().top,
+      scrollW: document.documentElement.scrollWidth, width: document.documentElement.clientWidth,
+    }));
+    if (!layout.menuHidden) problems.push('mobile menu is not collapsed');
+    if (layout.titleTop > 200) problems.push(`page title starts ${Math.round(layout.titleTop)}px down: content hidden below the menu`);
+    if (layout.scrollW > layout.width + 1) problems.push(`horizontal scroll on mobile (${layout.scrollW} > ${layout.width})`);
+    await page.click('.menu-toggle');
+    if (await page.evaluate(() => document.getElementById('nav-links').offsetParent === null)) problems.push('menu button does not open the menu');
+  }
   if (file === 'gpu' && !problems.length) {
     const r = await page.evaluate(() => window.__ccrLastRun);
     if (!r) problems.push('no GPU result');
@@ -97,7 +124,19 @@ for (const { name, file, spec } of cases.filter((c) => !filter || c.name.include
   console.log(`${problems.length ? 'FAIL' : 'ok  '} ${name.padEnd(12)} ${String(Date.now() - t0).padStart(6)} ms  charts=${charts}  ${status.trim().slice(0, 90)}`);
   for (const p of problems) console.log('       ' + p);
   failures += problems.length ? 1 : 0;
-  await page.close();
+  await context.close();
+}
+
+// The same spec on both engines: GPU (f32, its own random numbers) and WASM must agree within
+// Monte Carlo error at 4,000 paths.
+const tol = 4 / Math.sqrt(pairSpec.sim.numPaths);
+for (const [name, r] of Object.entries(pairs)) {
+  if (!r.wasm || !r.gpu) continue;
+  const metric = name === 'cva' ? 'cva' : 'eepe1y';
+  const diff = Math.abs(r.gpu[metric] - r.wasm[metric]) / Math.abs(r.wasm[metric]);
+  const ok = diff < tol;
+  console.log(`${ok ? 'ok  ' : 'FAIL'} ${`${name} engines`.padEnd(12)} ${metric}: WASM ${r.wasm[metric].toFixed(0)} vs GPU ${r.gpu[metric].toFixed(0)} (${(100 * diff).toFixed(2)}%, tol ${(100 * tol).toFixed(1)}%)`);
+  if (!ok) failures++;
 }
 
 await browser.close();

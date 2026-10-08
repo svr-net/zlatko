@@ -1,5 +1,6 @@
 import { run } from '../ccr-client.js';
 import { barChart, fmt, lineChart } from '../charts.js';
+import { engineNote, engineSelector, gpuExposure, gpuScopeNote, runWithEngine } from '../gpu/backend.js';
 import { card, grid, initPage, runButton, specEditor, table, toArrays } from '../ui.js';
 
 const page = initPage({
@@ -13,7 +14,8 @@ const page = initPage({
 });
 specEditor(page, ['market', 'assets', 'simulation', 'portfolio', 'csa'], { open: true });
 
-runButton(page, 'Compare CSAs', async (spec) => {
+const button = runButton(page, 'Compare CSAs', async (spec) => {
+  const t0 = performance.now();
   const csa = { ...spec.csa, enabled: true };
   const variants = [
     { name: 'no CSA', csa: { ...csa, enabled: false } },
@@ -22,8 +24,22 @@ runButton(page, 'Compare CSAs', async (spec) => {
     { name: 'MPR 20 days', csa: { ...csa, mpr: 20 / 250 } },
     { name: 'one-way (we never post)', csa: { ...csa, thresholdOwn: -1 } },
   ];
-  const results = [];
-  for (const v of variants) results.push(await run('exposure', { ...spec, csa: v.csa, samplePaths: 12 }));
+  const runResult = await runWithEngine(spec, {
+    wasm: async () => {
+      const out = [];
+      for (const v of variants) out.push(await run('exposure', { ...spec, csa: v.csa, samplePaths: 12 }));
+      return out;
+    },
+    gpu: async () => {
+      const out = [];
+      for (const v of variants) out.push(await gpuExposure({ ...spec, csa: v.csa }));
+      return Object.assign(out, { adapter: out[0].adapter });
+    },
+  });
+  const results = runResult.result;
+  const onGpu = runResult.engine === 'gpu';
+  window.__ccrEngineRun = { page: 'collateral', engine: runResult.engine, eepe1y: results.map((r) => r.profile.eepe1y) };
+  if (onGpu) gpuScopeNote(page.content, 'the sample paths of value and collateral held');
   const t = Array.from(results[0].profile.times);
   const g = grid(page.content);
   lineChart(card(g, 'Expected exposure by CSA', ''), {
@@ -32,11 +48,13 @@ runButton(page, 'Compare CSAs', async (spec) => {
   lineChart(card(g, `PFE ${Math.round(spec.pfeQuantile * 100)}% by CSA`, ''), {
     x: t, xLabel: 't (years)', series: results.map((r, i) => ({ name: variants[i].name, y: Array.from(r.profile.pfe), colorIndex: i })),
   });
-  const sc = results[1];
-  lineChart(card(g, 'Specified CSA: value vs collateral held', 'Sample paths of the netted value (grey) and the median collateral held with its 5–95% band.'), {
-    x: t, xLabel: 't (years)', zero: true, samples: toArrays(sc.nettedSamples),
-    series: [{ name: 'collateral median, 5–95%', y: Array.from(sc.collateralBands[1]), band: { lower: Array.from(sc.collateralBands[0]), upper: Array.from(sc.collateralBands[2]) }, colorIndex: 1 }],
-  });
+  if (!onGpu) {
+    const sc = results[1];
+    lineChart(card(g, 'Specified CSA: value vs collateral held', 'Sample paths of the netted value (grey) and the median collateral held with its 5–95% band.'), {
+      x: t, xLabel: 't (years)', zero: true, samples: toArrays(sc.nettedSamples),
+      series: [{ name: 'collateral median, 5–95%', y: Array.from(sc.collateralBands[1]), band: { lower: Array.from(sc.collateralBands[0]), upper: Array.from(sc.collateralBands[2]) }, colorIndex: 1 }],
+    });
+  }
   barChart(card(g, 'Effective EPE (1y) and peak PFE', ''), {
     labels: variants.map((v) => v.name),
     series: [{ name: 'EEPE (1y)', values: results.map((r) => r.profile.eepe1y) }, { name: 'peak PFE', values: results.map((r) => r.profile.maxPfe), colorIndex: 1 }],
@@ -48,4 +66,6 @@ runButton(page, 'Compare CSAs', async (spec) => {
       c.enabled ? fmt.compact(c.mta) : '–', c.enabled ? fmt.num(c.mpr * 250) : '–', fmt.compact(r.profile.eepe1y), fmt.compact(r.profile.maxPfe),
       fmt.pct(r.profile.eepe1y / results[0].profile.eepe1y, 1)];
   }));
+  return engineNote(runResult, performance.now() - t0);
 });
+engineSelector(page, () => button.click());

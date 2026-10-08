@@ -150,9 +150,14 @@ export function summarise(plan, sums, pfe, gpuMs) {
   profile.effectiveEe = profile.ee.map((v) => (running = Math.max(running, v)));
   profile.epe1y = timeAverage(times, profile.ee, 1);
   profile.eepe1y = timeAverage(times, profile.effectiveEe, 1);
+  profile.epeLife = timeAverage(times, profile.ee, times[times.length - 1]);
   profile.maxPfe = Math.max(...profile.pfe);
+  profile.pfeQuantile = plan.pfeQuantile;
 
   const surv = rep.map((j) => plan.marketSurvival[j]);
+  profile.marketSurvival = surv;
+  // Per-date pathwise CVA increments E[1/2 (D V+_{k-1} + D V+_k) (Q_{k-1} - Q_k)], before the LGD factor.
+  profile.cvaIncrements = pick(5);
   let cva = 0;
   for (let k = 1; k < rep.length; k++)
     cva += (1 - plan.recovery) * 0.5 * (profile.discountedEe[k - 1] + profile.discountedEe[k]) * (surv[k - 1] - surv[k]);
