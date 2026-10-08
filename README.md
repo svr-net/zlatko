@@ -43,6 +43,8 @@ headers and a `ccr::ccr` CMake target.
 | `e2e` | Every page in headless Chromium (WebGPU on SwiftShader): dev site over HTTP, standalone from `file://` and over HTTP. Screenshots are uploaded as an artifact |
 | `docker` | `native` and `web` images with BuildKit layer caching, plus a smoke test of the nginx image |
 
+Releases: push a tag that matches the CMake project version (`git tag v0.1.0 && git push origin v0.1.0`). `.github/workflows/release.yml` runs the full CI on the tag, then publishes a GitHub release with `zlatko-ccr-standalone-<tag>.zip` and its SHA-256.
+
 ## Standalone, copy-deployable build
 
 `tools/standalone/build.mjs` turns `web/` into one folder of static files that runs anywhere you copy it.
