@@ -6,8 +6,32 @@
 // back two arrays, which go back to the library (gpuAnalyse) for all post-processing.
 
 // Adapter requests, in order. Some mobile drivers (seen on Android) return no adapter for a
-// high-performance request but do for a plain one, so a null answer is not final.
-const ADAPTER_OPTIONS = [{ powerPreference: 'high-performance' }, {}, { powerPreference: 'low-power' }];
+// high-performance request but do for a plain one, so a null answer is not final. The last
+// request asks for a WebGPU *compatibility* adapter: where Chrome cannot offer core WebGPU
+// (seen on Android with an OpenGL compositor and a blocklisted Vulkan/GL interop) it may still
+// offer WebGPU on OpenGL ES in compatibility mode, which is enough for compute kernels.
+const ADAPTER_OPTIONS = [
+  { powerPreference: 'high-performance' },
+  {},
+  { powerPreference: 'low-power' },
+  { featureLevel: 'compatibility', compatibilityMode: true },
+];
+
+// What the fused kernels need beyond the compatibility-mode defaults: 7 storage buffers in the
+// fused kernel, 256-invocation workgroups in pfe-quantile and its 13 KiB histogram.
+const KERNEL_LIMITS = {
+  maxStorageBuffersPerShaderStage: 7,
+  maxComputeInvocationsPerWorkgroup: 256,
+  maxComputeWorkgroupSizeX: 256,
+  maxComputeWorkgroupStorageSize: 13316,
+};
+
+/** The kernel limits this adapter cannot meet, e.g. ["maxStorageBuffersPerShaderStage 4 < 7"]. */
+export function missingLimits(adapter) {
+  return Object.entries(KERNEL_LIMITS)
+    .filter(([k, need]) => !(adapter.limits[k] >= need))
+    .map(([k, need]) => `${k} ${adapter.limits[k]} < ${need}`);
+}
 
 /** Why WebGPU cannot start here, with what the user can check. */
 export function noAdapterReason() {
@@ -20,22 +44,29 @@ export function noAdapterReason() {
 
 async function requestAdapter() {
   if (!('gpu' in navigator)) throw new Error('WebGPU is not available in this browser');
+  const tooLimited = [];
   for (const options of ADAPTER_OPTIONS) {
     const adapter = await navigator.gpu.requestAdapter(options).catch(() => null);
-    if (adapter) return adapter;
+    if (!adapter) continue;
+    const missing = missingLimits(adapter);
+    if (!missing.length) return { adapter, compatibility: 'featureLevel' in options };
+    tooLimited.push(missing.join(', '));
   }
+  if (tooLimited.length) throw new Error(`WebGPU adapter too limited for the kernels (${tooLimited[0]})`);
   throw new Error(noAdapterReason());
 }
 
-// The largest buffers the adapter allows; if the device refuses them, fall back to the defaults.
+// Ask for the adapter's own limits where the kernels need more than the defaults (required in
+// compatibility mode) and for its largest buffers; without the large buffers if refused.
 async function requestDevice(adapter) {
   const lim = adapter.limits;
+  const needed = Object.fromEntries(Object.keys(KERNEL_LIMITS).map((k) => [k, lim[k]]));
   try {
     return await adapter.requestDevice({
-      requiredLimits: { maxStorageBufferBindingSize: lim.maxStorageBufferBindingSize, maxBufferSize: lim.maxBufferSize },
+      requiredLimits: { ...needed, maxStorageBufferBindingSize: lim.maxStorageBufferBindingSize, maxBufferSize: lim.maxBufferSize },
     });
   } catch (_) {
-    return adapter.requestDevice();
+    return adapter.requestDevice({ requiredLimits: needed });
   }
 }
 
@@ -52,6 +83,7 @@ export async function probeAdapters() {
         entry.adapter = [info.vendor, info.architecture, info.device, info.description].filter(Boolean).join(' · ') || 'adapter (no info)';
         entry.maxStorageBufferBindingSize = a.limits.maxStorageBufferBindingSize;
         entry.maxComputeWorkgroupStorageSize = a.limits.maxComputeWorkgroupStorageSize;
+        entry.missing = missingLimits(a);
       } else entry.adapter = null;
     } catch (e) {
       entry.error = e.message;
@@ -63,18 +95,18 @@ export async function probeAdapters() {
 
 export class GpuEngine {
   static async create(kernels) {
-    const adapter = await requestAdapter();
+    const { adapter, compatibility } = await requestAdapter();
     const device = await requestDevice(adapter);
-    const engine = new GpuEngine(adapter, device);
+    const engine = new GpuEngine(adapter, device, compatibility);
     await engine.compile(kernels);
     return engine;
   }
 
-  constructor(adapter, device) {
+  constructor(adapter, device, compatibility = false) {
     this.adapter = adapter;
     this.device = device;
     this.info = adapter.info || {};
-    this.name = [this.info.vendor, this.info.architecture].filter(Boolean).join(' ') || 'GPU';
+    this.name = ([this.info.vendor, this.info.architecture].filter(Boolean).join(' ') || 'GPU') + (compatibility ? ', compatibility mode' : '');
     device.lost.then((info) => { this.lost = info; });
   }
 
