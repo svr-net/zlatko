@@ -74,6 +74,7 @@ jobs:
             Unzip it anywhere and open `index.html`. It needs no server and no install, because the WebAssembly library is embedded in the bundle.
             The same folder can be uploaded unchanged to any static host (S3, GitHub Pages, nginx, IIS).
             It has 13 pages, one per library context: market data, risk-factor models, instruments, American Monte Carlo, exposure and netting, collateral, allocation, CVA/DVA, wrong-way risk, hedging, and the WebGPU fused kernels.
+            The Monte Carlo pages run on the fused WebGPU kernels whenever the browser supports WebGPU (the *Auto* engine), and on WebAssembly otherwise.
             Verify the download with the attached `.sha256` file.
 
             ### From source

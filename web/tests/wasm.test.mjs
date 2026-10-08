@@ -18,7 +18,9 @@ function run(name, fn) {
   return r;
 }
 
-run('version', () => ccr.version());
+const ver = run('version', () => ccr.version());
+const cmakeVersion = (await import('node:fs')).readFileSync(new URL('../../CMakeLists.txt', import.meta.url), 'utf8').match(/^\s*VERSION ([0-9.]+)$/m)[1];
+if (ver) check(ver.library === `zlatko ccr ${cmakeVersion}`, `version() reports the CMake project version: ${ver.library}`);
 const core = run('coreDemo', () => ccr.coreDemo({ ...spec, regression: { points: 300, noise: 0.2 } }));
 if (core) {
   near(core.brent.impliedVol, core.brent.trueVol, 1e-10, 'Brent implied vol');

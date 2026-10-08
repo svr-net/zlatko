@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.16)
 
 project(zlatko_ccr
-  VERSION 0.1.0
+  VERSION 0.2.0
   DESCRIPTION "Modelling, pricing and hedging counterparty credit exposure"
   LANGUAGES CXX)
 
@@ -62,6 +62,7 @@ if(EMSCRIPTEN)
   target_compile_options(ccr PRIVATE ${CCR_WASM_FLAGS})
   add_executable(ccr_wasm wasm/bindings.cpp)
   target_compile_options(ccr_wasm PRIVATE ${CCR_WASM_FLAGS})
+  target_compile_definitions(ccr_wasm PRIVATE CCR_VERSION="${PROJECT_VERSION}")
   target_link_libraries(ccr_wasm PRIVATE ccr)
   target_link_options(ccr_wasm PRIVATE
     -lembind -fwasm-exceptions
