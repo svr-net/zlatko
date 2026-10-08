@@ -61,6 +61,10 @@ const cases = [
     { name: `${name}-wasm-pair`, file: name, spec: pairSpec, engine: 'wasm', expectEngine: 'WebAssembly', pair: name },
     { name: `${name}-gpu-pair`, file: name, spec: pairSpec, engine: 'gpu', expectEngine: 'WebGPU', pair: name },
   ]),
+  // Android drivers: no adapter for a high-performance request but one for a plain request
+  // (Auto must still reach WebGPU), and no adapter at all (WebAssembly, with the reason).
+  { name: 'exposure-android-quirk', file: 'exposure', spec: testSpec, engine: 'auto', expectEngine: 'WebGPU', gpuStub: 'no-high-performance', device: 'Pixel 7' },
+  { name: 'exposure-no-adapter', file: 'exposure', spec: testSpec, engine: 'auto', expectEngine: 'WebAssembly', gpuStub: 'no-adapter', expectReason: 'WebGPU unavailable' },
   // A phone: Auto must pick WebGPU, and the collapsed menu must leave the page content in view.
   { name: 'exposure-mobile', file: 'exposure', spec: testSpec, engine: 'auto', expectEngine: 'WebGPU', device: 'iPhone 14' },
 ];
@@ -68,7 +72,7 @@ const pairs = {};
 let failures = 0;
 console.log(`testing ${root} ${fileMode ? 'from file:// (no server)' : `over ${base}`}`);
 
-for (const { name, file, spec, engine, expectEngine, pair, device } of cases.filter((c) => !filter || c.name.includes(filter))) {
+for (const { name, file, spec, engine, expectEngine, pair, device, gpuStub, expectReason } of cases.filter((c) => !filter || c.name.includes(filter))) {
   const context = await browser.newContext(device ? { ...devices[device] } : { viewport: { width: 1400, height: 1000 } });
   const page = await context.newPage();
   const errors = [];
@@ -76,6 +80,13 @@ for (const { name, file, spec, engine, expectEngine, pair, device } of cases.fil
   page.on('console', (m) => { if (m.type() === 'error') errors.push(m.text()); });
   const network = [];
   page.on('request', (r) => { if (!/^(file|data|blob):/.test(r.url())) network.push(r.url()); });
+  if (gpuStub) await page.addInitScript((stub) => {
+    const gpu = navigator.gpu;
+    if (!gpu) return;
+    const original = gpu.requestAdapter.bind(gpu);
+    gpu.requestAdapter = (options = {}) =>
+      stub === 'no-adapter' || options.powerPreference === 'high-performance' ? Promise.resolve(null) : original(options);
+  }, gpuStub);
   await page.addInitScript(({ spec, engine }) => {
     if (!sessionStorage.getItem('seeded')) {
       localStorage.setItem('ccr-spec-v1', JSON.stringify(spec));
@@ -101,6 +112,7 @@ for (const { name, file, spec, engine, expectEngine, pair, device } of cases.fil
   if (charts === 0) problems.push('no charts rendered');
   if (fileMode && network.length) problems.push(`network requests from a file:// page: ${network.slice(0, 3).join(', ')}`);
   if (expectEngine && !status.includes(`· ${expectEngine}`)) problems.push(`expected the ${expectEngine} engine: ${status}`);
+  if (expectReason && !status.includes(expectReason)) problems.push(`expected the reason "${expectReason}": ${status}`);
   // The status line is not enough: the fused kernels must really have been dispatched on WebGPU
   // (and never when WebAssembly ran).
   const gpuRuns = await page.evaluate(() => globalThis.__ccrGpuRuns || 0);
@@ -118,6 +130,10 @@ for (const { name, file, spec, engine, expectEngine, pair, device } of cases.fil
     if (layout.scrollW > layout.width + 1) problems.push(`horizontal scroll on mobile (${layout.scrollW} > ${layout.width})`);
     await page.click('.menu-toggle');
     if (await page.evaluate(() => document.getElementById('nav-links').offsetParent === null)) problems.push('menu button does not open the menu');
+  }
+  if (file === 'gpu') {
+    const probe = await page.waitForFunction(() => window.__ccrWebGpuProbe, null, { timeout: 30000 }).then((h) => h.jsonValue()).catch(() => null);
+    if (!probe || !probe.adapters.some((a) => a.adapter)) problems.push(`WebGPU diagnostics found no adapter: ${JSON.stringify(probe)}`);
   }
   if (file === 'gpu' && !problems.length) {
     const r = await page.evaluate(() => window.__ccrLastRun);

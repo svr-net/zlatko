@@ -60,6 +60,8 @@ export async function runAnalysis(analysis, spec) {
     return { ...g, engine: 'gpu', reason: mode === 'auto' ? 'Auto: WebGPU available' : 'WebGPU selected' };
   } catch (e) {
     console.warn('WebGPU run failed, falling back to WebAssembly:', e);
+    // No adapter is a property of the device, not a failure of the run: say so plainly.
+    if (/no WebGPU adapter/.test(e.message)) return wasm(`WebGPU unavailable: ${e.message.replace('no WebGPU adapter: ', '')}`);
     return wasm(`WebGPU failed (${e.message}); used WebAssembly`);
   }
 }
