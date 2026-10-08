@@ -1,5 +1,7 @@
 # zlatko — counterparty credit exposure library
 
+[![CI](https://github.com/svr-net/zlatko/actions/workflows/ci.yml/badge.svg)](https://github.com/svr-net/zlatko/actions/workflows/ci.yml)
+
 A C++17 library that models the techniques in
 
 > G. Cesari, J. Aquilina, N. Charpillon, Z. Filipović, G. Lee, I. Manda,
@@ -27,6 +29,19 @@ ctest --test-dir build            # or ./build/ccr_tests [name-filter]
 
 Options: `-DCCR_BUILD_TESTS=OFF` and `-DCCR_BUILD_EXAMPLES=OFF`. `cmake --install` installs the
 headers and a `ccr::ccr` CMake target.
+
+## Continuous integration
+
+`.github/workflows/ci.yml` runs on pushes to `main`, on pull requests and on manual dispatch:
+
+| Job | What it checks |
+|---|---|
+| `native (gcc)`, `native (clang)` | Release build with warnings as errors, `ctest`, example program |
+| `native (ASan + UBSan)` | Debug build with address and undefined-behaviour sanitizers, `ctest` |
+| `wasm` | Embind module built in `emscripten/emsdk:4.0.10`. Runs the Node checks of every entry point, and fails if the committed `web/wasm/` is out of date |
+| `standalone` | Copy-deployable site and zip, uploaded as the `zlatko-ccr-standalone` artifact |
+| `e2e` | Every page in headless Chromium (WebGPU on SwiftShader): dev site over HTTP, standalone from `file://` and over HTTP. Screenshots are uploaded as an artifact |
+| `docker` | `native` and `web` images with BuildKit layer caching, plus a smoke test of the nginx image |
 
 ## Standalone, copy-deployable build
 
