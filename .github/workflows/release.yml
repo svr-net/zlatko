@@ -1,11 +1,13 @@
 name: Release
 
-# Push a tag matching the CMake project version (e.g. v0.1.0) to publish a GitHub release
-# with the copy-deployable standalone site. The full CI runs first on the tagged commit;
-# the zip attached to the release is the one CI built and tested.
+# Publishes a GitHub release with the copy-deployable standalone site, either by pushing a
+# tag that matches the CMake project version (e.g. v0.1.0), or by running this workflow
+# manually on main, which creates that tag on the tested commit. Either way the full CI runs
+# first, and the zip attached to the release is the one CI built and tested.
 on:
   push:
     tags: ['v*']
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -21,37 +23,54 @@ jobs:
       contents: write
     steps:
       - uses: actions/checkout@v4
-      - name: Tag matches the project version
+      - name: Resolve the release tag
+        id: tag
         run: |
           version=$(sed -n 's/^ *VERSION \([0-9][0-9.]*\)$/\1/p' CMakeLists.txt | head -n 1)
-          if [ "v${version}" != "${GITHUB_REF_NAME}" ]; then
+          tag="v${version}"
+          if [ "${GITHUB_EVENT_NAME}" = "push" ] && [ "${GITHUB_REF_NAME}" != "${tag}" ]; then
             echo "::error::Tag ${GITHUB_REF_NAME} does not match project VERSION ${version} in CMakeLists.txt"
             exit 1
           fi
+          if [ "${GITHUB_EVENT_NAME}" = "workflow_dispatch" ]; then
+            if [ "${GITHUB_REF}" != "refs/heads/main" ]; then
+              echo "::error::Manual releases run from main only (got ${GITHUB_REF})"
+              exit 1
+            fi
+            if git ls-remote --exit-code --tags origin "refs/tags/${tag}" >/dev/null; then
+              echo "::error::Tag ${tag} already exists: bump VERSION in CMakeLists.txt for a new release"
+              exit 1
+            fi
+          fi
+          echo "tag=${tag}" >> "$GITHUB_OUTPUT"
       - uses: actions/download-artifact@v4
         with:
           name: zlatko-ccr-standalone
           path: dist
       - name: Package release assets
+        env:
+          TAG: ${{ steps.tag.outputs.tag }}
         run: |
           cd dist
-          asset="zlatko-ccr-standalone-${GITHUB_REF_NAME}.zip"
+          asset="zlatko-ccr-standalone-${TAG}.zip"
           mv zlatko-ccr-standalone.zip "${asset}"
           sha256sum "${asset}" > "${asset}.sha256"
           cat "${asset}.sha256"
       - name: Publish GitHub release
         uses: softprops/action-gh-release@v2
         with:
-          name: zlatko CCR ${{ github.ref_name }}
+          tag_name: ${{ steps.tag.outputs.tag }}
+          target_commitish: ${{ github.sha }}
+          name: zlatko CCR ${{ steps.tag.outputs.tag }}
           generate_release_notes: true
           fail_on_unmatched_files: true
           files: |
-            dist/zlatko-ccr-standalone-${{ github.ref_name }}.zip
-            dist/zlatko-ccr-standalone-${{ github.ref_name }}.zip.sha256
+            dist/zlatko-ccr-standalone-${{ steps.tag.outputs.tag }}.zip
+            dist/zlatko-ccr-standalone-${{ steps.tag.outputs.tag }}.zip.sha256
           body: |
             Counterparty credit exposure library (C++17), modelling *Modelling, Pricing, and Hedging Counterparty Credit Exposure* (Cesari et al., Springer 2009), with a WebAssembly + WebGPU front end.
 
-            ### Standalone site: `zlatko-ccr-standalone-${{ github.ref_name }}.zip`
+            ### Standalone site: `zlatko-ccr-standalone-${{ steps.tag.outputs.tag }}.zip`
             Unzip it anywhere and open `index.html`. It needs no server and no install, because the WebAssembly library is embedded in the bundle.
             The same folder can be uploaded unchanged to any static host (S3, GitHub Pages, nginx, IIS).
             It has 13 pages, one per library context: market data, risk-factor models, instruments, American Monte Carlo, exposure and netting, collateral, allocation, CVA/DVA, wrong-way risk, hedging, and the WebGPU fused kernels.
