@@ -337,7 +337,7 @@ ExposureProfile profileOn(const ExposureResult& r, const Matrix& values, double 
 
 val version() {
   val o = val::object();
-  o.set("library", std::string("zlatko ccr 0.1.0"));
+  o.set("library", std::string("zlatko ccr ") + CCR_VERSION);  // from the CMake project VERSION
   o.set("wasm", true);
   return o;
 }
