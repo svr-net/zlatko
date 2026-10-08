@@ -924,24 +924,27 @@ val cva(val spec) {
 
 // CVA analytics on an exposure profile computed elsewhere (the WebGPU kernels):
 // spec.profile = { times, ee, ene, pfe, discountedEe, discountedEne, expectedValue }.
+ExposureProfile profileFromJs(const val& p, double pfeQuantile, const char* caller) {
+  ExposureProfile profile;
+  profile.times = vec(p["times"]);
+  profile.expectedExposure = vec(p["ee"]);
+  profile.expectedNegativeExposure = vec(p["ene"]);
+  profile.discountedExpectedExposure = vec(p["discountedEe"]);
+  profile.discountedExpectedNegativeExposure = vec(p["discountedEne"]);
+  profile.potentialFutureExposure = has(p, "pfe") ? vec(p["pfe"]) : std::vector<double>(profile.times.size(), 0.0);
+  profile.expectedValue = has(p, "expectedValue") ? vec(p["expectedValue"]) : std::vector<double>(profile.times.size(), 0.0);
+  profile.pfeQuantile = pfeQuantile;
+  const std::size_t n = profile.times.size();
+  if (n == 0 || profile.expectedExposure.size() != n || profile.discountedExpectedExposure.size() != n ||
+      profile.discountedExpectedNegativeExposure.size() != n || profile.expectedNegativeExposure.size() != n)
+    throw std::invalid_argument(std::string(caller) + ": profile arrays must have one value per date");
+  return profile;
+}
+
 val cvaFromProfile(val spec) {
   return guarded([&] {
     const Env env = parseEnv(spec);
-    const val p = spec["profile"];
-    ExposureProfile profile;
-    profile.times = vec(p["times"]);
-    profile.expectedExposure = vec(p["ee"]);
-    profile.expectedNegativeExposure = vec(p["ene"]);
-    profile.discountedExpectedExposure = vec(p["discountedEe"]);
-    profile.discountedExpectedNegativeExposure = vec(p["discountedEne"]);
-    profile.potentialFutureExposure = has(p, "pfe") ? vec(p["pfe"]) : std::vector<double>(profile.times.size(), 0.0);
-    profile.expectedValue = has(p, "expectedValue") ? vec(p["expectedValue"]) : std::vector<double>(profile.times.size(), 0.0);
-    profile.pfeQuantile = env.pfeQuantile;
-    const std::size_t n = profile.times.size();
-    if (n == 0 || profile.expectedExposure.size() != n || profile.discountedExpectedExposure.size() != n ||
-        profile.discountedExpectedNegativeExposure.size() != n || profile.expectedNegativeExposure.size() != n)
-      throw std::invalid_argument("cvaFromProfile: profile arrays must have one value per date");
-    return cvaAnalytics(spec, env, profile);
+    return cvaAnalytics(spec, env, profileFromJs(spec["profile"], env.pfeQuantile, "cvaFromProfile"));
   });
 }
 
@@ -997,50 +1000,70 @@ val wrongWayRisk(val spec) {
 }
 
 // CVA hedging: CS01 buckets and CDS hedge, market deltas with/without common random numbers.
+// Credit hedging of CVA for a given exposure profile: bucketed CS01, the CDS hedge Jacobian and
+// notionals, and the P&L of the hedged and unhedged CVA under random spread scenarios.
+val creditHedges(const val& spec, const Env& env, const ExposureProfile& profile) {
+  const auto& quotes = env.creditQuotes.at(env.counterparty);
+  const double rec = env.cptyRecovery();
+  auto cvaOf = [&](const CreditCurve& c) { return unilateralCva(profile, c, rec); };
+
+  val out = val::object();
+  out.set("cva", cvaOf(env.cptyCurve()));
+  const auto cs01 = creditSpreadSensitivities(cvaOf, *env.domestic, quotes, rec);
+  const Matrix jac = cdsHedgeJacobian(*env.domestic, quotes, rec);
+  const auto notionals = cdsHedgeNotionals(cs01, jac);
+  std::vector<double> mats;
+  for (const auto& q : quotes) mats.push_back(q.maturity);
+  out.set("maturities", arr(mats));
+  out.set("cs01", arr(cs01));
+  out.set("jacobian", matrixToJs(jac));
+  out.set("hedgeNotionals", arr(notionals));
+
+  // Hedge effectiveness under random spread scenarios.
+  NormalGenerator rng(env.sim.seed + 1000);
+  const CreditCurve base = env.cptyCurve();
+  const double baseCva = cvaOf(base);
+  std::vector<double> unhedged, hedged;
+  const double shockBp = num(spec, "spreadShockBp", 10.0);
+  for (int n = 0; n < 60; ++n) {
+    auto moved = quotes;
+    const double parallel = rng.next();
+    for (auto& q : moved) q.spread = std::max(q.spread + 1e-4 * shockBp * (0.7 * parallel + 0.3 * rng.next()), 1e-5);
+    const CreditCurve curve = bootstrapCreditCurve(*env.domestic, moved, rec);
+    const double dCva = cvaOf(curve) - baseCva;
+    double dHedge = 0.0;
+    for (std::size_t k = 0; k < quotes.size(); ++k) {
+      const CreditDefaultSwap cds(quotes[k].maturity, quotes[k].spread, notionals[k], rec);
+      dHedge += cds.npv(*env.domestic, curve) - cds.npv(*env.domestic, base);
+    }
+    unhedged.push_back(-dCva);  // our P&L: CVA is a liability
+    hedged.push_back(-dCva + dHedge);
+  }
+  out.set("pnlUnhedged", arr(unhedged));
+  out.set("pnlHedged", arr(hedged));
+  return out;
+}
+
+// The credit part of hedging() for a profile simulated elsewhere (the WebGPU kernels).
+val creditHedgingFromProfile(val spec) {
+  return guarded([&] {
+    const Env env = parseEnv(spec);
+    val out = creditHedges(spec, env, profileFromJs(spec["profile"], env.pfeQuantile, "creditHedgingFromProfile"));
+    std::vector<double> carry;
+    for (const auto& a : env.assets) carry.push_back(a->carryCurve().discount(env.baseGrid.horizon()));
+    out.set("carryDiscountAtHorizon", arr(carry));
+    return out;
+  });
+}
+
 val hedging(val spec) {
   return guarded([&] {
     const Env env = parseEnv(spec);
     const ExposureEngine engine(env.generator(), env.sim, env.baseGrid);
     const NettingSet ns = env.nettingSet(true);
     const ExposureProfile profile = engine.run(ns, env.pfeQuantile).profile;
-    const auto& quotes = env.creditQuotes.at(env.counterparty);
     const double rec = env.cptyRecovery();
-    auto cvaOf = [&](const CreditCurve& c) { return unilateralCva(profile, c, rec); };
-
-    val out = val::object();
-    out.set("cva", cvaOf(env.cptyCurve()));
-    const auto cs01 = creditSpreadSensitivities(cvaOf, *env.domestic, quotes, rec);
-    const Matrix jac = cdsHedgeJacobian(*env.domestic, quotes, rec);
-    const auto notionals = cdsHedgeNotionals(cs01, jac);
-    std::vector<double> mats;
-    for (const auto& q : quotes) mats.push_back(q.maturity);
-    out.set("maturities", arr(mats));
-    out.set("cs01", arr(cs01));
-    out.set("jacobian", matrixToJs(jac));
-    out.set("hedgeNotionals", arr(notionals));
-
-    // Hedge effectiveness under random spread scenarios.
-    NormalGenerator rng(env.sim.seed + 1000);
-    const CreditCurve base = env.cptyCurve();
-    const double baseCva = cvaOf(base);
-    std::vector<double> unhedged, hedged;
-    const double shockBp = num(spec, "spreadShockBp", 10.0);
-    for (int n = 0; n < 60; ++n) {
-      auto moved = quotes;
-      const double parallel = rng.next();
-      for (auto& q : moved) q.spread = std::max(q.spread + 1e-4 * shockBp * (0.7 * parallel + 0.3 * rng.next()), 1e-5);
-      const CreditCurve curve = bootstrapCreditCurve(*env.domestic, moved, rec);
-      const double dCva = cvaOf(curve) - baseCva;
-      double dHedge = 0.0;
-      for (std::size_t k = 0; k < quotes.size(); ++k) {
-        const CreditDefaultSwap cds(quotes[k].maturity, quotes[k].spread, notionals[k], rec);
-        dHedge += cds.npv(*env.domestic, curve) - cds.npv(*env.domestic, base);
-      }
-      unhedged.push_back(-dCva);  // our P&L: CVA is a liability
-      hedged.push_back(-dCva + dHedge);
-    }
-    out.set("pnlUnhedged", arr(unhedged));
-    out.set("pnlHedged", arr(hedged));
+    val out = creditHedges(spec, env, profile);
 
     // Market-risk deltas of CVA by bump-and-revalue.
     const CreditCurve& cc = env.cptyCurve();
@@ -1287,5 +1310,6 @@ EMSCRIPTEN_BINDINGS(ccr) {
   emscripten::function("cvaFromProfile", &cvaFromProfile);
   emscripten::function("wrongWayRisk", &wrongWayRisk);
   emscripten::function("hedging", &hedging);
+  emscripten::function("creditHedgingFromProfile", &creditHedgingFromProfile);
   emscripten::function("gpuPlan", &gpuPlan);
 }

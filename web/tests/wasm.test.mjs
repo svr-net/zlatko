@@ -58,6 +58,14 @@ const hedge = run('hedging', () => ccr.hedging({ ...spec, sim: { ...spec.sim, nu
 if (hedge) {
   const sd = (a) => Math.sqrt(a.reduce((s, x) => s + x * x, 0) / a.length);
   check(sd(hedge.pnlHedged) < 0.1 * sd(hedge.pnlUnhedged), 'CDS hedge removes most spread P&L');
+  // The credit part from a profile simulated elsewhere must match hedging() on the same paths.
+  const base = ccr.exposure({ ...spec, sim: { ...spec.sim, numPaths: 500 } });
+  const credit = run('creditHedgingFromProfile', () => ccr.creditHedgingFromProfile({ ...spec, sim: { ...spec.sim, numPaths: 500 }, profile: base.profile }));
+  if (credit) {
+    near(credit.cva, hedge.cva, 1e-9 * hedge.cva, 'creditHedgingFromProfile CVA');
+    hedge.cs01.forEach((v, k) => near(credit.cs01[k], v, 1e-9 * Math.abs(v) + 1e-9, `creditHedgingFromProfile CS01[${k}]`));
+    near(credit.pnlHedged[7], hedge.pnlHedged[7], 1e-6 * Math.abs(hedge.pnlUnhedged[7]), 'creditHedgingFromProfile hedged P&L');
+  }
 }
 const plan = run('gpuPlan', () => ccr.gpuPlan({ ...spec, csa: { ...spec.csa, enabled: true } }));
 if (plan) check(plan.numTerms > 0 && plan.termStart.length === plan.times.length + 1, 'GPU plan tables');

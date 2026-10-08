@@ -1,5 +1,6 @@
 import { run } from '../ccr-client.js';
 import { barChart, fmt, lineChart, scatterChart } from '../charts.js';
+import { engineNote, engineSelector, gpuHedging, runWithEngine } from '../gpu/backend.js';
 import { card, grid, initPage, runButton, specEditor, table, tiles } from '../ui.js';
 
 const page = initPage({
@@ -12,9 +13,17 @@ const page = initPage({
 });
 specEditor(page, ['market', 'assets', 'credit', 'simulation', 'portfolio', 'csa']);
 
-runButton(page, 'Compute hedges', async (spec) => {
+const button = runButton(page, 'Compute hedges', async (spec) => {
+  const t0 = performance.now();
+  // Every delta is a pair of full Monte Carlo runs per bump, so the path count is capped.
   const sim = { ...spec.sim, numPaths: Math.min(spec.sim.numPaths, 1500) };
-  const r = await run('hedging', { ...spec, sim, bumps: [0.04, 0.02, 0.01, 0.005, 0.0025] });
+  const bumps = [0.04, 0.02, 0.01, 0.005, 0.0025];
+  const runResult = await runWithEngine(spec, {
+    wasm: () => run('hedging', { ...spec, sim, bumps }),
+    gpu: () => gpuHedging({ ...spec, sim }, bumps),
+  });
+  const r = runResult.result;
+  window.__ccrEngineRun = { page: 'hedging', engine: runResult.engine, cva: r.cva, cvaDv01: r.cvaDv01, cs01: Array.from(r.cs01), deltaCrn: r.assetDeltas.map((a) => Array.from(a.deltaCrn)) };
   const sd = (a) => Math.sqrt(a.reduce((s, x) => s + x * x, 0) / a.length);
   const pnlU = Array.from(r.pnlUnhedged), pnlH = Array.from(r.pnlHedged);
   tiles(page.content, [
@@ -50,4 +59,6 @@ runButton(page, 'Compute hedges', async (spec) => {
   const box = card(g, 'Hedge Jacobian', 'Change in value of a unit-notional par CDS (rows) for a 1bp move in each quote (columns).');
   const j = r.jacobian;
   table(box, ['CDS \\ quote', ...labels], labels.map((l, i) => [l, ...labels.map((_, k) => j.data[i * j.cols + k].toExponential(2))]));
+  return engineNote(runResult, performance.now() - t0);
 });
+engineSelector(page, () => button.click());

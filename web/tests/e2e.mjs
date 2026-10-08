@@ -42,18 +42,22 @@ const browser = await chromium.launch({
 const testSpec = { sim: { numPaths: 1000, seed: 11, antithetic: true } };
 const gpuSpec = { sim: { numPaths: 8000, seed: 11, antithetic: true } };
 const pairSpec = { sim: { numPaths: 4000, seed: 11, antithetic: true } };
+// Pages with the engine selector. With no stored choice they run on Auto, which must pick the
+// WebGPU kernels on desktop too; each also runs once forced onto WebAssembly.
+const enginePages = ['index', 'exposure', 'collateral', 'cva', 'wwr', 'hedging'];
 const cases = [
   ...['index', 'core', 'market', 'models', 'instruments', 'amc', 'exposure', 'collateral', 'allocation', 'cva', 'wwr', 'hedging']
-    .map((name) => ({ name, file: name, spec: testSpec })),
+    .map((name) => ({ name, file: name, spec: testSpec, ...(enginePages.includes(name) ? { engine: 'auto', expectEngine: 'WebGPU' } : {}) })),
+  ...['index', 'collateral', 'wwr'].map((name) => ({ name: `${name}-wasm`, file: name, spec: testSpec, engine: 'wasm', expectEngine: 'WebAssembly' })),
+  // A Bermudan needs American Monte Carlo: Auto must fall back to WebAssembly and say why.
+  { name: 'exposure-amc', file: 'exposure', spec: { ...testSpec, trades: [{ type: 'bermudan', id: 'Berm 1y×4y', notional: 1e6, fixedRate: 0.035, start: 1, tenor: 4, freq: 1, direction: 'receiver', degree: 2 }] }, engine: 'auto', expectEngine: 'WebAssembly' },
   { name: 'gpu', file: 'gpu', spec: gpuSpec },
   // Collateralised netting set: exercises the margin-call look-back inside the fused kernel.
   { name: 'gpu-csa', file: 'gpu', spec: { ...gpuSpec, csa: { enabled: true, thresholdCounterparty: 250e3, thresholdOwn: 250e3, mta: 50e3, independentAmount: 0, mpr: 10 / 250 } } },
-  // Engine selector: the Monte Carlo pages forced onto the WebGPU kernels (no silent fallback),
-  // and WASM/GPU pairs at 4,000 paths whose headline numbers must agree within Monte Carlo error.
-  ...['collateral', 'wwr'].map((name) => ({ name: `${name}-gpu`, file: name, spec: testSpec, engine: 'gpu', expectEngine: 'WebGPU' })),
-  ...['exposure', 'cva'].flatMap((name) => [
-    { name: `${name}-wasm-4k`, file: name, spec: pairSpec, engine: 'wasm', expectEngine: 'WebAssembly', pair: name },
-    { name: `${name}-gpu-4k`, file: name, spec: pairSpec, engine: 'gpu', expectEngine: 'WebGPU', pair: name },
+  // WASM/GPU pairs on the same spec whose headline numbers must agree within Monte Carlo error.
+  ...['exposure', 'cva', 'hedging'].flatMap((name) => [
+    { name: `${name}-wasm-pair`, file: name, spec: pairSpec, engine: 'wasm', expectEngine: 'WebAssembly', pair: name },
+    { name: `${name}-gpu-pair`, file: name, spec: pairSpec, engine: 'gpu', expectEngine: 'WebGPU', pair: name },
   ]),
   // A phone: Auto must pick WebGPU, and the collapsed menu must leave the page content in view.
   { name: 'exposure-mobile', file: 'exposure', spec: testSpec, engine: 'auto', expectEngine: 'WebGPU', device: 'iPhone 14' },
@@ -128,15 +132,23 @@ for (const { name, file, spec, engine, expectEngine, pair, device } of cases.fil
 }
 
 // The same spec on both engines: GPU (f32, its own random numbers) and WASM must agree within
-// Monte Carlo error at 4,000 paths.
-const tol = 4 / Math.sqrt(pairSpec.sim.numPaths);
+// Monte Carlo error at 4,000 paths (hedging caps its runs at 1,500 paths).
+const metrics = {
+  exposure: [['EEPE 1y', (r) => r.eepe1y]],
+  cva: [['CVA', (r) => r.cva]],
+  hedging: [['CVA', (r) => r.cva], ['parallel CS01', (r) => r.cs01.reduce((a, b) => a + b, 0)], ['CVA DV01', (r) => r.cvaDv01],
+    ['delta (CRN, h=0.005)', (r) => r.deltaCrn[0][3]]],
+};
 for (const [name, r] of Object.entries(pairs)) {
   if (!r.wasm || !r.gpu) continue;
-  const metric = name === 'cva' ? 'cva' : 'eepe1y';
-  const diff = Math.abs(r.gpu[metric] - r.wasm[metric]) / Math.abs(r.wasm[metric]);
-  const ok = diff < tol;
-  console.log(`${ok ? 'ok  ' : 'FAIL'} ${`${name} engines`.padEnd(12)} ${metric}: WASM ${r.wasm[metric].toFixed(0)} vs GPU ${r.gpu[metric].toFixed(0)} (${(100 * diff).toFixed(2)}%, tol ${(100 * tol).toFixed(1)}%)`);
-  if (!ok) failures++;
+  const tol = 4 / Math.sqrt(name === 'hedging' ? 1500 : pairSpec.sim.numPaths);
+  for (const [label, get] of metrics[name]) {
+    const w = get(r.wasm), g = get(r.gpu);
+    const diff = Math.abs(g - w) / Math.abs(w);
+    const ok = diff < tol;
+    console.log(`${ok ? 'ok  ' : 'FAIL'} ${`${name} engines`.padEnd(16)} ${label}: WASM ${w.toFixed(1)} vs GPU ${g.toFixed(1)} (${(100 * diff).toFixed(2)}%, tol ${(100 * tol).toFixed(1)}%)`);
+    if (!ok) failures++;
+  }
 }
 
 await browser.close();

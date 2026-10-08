@@ -1,5 +1,5 @@
 // Chooses between the WebAssembly library and the WebGPU fused kernels for the Monte Carlo
-// exposure pages, and runs the GPU path: the WASM build compiles the plan (gpuPlan), the GPU
+// pages (Auto: WebGPU wherever the browser has it), and runs the GPU path: the WASM build compiles the plan (gpuPlan), the GPU
 // simulates, prices and aggregates, and WASM applies the closed-form CVA analytics
 // (cvaFromProfile) so results have the same shape whichever engine produced them.
 import { run } from '../ccr-client.js';
@@ -16,13 +16,6 @@ export function getEngineMode() {
 
 export function setEngineMode(mode) {
   try { localStorage.setItem(STORAGE_KEY, mode); } catch (_) { /* storage unavailable */ }
-}
-
-/** Phones and tablets (including iPadOS, which reports a desktop user agent). */
-export function isMobileDevice() {
-  const coarse = typeof matchMedia === 'function' && matchMedia('(pointer: coarse)').matches;
-  const ua = navigator.userAgent || '';
-  return coarse || /Mobi|Android|iPhone|iPad|iPod/i.test(ua) || (navigator.maxTouchPoints > 1 && /Macintosh/.test(ua));
 }
 
 let engine = null;
@@ -43,12 +36,12 @@ export function gpuLimitation(spec) {
 
 /**
  * Decides the engine for a run: { engine: 'gpu' | 'wasm', reason }.
- * Auto uses WebGPU on phones and tablets that support it, WebAssembly elsewhere.
+ * Auto uses the WebGPU kernels whenever the browser supports WebGPU and the portfolio fits them,
+ * on desktop and mobile alike, and WebAssembly otherwise.
  */
 export async function chooseEngine(spec) {
   const mode = getEngineMode();
   if (mode === 'wasm') return { engine: 'wasm', reason: 'WebAssembly selected' };
-  if (mode === 'auto' && !isMobileDevice()) return { engine: 'wasm', reason: 'Auto: WebAssembly on desktop' };
   if (!('gpu' in navigator)) return { engine: 'wasm', reason: 'WebGPU is not available in this browser' };
   const limitation = gpuLimitation(spec);
   if (limitation) return { engine: 'wasm', reason: limitation };
@@ -57,7 +50,7 @@ export async function chooseEngine(spec) {
   } catch (e) {
     return { engine: 'wasm', reason: `WebGPU could not start (${e.message})` };
   }
-  return { engine: 'gpu', reason: mode === 'auto' ? 'Auto: WebGPU on mobile' : 'WebGPU selected' };
+  return { engine: 'gpu', reason: mode === 'auto' ? 'Auto: WebGPU available' : 'WebGPU selected' };
 }
 
 /** Exposure profile simulated on the GPU, in the same shape as the WASM profile. */
@@ -74,6 +67,47 @@ export async function gpuCva(spec) {
   const g = await gpuExposure(spec);
   const analytics = await run('cvaFromProfile', { ...spec, profile: g.profile });
   return { ...analytics, pathwiseCva: g.pathwiseCva, gpu: g };
+}
+
+/**
+ * The hedging analysis on the GPU, in the same shape as the WASM `hedging` result. The kernels
+ * simulate the base and every bumped exposure profile with the same seed (common random numbers)
+ * or with other seeds; CS01s, the hedge Jacobian and the spread scenarios come from the WASM
+ * library applied to the base profile. Bumped CVAs use the base counterparty curve, as in WASM.
+ */
+export async function gpuHedging(spec, bumps) {
+  const base = await gpuExposure(spec);
+  const credit = await run('creditHedgingFromProfile', { ...spec, profile: base.profile });
+  const surv = base.profile.marketSurvival, lgd = 1 - base.plan.recovery;
+  const cvaOf = async (s) => {
+    const e = (await gpuExposure(s)).profile.discountedEe;
+    let cva = 0;
+    for (let k = 1; k < e.length; k++) cva += lgd * 0.5 * (e[k - 1] + e[k]) * (surv[k - 1] - surv[k]);
+    return cva;
+  };
+  const withSeed = (s, seed) => ({ ...s, sim: { ...s.sim, seed } });
+  const seed = spec.sim.seed;
+  const assetDeltas = [];
+  for (let a = 0; a < spec.assets.length; a++) {
+    const asset = spec.assets[a];
+    const bumped = (b) => ({ ...spec, assets: spec.assets.map((x, i) => (i === a ? { ...x, spot: x.spot + b } : x)) });
+    const crn = [], independent = [];
+    for (const h of bumps) {
+      crn.push((await cvaOf(bumped(h)) - await cvaOf(bumped(-h))) / (2 * h));
+      independent.push((await cvaOf(withSeed(bumped(h), seed + 1)) - await cvaOf(withSeed(bumped(-h), seed + 2))) / (2 * h));
+    }
+    assetDeltas.push({ name: asset.name, bumps, deltaCrn: crn, deltaIndependent: independent, carryDiscountAtHorizon: credit.carryDiscountAtHorizon[a] });
+  }
+  const shifted = (bp) => ({ ...spec, domestic: shiftCurve(spec.domestic, bp * 1e-4) });
+  const cvaDv01 = 0.5 * (await cvaOf(shifted(1)) - await cvaOf(shifted(-1)));
+  return { ...credit, assetDeltas, cvaDv01, adapter: base.adapter };
+}
+
+// Parallel shift of the zero rates, as ccr::YieldCurve::shifted.
+function shiftCurve(curve, shift) {
+  if (!curve) return { flat: 0.03 + shift };
+  if (curve.flat !== undefined) return { flat: curve.flat + shift };
+  return { times: curve.times, rates: curve.rates.map((r) => r + shift) };
 }
 
 /**
@@ -98,7 +132,7 @@ export function engineSelector(page, onChange) {
   const select = el('select', { 'aria-label': 'Compute engine' },
     Object.entries(MODES).map(([value, label]) => el('option', {
       value, selected: value === getEngineMode(),
-      text: value === 'auto' ? 'Auto (WebGPU on mobile)' : label,
+      text: value === 'auto' ? 'Auto (WebGPU if available)' : label,
     })));
   select.addEventListener('change', () => { setEngineMode(select.value); onChange(); });
   page.toolbar.insertBefore(el('label', { class: 'engine-select' }, 'Engine ', select), page.status);
