@@ -5,15 +5,66 @@
 // uploads the buffers, dispatches fused-exposure -> reduce-partials -> pfe-quantile and reads
 // back two arrays, which go back to the library (gpuAnalyse) for all post-processing.
 
-export class GpuEngine {
-  static async create(kernels) {
-    if (!('gpu' in navigator)) throw new Error('WebGPU is not available in this browser');
-    const adapter = await navigator.gpu.requestAdapter({ powerPreference: 'high-performance' });
-    if (!adapter) throw new Error('No WebGPU adapter found');
-    const lim = adapter.limits;
-    const device = await adapter.requestDevice({
+// Adapter requests, in order. Some mobile drivers (seen on Android) return no adapter for a
+// high-performance request but do for a plain one, so a null answer is not final.
+const ADAPTER_OPTIONS = [{ powerPreference: 'high-performance' }, {}, { powerPreference: 'low-power' }];
+
+/** Why WebGPU cannot start here, with what the user can check. */
+export function noAdapterReason() {
+  const ua = navigator.userAgent || '';
+  const android = /Android/.test(ua);
+  return android
+    ? 'no WebGPU adapter: Chrome has WebGPU blocked or unsupported on this device (it needs Android 12+ and a supported GPU; see chrome://gpu)'
+    : 'no WebGPU adapter: WebGPU is blocked or unsupported for this GPU or driver (see chrome://gpu)';
+}
+
+async function requestAdapter() {
+  if (!('gpu' in navigator)) throw new Error('WebGPU is not available in this browser');
+  for (const options of ADAPTER_OPTIONS) {
+    const adapter = await navigator.gpu.requestAdapter(options).catch(() => null);
+    if (adapter) return adapter;
+  }
+  throw new Error(noAdapterReason());
+}
+
+// The largest buffers the adapter allows; if the device refuses them, fall back to the defaults.
+async function requestDevice(adapter) {
+  const lim = adapter.limits;
+  try {
+    return await adapter.requestDevice({
       requiredLimits: { maxStorageBufferBindingSize: lim.maxStorageBufferBindingSize, maxBufferSize: lim.maxBufferSize },
     });
+  } catch (_) {
+    return adapter.requestDevice();
+  }
+}
+
+/** Every adapter request with its answer, for the diagnostics panel. */
+export async function probeAdapters() {
+  const report = { secureContext: globalThis.isSecureContext, api: 'gpu' in navigator, userAgent: navigator.userAgent, adapters: [] };
+  if (!report.api) return report;
+  for (const options of ADAPTER_OPTIONS) {
+    const entry = { request: JSON.stringify(options) };
+    try {
+      const a = await navigator.gpu.requestAdapter(options);
+      if (a) {
+        const info = a.info || {};
+        entry.adapter = [info.vendor, info.architecture, info.device, info.description].filter(Boolean).join(' · ') || 'adapter (no info)';
+        entry.maxStorageBufferBindingSize = a.limits.maxStorageBufferBindingSize;
+        entry.maxComputeWorkgroupStorageSize = a.limits.maxComputeWorkgroupStorageSize;
+      } else entry.adapter = null;
+    } catch (e) {
+      entry.error = e.message;
+    }
+    report.adapters.push(entry);
+  }
+  return report;
+}
+
+export class GpuEngine {
+  static async create(kernels) {
+    const adapter = await requestAdapter();
+    const device = await requestDevice(adapter);
     const engine = new GpuEngine(adapter, device);
     await engine.compile(kernels);
     return engine;

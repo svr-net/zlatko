@@ -1,5 +1,6 @@
 import { run } from '../ccr-client.js';
 import { barChart, fmt, lineChart } from '../charts.js';
+import { probeAdapters } from '../gpu/engine.js';
 import { runOnGpu } from '../gpu/backend.js';
 import { card, el, grid, initPage, passFail, runButton, specEditor, table, tiles } from '../ui.js';
 
@@ -111,3 +112,22 @@ run('gpuKernels', {}).then((k) => page.main.append(el('details', { class: 'spec'
   el('h3', { text: 'fused-exposure' }), el('pre', { class: 'code', text: k.fusedExposure }),
   el('h3', { text: 'reduce-partials' }), el('pre', { class: 'code', text: k.reducePartials }),
   el('h3', { text: 'pfe-quantile' }), el('pre', { class: 'code', text: k.pfeQuantile }))));
+
+// What this browser and device offer: useful when Auto falls back to WebAssembly.
+const diag = el('details', { class: 'spec', id: 'webgpu-diagnostics' }, el('summary', { text: 'WebGPU diagnostics for this device' }));
+page.main.append(diag);
+probeAdapters().then((r) => {
+  // Each check above its answer, so the panel reads on a phone screen.
+  const rows = [
+    ['secure context (https or file)', r.secureContext ? 'yes' : 'no: WebGPU needs https'],
+    ['navigator.gpu (WebGPU API)', r.api ? 'present' : 'missing: this browser has no WebGPU'],
+    ...r.adapters.map((a) => [`requestAdapter(${a.request})`, a.error ? `error: ${a.error}` : a.adapter
+      ? `${a.adapter} (storage binding ${fmt.num(a.maxStorageBufferBindingSize / 2 ** 20)} MiB, workgroup storage ${fmt.num(a.maxComputeWorkgroupStorageSize)} B)`
+      : 'no adapter']),
+    ['browser', r.userAgent],
+  ];
+  diag.append(el('dl', { class: 'diagnostics' }, rows.flatMap(([k, v]) => [el('dt', { text: k }), el('dd', { text: v })])));
+  if (r.api && r.adapters.every((a) => !a.adapter))
+    diag.append(el('p', { class: 'note', text: 'The browser has the WebGPU API but offers no adapter, so Chrome has WebGPU blocked or unsupported for this GPU or driver. On Android it needs Chrome 121+ on Android 12+ with a supported GPU. chrome://gpu shows the reason; enabling chrome://flags/#enable-unsafe-webgpu overrides the blocklist at your own risk. The pages keep working on WebAssembly.' }));
+  window.__ccrWebGpuProbe = r;
+});
