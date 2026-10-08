@@ -38,6 +38,9 @@ add_library(ccr
   src/exposure/allocation.cpp
   src/cva/cva.cpp
   src/hedging/sensitivities.cpp
+  src/gpu/fused_exposure.cpp
+  src/gpu/fused_kernels.cpp
+  src/gpu/fused_reference.cpp
 )
 add_library(ccr::ccr ALIAS ccr)
 
@@ -82,6 +85,7 @@ if(CCR_BUILD_TESTS)
     tests/test_exposure.cpp
     tests/test_cva.cpp
     tests/test_hedging.cpp
+    tests/test_gpu.cpp
   )
   target_link_libraries(ccr_tests PRIVATE ccr)
   add_test(NAME ccr_tests COMMAND ccr_tests)

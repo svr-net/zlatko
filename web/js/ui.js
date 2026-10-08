@@ -55,18 +55,29 @@ export function el(tag, attrs = {}, ...children) {
 /** Builds the page shell. Returns { main, toolbar, status, content }. */
 export function initPage({ id, title, context, description }) {
   document.title = `${title} · zlatko CCR`;
+  // On narrow screens the links collapse behind a Menu button so the page content shows first.
+  const links = el('div', { class: 'nav-links', id: 'nav-links' });
+  const toggle = el('button', { class: 'menu-toggle', type: 'button', 'aria-expanded': 'false', 'aria-controls': 'nav-links', text: '☰ Menu' });
   const nav = el('nav', { class: 'sidebar' },
-    el('div', { class: 'brand', text: 'zlatko · CCR' }),
-    el('div', { class: 'sub', text: 'Counterparty credit exposure in WebAssembly + WebGPU' }));
+    el('div', { class: 'nav-head' },
+      el('div', {}, el('div', { class: 'brand', text: 'zlatko · CCR' }),
+        el('div', { class: 'sub', text: 'Counterparty credit exposure in WebAssembly + WebGPU' })),
+      toggle),
+    links);
+  toggle.addEventListener('click', () => {
+    const open = nav.classList.toggle('open');
+    toggle.setAttribute('aria-expanded', String(open));
+    toggle.textContent = open ? '✕ Close' : '☰ Menu';
+  });
   for (const g of PAGES) {
-    nav.append(el('div', { class: 'group', text: g.group }));
-    for (const p of g.items) nav.append(el('a', { href: p.href, class: p.id === id ? 'active' : '', text: p.title }));
+    links.append(el('div', { class: 'group', text: g.group }));
+    for (const p of g.items) links.append(el('a', { href: p.href, class: p.id === id ? 'active' : '', text: p.title }));
   }
   const wasmDot = el('span', { class: 'dot' });
   const gpuDot = el('span', { class: 'dot' });
   const wasmText = el('span', { text: 'WASM: loading…' });
   const gpuText = el('span', { text: 'WebGPU: checking…' });
-  nav.append(el('div', { class: 'env' }, el('div', {}, wasmDot, wasmText), el('div', {}, gpuDot, gpuText)));
+  links.append(el('div', { class: 'env' }, el('div', {}, wasmDot, wasmText), el('div', {}, gpuDot, gpuText)));
 
   const status = el('span', { class: 'status', id: 'run-status' });
   const toolbar = el('div', { class: 'toolbar' });

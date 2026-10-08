@@ -23,6 +23,12 @@ class EuropeanOption : public PathwiseTrade {
   std::vector<double> eventTimes() const override { return {expiry_}; }
   void valueAtTime(const ScenarioSet& scenarios, std::size_t j, double* out) const override;
 
+  const std::string& asset() const { return asset_; }
+  OptionType type() const { return type_; }
+  double notional() const { return notional_; }
+  double strike() const { return strike_; }
+  double expiry() const { return expiry_; }
+
  private:
   std::string asset_;
   OptionType type_;
