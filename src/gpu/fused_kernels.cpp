@@ -33,19 +33,26 @@ struct Header {
 
 const WG : u32 = 64u;
 const NF : u32 = 7u;
-const MAXA : u32 = 4u;
-const MAXF : u32 = 7u;
+const STEP_VEC : u32 = 6u;    // vec4s per date in STEPS
+const TERM_TILE : u32 = 64u;  // valuation terms staged in workgroup memory at a time
+const CHOL_VEC : u32 = 16u;   // Cholesky factor: 8 padded rows of 2 vec4s
 
 @group(0) @binding(0) var<uniform> H : Header;
-@group(0) @binding(1) var<storage, read> IDX : array<u32>;      // termStart[nT+1] | callIndex[nT] | isReporting[nT]
-@group(0) @binding(2) var<storage, read> FP : array<f32>;       // CIR params, CSA, spots, Cholesky factor
-@group(0) @binding(3) var<storage, read> STEPS : array<f32>;    // per-date transition coefficients
-@group(0) @binding(4) var<storage, read> TERMS : array<f32>;    // valuation terms, 8 floats each
-@group(0) @binding(5) var<storage, read_write> VALS : array<f32>;     // [nT][nP] netted value
+@group(0) @binding(1) var<storage, read> IDX : array<u32>;            // termStart[nT+1] | callIndex[nT] | isReporting[nT]
+@group(0) @binding(2) var<storage, read> FP : array<vec4<f32>>;       // CIR x2 | CSA | spots | Cholesky rows
+@group(0) @binding(3) var<storage, read> STEPS : array<vec4<f32>>;    // per date: HW | HW | carry | vol | var/2 | CIR++ shift
+@group(0) @binding(4) var<storage, read> TERMS : array<vec4<f32>>;    // per term: (kind, slot, c, A) (B, p1, p2, p3)
+@group(0) @binding(5) var<storage, read_write> VALS : array<f32>;     // [nT][nP] netted value (margin-call look-back)
 @group(0) @binding(6) var<storage, read_write> EXPO : array<f32>;     // [nT][nP] positive exposure
 @group(0) @binding(7) var<storage, read_write> PARTIALS : array<f32>; // [numWG][nT][NF]
 
-var<workgroup> red : array<f32, 448>;
+// Workgroup tiles: data every path of the workgroup reads is staged once in fast shared
+// memory instead of being fetched from storage by each of the 64 invocations.
+var<workgroup> chol : array<vec4<f32>, 16>;
+var<workgroup> stepTile : array<vec4<f32>, 6>;
+var<workgroup> termTile : array<vec4<f32>, 128>;
+var<workgroup> termRange : vec2<u32>;
+var<workgroup> red : array<vec4<f32>, 128>;  // statistics reduction, 2 vec4 per invocation
 
 fn pcg(v : u32) -> u32 {
   let state = v * 747796405u + 2891336453u;
@@ -53,12 +60,14 @@ fn pcg(v : u32) -> u32 {
   return (word >> 22u) ^ word;
 }
 
-fn gauss(stream : u32, j : u32, k : u32) -> f32 {
+// Box-Muller pair: one hash pair, one log and one sqrt give two independent normals.
+fn gauss2(stream : u32, j : u32, k : u32) -> vec2<f32> {
   let h1 = pcg(stream ^ pcg(j * 131u + k));
   let h2 = pcg(h1 ^ 0x68E31DA4u);
   let u1 = (f32(h1 >> 8u) + 0.5) / 16777216.0;
   let u2 = (f32(h2 >> 8u) + 0.5) / 16777216.0;
-  return sqrt(-2.0 * log(u1)) * cos(6.2831853 * u2);
+  let a = 6.2831853 * u2;
+  return sqrt(-2.0 * log(u1)) * vec2<f32>(cos(a), sin(a));
 }
 
 fn ncdf(x : f32) -> f32 {
@@ -77,12 +86,10 @@ fn black(F : f32, K : f32, sd : f32, df : f32, isCall : bool) -> f32 {
   return df * s * (F * ncdf(s * d1) - K * ncdf(s * d2));
 }
 
-fn requiredCollateral(v : f32) -> f32 {
-  let hc = FP[8];
-  let hb = FP[9];
+fn requiredCollateral(v : f32, csa : vec4<f32>) -> f32 {
   var c = 0.0;
-  if (v > hc) { c = c + (v - hc); }
-  if (hb >= 0.0 && -v > hb) { c = c - (-v - hb); }
+  if (v > csa.x) { c = c + (v - csa.x); }
+  if (csa.y >= 0.0 && -v > csa.y) { c = c - (-v - csa.y); }
   return c;
 }
 
@@ -93,8 +100,12 @@ fn main(@builtin(global_invocation_id) gid : vec3<u32>,
   let nP = H.nP;
   let nT = H.nT;
   let p = gid.x;
+  let l = lid.x;
   let isActive = p < nP;
   let pp = min(p, nP - 1u);
+
+  // Stage the Cholesky factor once per workgroup.
+  if (l < CHOL_VEC) { chol[l] = FP[4u + l]; }
 
   // Antithetic pairs share a stream and flip the sign of every normal.
   var sign = 1.0;
@@ -105,48 +116,51 @@ fn main(@builtin(global_invocation_id) gid : vec3<u32>,
   }
   let stream = pcg(pcg(H.seed) ^ pcg(pathStream + 0x9E3779B9u));
 
+  var cir = array<vec4<f32>, 2>(FP[0], FP[1]);  // (kappa, theta, xi, y0) per credit
+  let csa = FP[2];                               // (H cpty, H own, MTA, IA)
   var x = 0.0;
   var D = 1.0;
-  var S : array<f32, 4>;
-  for (var a = 0u; a < MAXA; a++) { S[a] = FP[12u + a]; }
-  var y : array<f32, 2>;
-  var Y : array<f32, 2>;
-  for (var c = 0u; c < 2u; c++) { y[c] = FP[4u * c + 3u]; Y[c] = 0.0; }
+  var S = FP[3];                                 // the four asset spots as one vector
+  var y = vec2<f32>(cir[0].w, cir[1].w);
+  var Y = vec2<f32>(0.0, 0.0);
   var fix : array<f32, 32>;
-  var z : array<f32, 64>;
-  var w : array<f32, 7>;
+  var z : array<vec4<f32>, 16>;                  // 64 normals, 4 per vector
+  var w : array<f32, 8>;                         // correlated drivers (7 used)
   var held = 0.0;
   var prevDE = 0.0;
   var prevQ = 1.0;
-  let ia = FP[11];
-  let mta = FP[10];
+  let nZ = (H.nNormals + 3u) / 4u;
 
   for (var j = 0u; j < nT; j++) {
+    // Stage this date's step coefficients and term range for the whole workgroup.
+    if (l < STEP_VEC) { stepTile[l] = STEPS[j * STEP_VEC + l]; }
+    if (l == 0u) { termRange = vec2<u32>(IDX[j], IDX[j + 1u]); }
+    let range = workgroupUniformLoad(&termRange);  // includes the barrier
+
     var Q = 1.0;
     if (j > 0u) {
-      let base = j * H.stepStride;
-      for (var k = 0u; k < H.nNormals; k++) { z[k] = sign * gauss(stream, j, k); }
-      for (var i = 0u; i < H.nCorr; i++) {
-        var acc = 0.0;
-        for (var k = 0u; k <= i; k++) { acc = acc + FP[16u + i * MAXF + k] * z[k]; }
-        w[i] = acc;
+      for (var q = 0u; q < nZ; q++) {
+        z[q] = sign * vec4<f32>(gauss2(stream, j, 2u * q), gauss2(stream, j, 2u * q + 1u));
       }
+      // Correlate: each padded Cholesky row is two vec4 dot products (fully unrolled).
+      for (var i = 0u; i < 8u; i++) { w[i] = dot(chol[2u * i], z[0]) + dot(chol[2u * i + 1u], z[1]); }
+
+      let hw0 = stepTile[0];  // (e^{-a dt}, sd x, c1, c2)
+      let hw1 = stepTile[1];  // (int phi, (1 - e^{-a dt}) / a, dt, -)
+      let nC = H.nCorr;
+      let zI = z[nC >> 2u][nC & 3u];
       // Hull-White: exact joint transition of x and int r dt.
-      let integratedRate = x * STEPS[base + 5u] + STEPS[base + 2u] * w[0] + STEPS[base + 3u] * z[H.nCorr] + STEPS[base + 4u];
-      x = x * STEPS[base] + STEPS[base + 1u] * w[0];
+      let integratedRate = x * hw1.y + hw0.z * w[0] + hw0.w * zI + hw1.x;
+      x = x * hw0.x + hw0.y * w[0];
       D = D * exp(-integratedRate);
-      // Log-normal assets drifting at the simulated domestic rate.
-      for (var a = 0u; a < H.nA; a++) {
-        let o = base + 7u + 3u * a;
-        S[a] = S[a] * exp(integratedRate - STEPS[o] - STEPS[o + 2u] + STEPS[o + 1u] * w[1u + a]);
-      }
+      // All four log-normal assets in one vector step (unused lanes have zero volatility).
+      let wa = vec4<f32>(w[1], w[2], w[3], w[4]);
+      S = S * exp(vec4<f32>(integratedRate) - stepTile[2] - stepTile[4] + stepTile[3] * wa);
       // CIR++ intensities: full-truncation Euler on Brownian-bridge sub-steps.
-      let dt = STEPS[base + 6u];
-      var off = H.nCorr + 1u;
+      let dt = hw1.z;
+      var off = nC + 1u;
       for (var c = 0u; c < H.nC; c++) {
-        let kappa = FP[4u * c];
-        let theta = FP[4u * c + 1u];
-        let xi = FP[4u * c + 2u];
+        let prm = cir[c];
         let h = dt / f32(H.substeps);
         var rem = sqrt(dt) * w[1u + H.nA + c];
         var remT = dt;
@@ -155,12 +169,13 @@ fn main(@builtin(global_invocation_id) gid : vec3<u32>,
         for (var s = 0u; s < H.substeps; s++) {
           var dW = rem;
           if (s + 1u < H.substeps) {
-            dW = h / remT * rem + sqrt(max(h * (remT - h) / remT, 0.0)) * z[off + s];
+            let k = off + s;
+            dW = h / remT * rem + sqrt(max(h * (remT - h) / remT, 0.0)) * z[k >> 2u][k & 3u];
           }
           rem = rem - dW;
           remT = remT - h;
           let yp = max(yy, 0.0);
-          let yn = yy + kappa * (theta - yp) * h + xi * sqrt(yp) * dW;
+          let yn = yy + prm.x * (prm.y - yp) * h + prm.z * sqrt(yp) * dW;
           YY = YY + 0.5 * (yp + max(yn, 0.0)) * h;
           yy = yn;
         }
@@ -168,28 +183,31 @@ fn main(@builtin(global_invocation_id) gid : vec3<u32>,
         Y[c] = YY;
         off = off + H.substeps - 1u;
       }
-      if (H.nC > 0u) { Q = exp(-Y[H.cpty] - STEPS[base + 7u + 3u * MAXA + H.cpty]); }
+      if (H.nC > 0u) { Q = exp(-Y[H.cpty] - stepTile[5][H.cpty]); }
     }
 
-    // Revalue the netting set from the compiled term table.
+    // Revalue the netting set. The term table of this date is a matrix (terms x 8) shared by
+    // every path: it is streamed through workgroup memory in tiles of TERM_TILE terms, loaded
+    // cooperatively as vec4s, and each invocation applies the tile to its own path state.
     var v = 0.0;
-    let t1 = IDX[j + 1u];
-    for (var t = IDX[j]; t < t1; t++) {
-      let r = t * 8u;
-      let kind = u32(TERMS[r]);
-      let slot = u32(TERMS[r + 1u]);
-      let c = TERMS[r + 2u];
-      let bond = TERMS[r + 3u] * exp(-TERMS[r + 4u] * x);
-      switch kind {
-        case 0u: { v = v + c * bond; }
-        case 1u: { v = v + c * fix[slot] * bond; }
-        case 2u: { v = v + c * S[slot] * TERMS[r + 3u]; }
-        case 3u: { fix[slot] = (bond / (TERMS[r + 5u] * exp(-TERMS[r + 6u] * x)) - 1.0) / c; }
-        default: {
-          let p3 = TERMS[r + 7u];
-          v = v + c * black(S[slot] * TERMS[r + 5u] / bond, TERMS[r + 6u], abs(p3), bond, p3 > 0.0);
+    for (var t0 = range.x; t0 < range.y; t0 += TERM_TILE) {
+      let n = min(TERM_TILE, range.y - t0);
+      for (var q = l; q < 2u * n; q += WG) { termTile[q] = TERMS[2u * t0 + q]; }
+      workgroupBarrier();
+      for (var t = 0u; t < n; t++) {
+        let a = termTile[2u * t];       // (kind, slot, c, A)
+        let b = termTile[2u * t + 1u];  // (B, p1, p2, p3)
+        let slot = u32(a.y);
+        let bond = a.w * exp(-b.x * x);
+        switch u32(a.x) {
+          case 0u: { v = v + a.z * bond; }
+          case 1u: { v = v + a.z * fix[slot] * bond; }
+          case 2u: { v = v + a.z * S[slot] * a.w; }
+          case 3u: { fix[slot] = (bond / (b.y * exp(-b.z * x)) - 1.0) / a.z; }
+          default: { v = v + a.z * black(S[slot] * b.y / bond, b.z, abs(b.w), bond, b.w > 0.0); }
         }
       }
+      workgroupBarrier();
     }
 
     // Collateral called on the value at t - MPR (already written by this invocation).
@@ -199,9 +217,9 @@ fn main(@builtin(global_invocation_id) gid : vec3<u32>,
       let callJ = IDX[H.offCall + j];
       var vc = v;
       if (callJ != j) { vc = VALS[callJ * nP + pp]; }
-      let required = requiredCollateral(vc);
-      if (j == 0u || abs(required - held) >= mta) { held = required; }
-      collateral = held + ia;
+      let required = requiredCollateral(vc, csa);
+      if (j == 0u || abs(required - held) >= csa.z) { held = required; }
+      collateral = held + csa.w;
     }
     let e = v - collateral;
     let ep = max(e, 0.0);
@@ -216,25 +234,24 @@ fn main(@builtin(global_invocation_id) gid : vec3<u32>,
       prevQ = Q;
     }
 
-    // Workgroup tree reduction of the statistics for this date.
-    let b = lid.x * NF;
+    // Workgroup tree reduction of the statistics, two vec4s per invocation.
     let m = select(0.0, 1.0, isActive);
-    red[b] = m * e;
-    red[b + 1u] = m * ep;
-    red[b + 2u] = m * en;
-    red[b + 3u] = m * D * ep;
-    red[b + 4u] = m * D * en;
-    red[b + 5u] = m * cvaInc;
-    red[b + 6u] = m * Q;
+    red[2u * l] = m * vec4<f32>(e, ep, en, D * ep);
+    red[2u * l + 1u] = m * vec4<f32>(D * en, cvaInc, Q, 0.0);
     workgroupBarrier();
     for (var s = WG / 2u; s > 0u; s = s >> 1u) {
-      if (lid.x < s) {
-        for (var f = 0u; f < NF; f++) { red[b + f] = red[b + f] + red[(lid.x + s) * NF + f]; }
+      if (l < s) {
+        red[2u * l] = red[2u * l] + red[2u * (l + s)];
+        red[2u * l + 1u] = red[2u * l + 1u] + red[2u * (l + s) + 1u];
       }
       workgroupBarrier();
     }
-    if (lid.x == 0u) {
-      for (var f = 0u; f < NF; f++) { PARTIALS[(wid.x * nT + j) * NF + f] = red[f]; }
+    if (l == 0u) {
+      let o = (wid.x * nT + j) * NF;
+      let r0 = red[0];
+      let r1 = red[1];
+      PARTIALS[o] = r0.x; PARTIALS[o + 1u] = r0.y; PARTIALS[o + 2u] = r0.z; PARTIALS[o + 3u] = r0.w;
+      PARTIALS[o + 4u] = r1.x; PARTIALS[o + 5u] = r1.y; PARTIALS[o + 6u] = r1.z;
     }
     workgroupBarrier();
   }

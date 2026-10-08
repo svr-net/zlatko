@@ -17,12 +17,15 @@ std::uint32_t pcg(std::uint32_t v) {
   return (word >> 22u) ^ word;
 }
 
-float gauss(std::uint32_t stream, std::uint32_t j, std::uint32_t k) {
+// Box-Muller pair k: normals 2k (cosine) and 2k + 1 (sine), as gauss2 in the kernel.
+void gauss2(std::uint32_t stream, std::uint32_t j, std::uint32_t k, float* out) {
   const std::uint32_t h1 = pcg(stream ^ pcg(j * 131u + k));
   const std::uint32_t h2 = pcg(h1 ^ 0x68E31DA4u);
   const float u1 = (static_cast<float>(h1 >> 8u) + 0.5f) / 16777216.0f;
   const float u2 = (static_cast<float>(h2 >> 8u) + 0.5f) / 16777216.0f;
-  return std::sqrt(-2.0f * std::log(u1)) * std::cos(6.2831853f * u2);
+  const float r = std::sqrt(-2.0f * std::log(u1)), a = 6.2831853f * u2;
+  out[0] = r * std::cos(a);
+  out[1] = r * std::sin(a);
 }
 
 float ncdf(float x) {
@@ -51,7 +54,7 @@ FusedOutput runFusedReference(const FusedPlan& plan) {
   const auto& TERMS = plan.terms;
   const std::uint32_t nP = H[0], nT = H[1], nA = H[2], nC = H[3], substeps = H[4], nNormals = H[5], seed = H[6];
   const bool antithetic = H[7] == 1u, hasCsa = H[8] == 1u;
-  const std::uint32_t cpty = H[9], stepStride = H[10], nCorr = H[11], offCall = H[12], offReporting = H[13];
+  const std::uint32_t cpty = H[9], nCorr = H[11], offCall = H[12], offReporting = H[13];
   float quantileLevel;
   std::memcpy(&quantileLevel, &H[14], sizeof quantileLevel);
   const std::uint32_t numWG = H[15];
@@ -72,7 +75,7 @@ FusedOutput runFusedReference(const FusedPlan& plan) {
     }
     const std::uint32_t stream = pcg(pcg(seed) ^ pcg(pathStream + 0x9E3779B9u));
     float x = 0.0f, D = 1.0f;
-    float S[kMaxAssets], y[kMaxCredits], Y[kMaxCredits], fix[kMaxSwapSlots] = {}, z[kMaxNormals], w[kMaxFactors];
+    float S[kMaxAssets], y[kMaxCredits], Y[kMaxCredits], fix[kMaxSwapSlots] = {}, z[kMaxNormals] = {}, w[kCholeskyStride];
     for (std::uint32_t a = 0; a < kMaxAssets; ++a) S[a] = FP[12 + a];
     for (std::uint32_t c = 0; c < kMaxCredits; ++c) y[c] = FP[4 * c + 3], Y[c] = 0.0f;
     float held = 0.0f, prevDE = 0.0f, prevQ = 1.0f;
@@ -81,20 +84,22 @@ FusedOutput runFusedReference(const FusedPlan& plan) {
     for (std::uint32_t j = 0; j < nT; ++j) {
       float Q = 1.0f;
       if (j > 0) {
-        const std::size_t base = std::size_t(j) * stepStride;
-        for (std::uint32_t k = 0; k < nNormals; ++k) z[k] = sign * gauss(stream, j, k);
-        for (std::uint32_t i = 0; i < nCorr; ++i) {
-          float acc = 0.0f;
-          for (std::uint32_t k = 0; k <= i; ++k) acc += FP[16 + i * kMaxFactors + k] * z[k];
-          w[i] = acc;
+        const std::size_t base = std::size_t(j) * kStepStride;
+        const std::uint32_t nZ = 4 * ((nNormals + 3) / 4);
+        for (std::uint32_t k = 0; k < nZ; k += 2) gauss2(stream, j, k / 2, &z[k]);
+        for (std::uint32_t k = 0; k < nZ; ++k) z[k] *= sign;
+        // Each padded Cholesky row as two 4-term dot products, as in the kernel.
+        for (std::uint32_t i = 0; i < kCholeskyStride; ++i) {
+          const float* row = &FP[16 + i * kCholeskyStride];
+          const float d0 = row[0] * z[0] + row[1] * z[1] + row[2] * z[2] + row[3] * z[3];
+          const float d1 = row[4] * z[4] + row[5] * z[5] + row[6] * z[6] + row[7] * z[7];
+          w[i] = d0 + d1;
         }
         const float integratedRate = x * STEPS[base + 5] + STEPS[base + 2] * w[0] + STEPS[base + 3] * z[nCorr] + STEPS[base + 4];
         x = x * STEPS[base] + STEPS[base + 1] * w[0];
         D = D * std::exp(-integratedRate);
-        for (std::uint32_t a = 0; a < nA; ++a) {
-          const std::size_t o = base + 7 + 3 * a;
-          S[a] = S[a] * std::exp(integratedRate - STEPS[o] - STEPS[o + 2] + STEPS[o + 1] * w[1 + a]);
-        }
+        for (std::uint32_t a = 0; a < kMaxAssets; ++a)
+          S[a] = S[a] * std::exp(integratedRate - STEPS[base + 8 + a] - STEPS[base + 16 + a] + STEPS[base + 12 + a] * w[1 + a]);
         const float dt = STEPS[base + 6];
         std::uint32_t off = nCorr + 1;
         for (std::uint32_t c = 0; c < nC; ++c) {
@@ -115,7 +120,7 @@ FusedOutput runFusedReference(const FusedPlan& plan) {
           Y[c] = YY;
           off += substeps - 1;
         }
-        if (nC > 0) Q = std::exp(-Y[cpty] - STEPS[base + 7 + 3 * kMaxAssets + cpty]);
+        if (nC > 0) Q = std::exp(-Y[cpty] - STEPS[base + 20 + cpty]);
       }
 
       float v = 0.0f;

@@ -100,12 +100,11 @@ FusedPlan compile(const ExposureEngine& engine, const NettingSet& nettingSet, do
     row[6] = static_cast<float>(dt);
     for (std::size_t k = 0; k < assets.size(); ++k) {
       const auto& m = *assets[k];
-      row[7 + 3 * k] = static_cast<float>(std::log(m.carryCurve().discount(t0) / m.carryCurve().discount(t1)));
-      row[8 + 3 * k] = static_cast<float>(m.volatility() * std::sqrt(dt));
-      row[9 + 3 * k] = static_cast<float>(0.5 * m.volatility() * m.volatility() * dt);
+      row[8 + k] = static_cast<float>(std::log(m.carryCurve().discount(t0) / m.carryCurve().discount(t1)));
+      row[12 + k] = static_cast<float>(m.volatility() * std::sqrt(dt));
+      row[16 + k] = static_cast<float>(0.5 * m.volatility() * m.volatility() * dt);
     }
-    for (std::size_t c = 0; c < credits.size(); ++c)
-      row[7 + 3 * kMaxAssets + c] = static_cast<float>(credits[c]->integratedShift(t1));
+    for (std::size_t c = 0; c < credits.size(); ++c) row[20 + c] = static_cast<float>(credits[c]->integratedShift(t1));
   }
 
   // Valuation terms per date: [kind, slot, c, A, B, p1, p2, p3].
@@ -189,7 +188,7 @@ FusedPlan compile(const ExposureEngine& engine, const NettingSet& nettingSet, do
   for (const auto& c : credits) plan.numNormals += c->extraNormals();
   if (plan.numNormals > kMaxNormals) throw std::invalid_argument("too many normals per step for the GPU kernel");
   const Matrix l = gen.correlation().rows() ? cholesky(gen.correlation()) : Matrix::identity(plan.numCorrelated);
-  plan.params.assign(16 + kMaxFactors * kMaxFactors, 0.0f);
+  plan.params.assign(kParamCount, 0.0f);
   for (std::size_t c = 0; c < credits.size(); ++c) {
     plan.params[4 * c + 0] = static_cast<float>(credits[c]->kappa());
     plan.params[4 * c + 1] = static_cast<float>(credits[c]->theta());
@@ -205,7 +204,7 @@ FusedPlan compile(const ExposureEngine& engine, const NettingSet& nettingSet, do
   }
   for (std::size_t k = 0; k < assets.size(); ++k) plan.params[12 + k] = static_cast<float>(assets[k]->spot());
   for (std::size_t i = 0; i < plan.numCorrelated; ++i)
-    for (std::size_t k = 0; k <= i; ++k) plan.params[16 + i * kMaxFactors + k] = static_cast<float>(l(i, k));
+    for (std::size_t k = 0; k <= i; ++k) plan.params[16 + i * kCholeskyStride + k] = static_cast<float>(l(i, k));
 
   for (double t : plan.times)
     plan.marketSurvival.push_back(credits.empty() ? 1.0 : credits[counterparty]->marketCurve().survival(t));
@@ -214,7 +213,7 @@ FusedPlan compile(const ExposureEngine& engine, const NettingSet& nettingSet, do
                  static_cast<std::uint32_t>(plan.numAssets), static_cast<std::uint32_t>(plan.numCredits),
                  static_cast<std::uint32_t>(plan.substeps), static_cast<std::uint32_t>(plan.numNormals), plan.seed,
                  plan.antithetic ? 1u : 0u, plan.hasCsa ? 1u : 0u, static_cast<std::uint32_t>(counterparty),
-                 static_cast<std::uint32_t>(kStepStride), static_cast<std::uint32_t>(plan.numCorrelated),
+                 static_cast<std::uint32_t>(kStepStride / 4), static_cast<std::uint32_t>(plan.numCorrelated),
                  static_cast<std::uint32_t>(offCall), static_cast<std::uint32_t>(offReporting),
                  floatBits(static_cast<float>(pfeQuantile)), static_cast<std::uint32_t>(plan.numWorkgroups())};
   return plan;

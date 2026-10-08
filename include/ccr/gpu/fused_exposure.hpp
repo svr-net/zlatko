@@ -22,8 +22,12 @@ namespace ccr::gpu {
 /// buffers, dispatches the three kernels and reads back two arrays (FusedOutput);
 /// summarise() turns them into an ExposureProfile.
 ///
-/// runFusedReference() executes the same kernels on the CPU in 32-bit floats, so the
-/// algorithm is tested natively without a GPU.
+/// The fused kernel is vectorised and tiled: normals come in Box-Muller pairs packed into
+/// vec4s, the Cholesky product is two vec4 dot products per row, the four assets step as
+/// one vec4, and the Cholesky factor, each date's step row and the valuation-term table are
+/// staged in workgroup memory (the term table in tiles of 64 terms) so that the 64 paths of a
+/// workgroup share one load. runFusedReference() executes the same kernels on the CPU in
+/// 32-bit floats, so the algorithm is tested natively without a GPU.
 
 constexpr std::size_t kWorkgroupSize = 64;   ///< threads per workgroup of the fused kernel
 constexpr std::size_t kStatsPerDate = 7;     ///< E[V - C], EE, ENE, EE*, ENE*, pathwise CVA increment, E[Q]
@@ -32,7 +36,11 @@ constexpr std::size_t kMaxCredits = 2;
 constexpr std::size_t kMaxFactors = 1 + kMaxAssets + kMaxCredits;
 constexpr std::size_t kMaxSwapSlots = 32;    ///< swaps with a running fixing
 constexpr std::size_t kMaxNormals = 64;      ///< normals drawn per path and step
-constexpr std::size_t kStepStride = 7 + 3 * kMaxAssets + kMaxCredits;
+constexpr std::size_t kCholeskyStride = 8;  ///< padded row length of the Cholesky factor (two vec4s)
+/// Floats per date in the step table, as six vec4s: HW (e, sd x, c1, c2), HW (int phi, (1-e)/a, dt, 0),
+/// carry[4], vol sqrt(dt)[4], vol^2 dt / 2[4], CIR++ shift[2] + padding.
+constexpr std::size_t kStepStride = 24;
+constexpr std::size_t kParamCount = 16 + kCholeskyStride * kCholeskyStride;
 constexpr std::size_t kTermStride = 8;
 constexpr std::size_t kHeaderWords = 16;
 constexpr std::size_t kPfeBins = 3072;       ///< histogram bins of the PFE kernel (12 KiB of workgroup storage)
@@ -56,8 +64,8 @@ struct FusedPlan {
   // GPU buffers, in the exact binary layout of the WGSL kernels.
   std::vector<std::uint32_t> header;    ///< uniform block (kHeaderWords words; the quantile as f32 bits)
   std::vector<std::uint32_t> indices;   ///< termStart[nT+1] | callIndex[nT] | isReporting[nT]
-  std::vector<float> params;            ///< CIR parameters, CSA terms, spots, Cholesky factor
-  std::vector<float> steps;             ///< per-date transition coefficients (kStepStride per date)
+  std::vector<float> params;            ///< CIR parameters x2 | CSA terms | spots | Cholesky rows (kCholeskyStride)
+  std::vector<float> steps;             ///< per-date transition coefficients (kStepStride per date, vec4-aligned)
   std::vector<float> terms;             ///< valuation terms (kTermStride per term)
 
   /// Market survival of the counterparty on the simulation dates (1 without credits).

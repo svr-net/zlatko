@@ -150,6 +150,8 @@ The JavaScript layer (`web/js/gpu`, about 200 lines) only routes calls and talks
 Three WGSL compute kernels (`src/gpu/fused_kernels.cpp`) then run on these tables:
 1. **fused-exposure** runs once per path. It draws counter-based normals, correlates them, steps rates, FX and CIR++,
    revalues the netting set, applies the CSA and reduces E[V−C]/EE/ENE/EE*/ENE*/pathwise-CVA/E[Q] across the workgroup. It never builds a scenario cube.
+   - *Vector unrolling:* normals come in Box–Muller pairs packed four to a `vec4` (one hash pair, one `log` and one `sqrt` per two normals). Each Cholesky row is two `vec4` dot products. The four FX/equity factors step as one `vec4`, and the statistics reduce as two `vec4`s per invocation.
+   - *Matrix tiling:* inputs that every path reads are staged once per workgroup in shared memory instead of being fetched by each of the 64 invocations. That covers the Cholesky factor, each date's step row and the valuation-term table. The term table of a date (terms × 8) streams through in tiles of 64 terms, loaded cooperatively as `vec4`s, and each invocation applies the tile to its own path state.
 2. **reduce-partials** sums the workgroup results.
 3. **pfe-quantile** builds a histogram per date and reads off the quantile.
 

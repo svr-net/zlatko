@@ -92,10 +92,20 @@ TEST(gpu_fused_kernel_matches_exposure_engine) {
     const auto cpu = s.engine.run(s.nettingSet, 0.95).profile;
     CHECK(fused.profile.times.size() == cpu.times.size());
     CHECK_NEAR(fused.profile.expectedValue[0], cpu.expectedValue[0], 1e-6 * 1.9e6);
-    const double tol = 4.0 / std::sqrt(8000.0);
-    CHECK(maxRelDiff(fused.profile.expectedExposure, cpu.expectedExposure) < tol);
-    CHECK(maxRelDiff(fused.profile.potentialFutureExposure, cpu.potentialFutureExposure) < tol);
-    CHECK(maxRelDiff(fused.profile.discountedExpectedNegativeExposure, cpu.discountedExpectedNegativeExposure) < tol);
+    // Two independent Monte Carlo estimates: integrated measures within 4 standard errors,
+    // the worst of the ~100 dates within 6, and no systematic lean across dates.
+    const double tol = 4.0 / std::sqrt(8000.0), worstDate = 6.0 / std::sqrt(8000.0);
+    CHECK(maxRelDiff(fused.profile.expectedExposure, cpu.expectedExposure) < worstDate);
+    CHECK(maxRelDiff(fused.profile.potentialFutureExposure, cpu.potentialFutureExposure) < worstDate);
+    CHECK(maxRelDiff(fused.profile.discountedExpectedNegativeExposure, cpu.discountedExpectedNegativeExposure) < worstDate);
+    CHECK_NEAR(fused.profile.effectiveExpectedPositiveExposure(1.0), cpu.effectiveExpectedPositiveExposure(1.0),
+               tol * cpu.effectiveExpectedPositiveExposure(1.0));
+    double lean = 0.0, scale = 0.0;
+    for (std::size_t i = 0; i < cpu.times.size(); ++i) {
+      lean += fused.profile.expectedExposure[i] - cpu.expectedExposure[i];
+      scale += cpu.expectedExposure[i];
+    }
+    CHECK(std::fabs(lean) < tol * scale);
     const double cvaFused = unilateralCva(fused.profile, *s.market, 0.4);
     const double cvaCpu = unilateralCva(cpu, *s.market, 0.4);
     CHECK_NEAR(cvaFused, cvaCpu, tol * cvaCpu);
