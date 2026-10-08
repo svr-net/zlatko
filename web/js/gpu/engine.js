@@ -96,6 +96,7 @@ export class GpuEngine {
     enc.copyBufferToBuffer(bufs.sums, 0, bufs.readSums, 0, bytes.sums);
     enc.copyBufferToBuffer(bufs.pfe, 0, bufs.readPfe, 0, bytes.pfe);
     d.queue.submit([enc.finish()]);
+    globalThis.__ccrGpuRuns = (globalThis.__ccrGpuRuns || 0) + 1; // fused pipelines submitted (checked by the e2e test)
     await Promise.all([bufs.readSums.mapAsync(GPUMapMode.READ), bufs.readPfe.mapAsync(GPUMapMode.READ)]);
     const gpuMs = performance.now() - t0;
     const oom = await d.popErrorScope();

@@ -49,6 +49,8 @@ const cases = [
   ...['index', 'core', 'market', 'models', 'instruments', 'amc', 'exposure', 'collateral', 'allocation', 'cva', 'wwr', 'hedging']
     .map((name) => ({ name, file: name, spec: testSpec, ...(enginePages.includes(name) ? { engine: 'auto', expectEngine: 'WebGPU' } : {}) })),
   ...['index', 'collateral', 'wwr'].map((name) => ({ name: `${name}-wasm`, file: name, spec: testSpec, engine: 'wasm', expectEngine: 'WebAssembly' })),
+  // A first visit (nothing stored): the default is Auto, which must dispatch the fused kernels.
+  { name: 'cva-first-visit', file: 'cva', spec: testSpec, expectEngine: 'WebGPU' },
   // A Bermudan needs American Monte Carlo: Auto must fall back to WebAssembly and say why.
   { name: 'exposure-amc', file: 'exposure', spec: { ...testSpec, trades: [{ type: 'bermudan', id: 'Berm 1y×4y', notional: 1e6, fixedRate: 0.035, start: 1, tenor: 4, freq: 1, direction: 'receiver', degree: 2 }] }, engine: 'auto', expectEngine: 'WebAssembly' },
   { name: 'gpu', file: 'gpu', spec: gpuSpec },
@@ -99,6 +101,11 @@ for (const { name, file, spec, engine, expectEngine, pair, device } of cases.fil
   if (charts === 0) problems.push('no charts rendered');
   if (fileMode && network.length) problems.push(`network requests from a file:// page: ${network.slice(0, 3).join(', ')}`);
   if (expectEngine && !status.includes(`· ${expectEngine}`)) problems.push(`expected the ${expectEngine} engine: ${status}`);
+  // The status line is not enough: the fused kernels must really have been dispatched on WebGPU
+  // (and never when WebAssembly ran).
+  const gpuRuns = await page.evaluate(() => globalThis.__ccrGpuRuns || 0);
+  if (expectEngine === 'WebGPU' && gpuRuns === 0) problems.push('no fused pipeline was dispatched on WebGPU');
+  if (expectEngine === 'WebAssembly' && gpuRuns > 0) problems.push(`${gpuRuns} WebGPU dispatches while WebAssembly ran`);
   if (pair) pairs[pair] = { ...(pairs[pair] || {}), [engine]: await page.evaluate(() => window.__ccrEngineRun) };
   if (device) {
     const layout = await page.evaluate(() => ({
@@ -125,7 +132,7 @@ for (const { name, file, spec, engine, expectEngine, pair, device } of cases.fil
     }
   }
   if (process.env.SCREENSHOTS) await page.screenshot({ path: path.join(process.env.SCREENSHOTS, `${name}.png`), fullPage: true });
-  console.log(`${problems.length ? 'FAIL' : 'ok  '} ${name.padEnd(12)} ${String(Date.now() - t0).padStart(6)} ms  charts=${charts}  ${status.trim().slice(0, 90)}`);
+  console.log(`${problems.length ? 'FAIL' : 'ok  '} ${name.padEnd(12)} ${String(Date.now() - t0).padStart(6)} ms  charts=${charts}  gpu=${gpuRuns}  ${status.trim().slice(0, 80)}`);
   for (const p of problems) console.log('       ' + p);
   failures += problems.length ? 1 : 0;
   await context.close();
