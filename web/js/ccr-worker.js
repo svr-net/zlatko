@@ -2,7 +2,8 @@
 // runs never block the page. Messages: { id, fn, spec } -> { id, result, ms } | { id, error }.
 import createCcrModule from '../wasm/ccr.js';
 
-const ready = createCcrModule();
+// The standalone build embeds the .wasm bytes and passes them here (no fetch, works from file://).
+const ready = createCcrModule(self.__CCR_MODULE_OPTIONS__ || {});
 
 self.onmessage = async (event) => {
   const { id, fn, spec } = event.data;

@@ -92,6 +92,10 @@ body {
 a { color: var(--accent); }
 
 .layout { display: grid; grid-template-columns: 240px minmax(0, 1fr); min-height: 100vh; }
+@media (min-width: 861px) {
+  /* Paint the sidebar column down the whole page (the sticky nav itself is one screen tall). */
+  .layout { background: linear-gradient(to right, var(--surface-1) 239px, var(--border) 239px 240px, var(--surface-0) 240px); }
+}
 
 nav.sidebar {
   background: var(--surface-1);

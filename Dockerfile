@@ -2,7 +2,7 @@
 #
 # Multi-stage build of the library, its WebAssembly module and the web front end.
 #
-#   docker build -t zlatko-ccr .                    # web front end (nginx), default target
+#   docker build -t zlatko-ccr .                    # standalone web front end on nginx, default target
 #   docker run --rm -p 8080:80 zlatko-ccr           # -> http://localhost:8080
 #
 #   docker build --target native -t zlatko-ccr:native .   # C++ build + unit tests
@@ -12,11 +12,13 @@
 #                                                   # WebGPU on SwiftShader); behind a TLS-intercepting
 #                                                   # proxy add --secret id=ca,src=<proxy CA bundle>
 #   docker build --target wasm-artifacts --output web/wasm .   # export ccr.js/ccr.wasm to the host
+#   docker build --target standalone-artifacts --output dist .  # export the standalone site + zip
 #
 # Every build stage runs its tests, so a successful build means they passed.
 
 ARG EMSDK_VERSION=4.0.10
 ARG PLAYWRIGHT_VERSION=1.56.1
+ARG NODE_VERSION=22
 
 # ---------------------------------------------------------------- native C++ library
 FROM ubuntu:24.04 AS native-build
@@ -57,21 +59,41 @@ RUN rm -f web/wasm/ccr.js web/wasm/ccr.wasm \
 FROM scratch AS wasm-artifacts
 COPY --from=wasm /src/web/wasm/ccr.js /src/web/wasm/ccr.wasm /
 
+# ---------------------------------------------------------------- standalone (copy-deployable) site
+# One folder of static files with the .wasm embedded: no ES modules, no fetch, no server
+# configuration. Open index.html from disk or copy the folder to any static host.
+FROM node:${NODE_VERSION}-alpine AS standalone
+ARG GIT_COMMIT=unknown
+WORKDIR /src
+COPY tools/standalone/package.json tools/standalone/package-lock.json tools/standalone/
+RUN --mount=type=secret,id=ca,required=false \
+    if [ -f /run/secrets/ca ]; then export NODE_EXTRA_CA_CERTS=/run/secrets/ca; fi \
+ && cd tools/standalone && npm ci --no-audit --no-fund
+COPY tools/standalone/build.mjs tools/standalone/
+COPY --from=wasm /src/web web
+RUN GIT_COMMIT=${GIT_COMMIT} node tools/standalone/build.mjs --out /dist
+
+FROM scratch AS standalone-artifacts
+COPY --from=standalone /dist /
+
 # ---------------------------------------------------------------- browser end-to-end tests
 FROM mcr.microsoft.com/playwright:v${PLAYWRIGHT_VERSION}-noble AS e2e
 ARG PLAYWRIGHT_VERSION
 WORKDIR /web
 COPY --from=wasm /src/web /web
+COPY --from=standalone /dist/standalone /standalone
 # Behind a TLS-intercepting proxy, pass its CA: docker build --secret id=ca,src=/path/ca.pem ...
 RUN --mount=type=secret,id=ca,required=false \
     if [ -f /run/secrets/ca ]; then export NODE_EXTRA_CA_CERTS=/run/secrets/ca; fi \
- && npm init -y >/dev/null && npm install --no-audit --no-fund playwright@${PLAYWRIGHT_VERSION} \
- && node tests/e2e.mjs
+ && npm init -y >/dev/null && npm install --no-audit --no-fund playwright@${PLAYWRIGHT_VERSION}
+# Development site over HTTP, then the standalone build opened from disk and served over HTTP.
+RUN node tests/e2e.mjs \
+ && node tests/e2e.mjs --root /standalone --file \
+ && node tests/e2e.mjs --root /standalone
 
 # ---------------------------------------------------------------- web front end (default)
 FROM nginx:1.27-alpine AS web
 COPY docker/nginx.conf /etc/nginx/conf.d/default.conf
-COPY --from=wasm /src/web /usr/share/nginx/html
-RUN rm -rf /usr/share/nginx/html/tests
+COPY --from=standalone /dist/standalone /usr/share/nginx/html
 EXPOSE 80
 HEALTHCHECK --interval=30s --timeout=3s CMD wget -q -O /dev/null http://127.0.0.1/ || exit 1

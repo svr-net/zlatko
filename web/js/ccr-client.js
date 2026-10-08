@@ -4,9 +4,19 @@ let worker = null;
 let nextId = 1;
 const pending = new Map();
 
+function createWorker() {
+  // Standalone build: the whole worker (glue + embedded .wasm) ships as a string in a classic
+  // script, so it runs from a blob URL without any fetch, from file:// or any static host.
+  if (globalThis.__CCR_WORKER_SOURCE__) {
+    const blob = new Blob([globalThis.__CCR_WORKER_SOURCE__], { type: 'text/javascript' });
+    return new Worker(URL.createObjectURL(blob));
+  }
+  return new Worker(new URL('./ccr-worker.js', import.meta.url), { type: 'module' });
+}
+
 function ensureWorker() {
   if (worker) return worker;
-  worker = new Worker(new URL('./ccr-worker.js', import.meta.url), { type: 'module' });
+  worker = createWorker();
   worker.onmessage = (e) => {
     const p = pending.get(e.data.id);
     if (!p) return;

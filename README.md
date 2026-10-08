@@ -28,18 +28,46 @@ ctest --test-dir build            # or ./build/ccr_tests [name-filter]
 Options: `-DCCR_BUILD_TESTS=OFF` and `-DCCR_BUILD_EXAMPLES=OFF`. `cmake --install` installs the
 headers and a `ccr::ccr` CMake target.
 
+## Standalone, copy-deployable build
+
+`tools/standalone/build.mjs` turns `web/` into one folder of static files that runs anywhere you copy it.
+- Open `index.html` straight from disk (`file://`), or upload the folder unchanged to any static host (S3, GitHub Pages, IIS, nginx...).
+- There is no server code, no MIME setup and no build step on the target.
+- The `.wasm` is embedded in the worker script, and every page is bundled into one classic script, so nothing is fetched at runtime.
+- Asset names carry content hashes, so a host can cache them indefinitely.
+
+```sh
+docker build --target standalone-artifacts --output dist .     # -> dist/standalone/ + dist/zlatko-ccr-standalone.zip
+# or locally (needs web/wasm built):
+npm --prefix tools/standalone ci && node tools/standalone/build.mjs
+```
+
+```
+dist/standalone/
+  index.html, core.html, ... gpu.html      13 pages
+  assets/app.<hash>.js                     all pages (classic script, ~85 KiB)
+  assets/ccr-runtime.<hash>.js             WASM worker with embedded library (~360 KiB)
+  assets/style.<hash>.css
+  manifest.json, README.txt                build commit, file sizes and SHA-256
+```
+
+The whole site is about 460 KiB (about 185 KiB zipped). `node web/tests/e2e.mjs --root dist/standalone --file` opens every page from
+disk. It checks that the pages make no network request at all, and that the WebGPU kernels still agree with WASM.
+
 ## Docker
 
 The multi-stage `Dockerfile` builds everything from source. Each stage runs its tests, so a successful build means they passed.
 
 ```sh
-docker build -t zlatko-ccr .                       # WASM from source + Node checks -> nginx image (default)
+docker build -t zlatko-ccr .                       # WASM from source + checks -> standalone site on nginx (default)
 docker run --rm -p 8080:80 zlatko-ccr              # web front end at http://localhost:8080
 
 docker build --target native -t zlatko-ccr:native .   # native C++ build, ctest
 docker run --rm zlatko-ccr:native                     # end-to-end demo
 
-docker build --target e2e .                        # every page in headless Chromium, WebGPU on SwiftShader
+docker build --target e2e .                        # every page in headless Chromium, WebGPU on SwiftShader:
+                                                   # dev site over HTTP, standalone from file:// and over HTTP
+docker build --target standalone-artifacts --output dist .  # export the standalone site and zip
 docker build --target wasm-artifacts --output web/wasm .   # export ccr.js / ccr.wasm to the host
 ```
 
@@ -48,11 +76,13 @@ docker build --target wasm-artifacts --output web/wasm .   # export ccr.js / ccr
 | `native` | `ubuntu:24.04` | Library, unit tests and demo binary; installed headers and CMake package in `/opt/ccr` |
 | `wasm` | `emscripten/emsdk:4.0.10` | Embind module built from source and checked with `web/tests/wasm.test.mjs` |
 | `wasm-artifacts` | `scratch` | Only `ccr.js` and `ccr.wasm`, for `--output` |
-| `e2e` | `mcr.microsoft.com/playwright` | Browser test of all pages, including GPU-vs-WASM agreement |
-| `web` (default) | `nginx:1.27-alpine` | Static site, about 75 MB; `.wasm` is served as `application/wasm` |
+| `standalone` | `node:22-alpine` | Copy-deployable site built with the pinned esbuild |
+| `standalone-artifacts` | `scratch` | `standalone/` folder and `zlatko-ccr-standalone.zip`, for `--output` |
+| `e2e` | `mcr.microsoft.com/playwright` | Browser test of all pages in three modes, including GPU-vs-WASM agreement |
+| `web` (default) | `nginx:1.27-alpine` | The standalone site, about 75 MB; hashed assets are cached as immutable |
 
-If the network goes through a TLS-intercepting proxy, give the `e2e` stage the proxy's CA so npm can reach the registry:
-`docker build --target e2e --secret id=ca,src=/path/to/ca.pem .`
+If the network goes through a TLS-intercepting proxy, give the npm stages the proxy's CA so they can reach the registry:
+`docker build --secret id=ca,src=/path/to/ca.pem ...`. Pass `--build-arg GIT_COMMIT=$(git rev-parse --short HEAD)` to stamp the commit into `manifest.json`.
 
 ## Web front end (WebAssembly + WebGPU)
 

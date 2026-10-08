@@ -1,8 +1,10 @@
 // End-to-end test of the web front end in headless Chromium (Playwright).
 //
-//   node web/tests/e2e.mjs [page-filter]
+//   node web/tests/e2e.mjs [page-filter] [--root DIR] [--file]
 //
-// Serves web/ on a local port, opens every page, waits for its automatic run and
+// Serves web/ (or --root DIR, e.g. dist/standalone) on a local port, or with --file opens the
+// pages straight from disk as file:// URLs (the copy-and-open deployment of the standalone
+// build, which must then make no network request at all). Opens every page, waits for its automatic run and
 // checks that it finished without errors and rendered charts. On the WebGPU page
 // it also checks that the fused GPU kernel agrees with the WASM library.
 // WebGPU runs on SwiftShader in headless mode, so the GPU page works without a GPU.
@@ -10,9 +12,13 @@
 import http from 'node:http';
 import fs from 'node:fs';
 import path from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 
-const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+const argv = process.argv.slice(2);
+const option = (name) => { const i = argv.indexOf(name); return i >= 0 ? argv[i + 1] : undefined; };
+const fileMode = argv.includes('--file');
+const root = path.resolve(option('--root') || path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..'));
+const filter = argv.find((a, i) => !a.startsWith('--') && argv[i - 1] !== '--root');
 const { chromium } = await import(process.env.PLAYWRIGHT_MODULE || 'playwright').catch(() =>
   import('/opt/node22/lib/node_modules/playwright/index.mjs'));
 
@@ -42,14 +48,16 @@ const cases = [
   // Collateralised netting set: exercises the margin-call look-back inside the fused kernel.
   { name: 'gpu-csa', file: 'gpu', spec: { ...gpuSpec, csa: { enabled: true, thresholdCounterparty: 250e3, thresholdOwn: 250e3, mta: 50e3, independentAmount: 0, mpr: 10 / 250 } } },
 ];
-const filter = process.argv[2];
 let failures = 0;
+console.log(`testing ${root} ${fileMode ? 'from file:// (no server)' : `over ${base}`}`);
 
 for (const { name, file, spec } of cases.filter((c) => !filter || c.name.includes(filter))) {
   const page = await browser.newPage({ viewport: { width: 1400, height: 1000 } });
   const errors = [];
   page.on('pageerror', (e) => errors.push(e.message));
   page.on('console', (m) => { if (m.type() === 'error') errors.push(m.text()); });
+  const network = [];
+  page.on('request', (r) => { if (!/^(file|data|blob):/.test(r.url())) network.push(r.url()); });
   await page.addInitScript((spec) => {
     if (!sessionStorage.getItem('seeded')) {
       localStorage.setItem('ccr-spec-v1', JSON.stringify(spec));
@@ -57,7 +65,7 @@ for (const { name, file, spec } of cases.filter((c) => !filter || c.name.include
     }
   }, spec);
   const t0 = Date.now();
-  await page.goto(`${base}/${file}.html`);
+  await page.goto(fileMode ? pathToFileURL(path.join(root, `${file}.html`)).href : `${base}/${file}.html`);
   let status = '';
   try {
     await page.waitForFunction(() => {
@@ -72,6 +80,7 @@ for (const { name, file, spec } of cases.filter((c) => !filter || c.name.include
   const problems = [...errors];
   if (/Error|timeout/.test(status)) problems.push('status: ' + status);
   if (charts === 0) problems.push('no charts rendered');
+  if (fileMode && network.length) problems.push(`network requests from a file:// page: ${network.slice(0, 3).join(', ')}`);
   if (file === 'gpu' && !problems.length) {
     const r = await page.evaluate(() => window.__ccrLastRun);
     if (!r) problems.push('no GPU result');

@@ -60,7 +60,8 @@ runButton(page, 'Run quick exposure', async (spec) => {
 `C++17 library (include/ccr, src/)
    │  emcmake cmake -S . -B build-wasm   (Embind wrapper: wasm/bindings.cpp)
    ▼
-web/wasm/ccr.{js,wasm}  ── loaded in a module Worker (js/ccr-worker.js)
+web/wasm/ccr.{js,wasm}  ── run in a Worker (js/ccr-worker.js)
+   │   standalone build: worker + .wasm embedded, started from a blob URL
    │   coreDemo · marketDemo · simulate · priceTrades · amc · exposure
    │   allocation · cva · wrongWayRisk · hedging · gpuPlan
    ▼
