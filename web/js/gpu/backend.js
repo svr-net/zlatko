@@ -61,7 +61,7 @@ export async function runAnalysis(analysis, spec) {
   } catch (e) {
     console.warn('WebGPU run failed, falling back to WebAssembly:', e);
     // No adapter is a property of the device, not a failure of the run: say so plainly.
-    if (/no WebGPU adapter/.test(e.message)) return wasm(`WebGPU unavailable: ${e.message.replace('no WebGPU adapter: ', '')}`);
+    if (/no WebGPU adapter|too limited/.test(e.message)) return wasm(`WebGPU unavailable: ${e.message.replace("no WebGPU adapter: ", "")}`);
     return wasm(`WebGPU failed (${e.message}); used WebAssembly`);
   }
 }

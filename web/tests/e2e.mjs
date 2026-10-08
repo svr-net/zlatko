@@ -64,6 +64,8 @@ const cases = [
   // Android drivers: no adapter for a high-performance request but one for a plain request
   // (Auto must still reach WebGPU), and no adapter at all (WebAssembly, with the reason).
   { name: 'exposure-android-quirk', file: 'exposure', spec: testSpec, engine: 'auto', expectEngine: 'WebGPU', gpuStub: 'no-high-performance', device: 'Pixel 7' },
+  // Chrome offers only a WebGPU compatibility-mode adapter (OpenGL ES): Auto must use it.
+  { name: 'exposure-compat-only', file: 'exposure', spec: testSpec, engine: 'auto', expectEngine: 'WebGPU', gpuStub: 'compat-only', device: 'Pixel 7', expectReason: 'compatibility mode' },
   { name: 'exposure-no-adapter', file: 'exposure', spec: testSpec, engine: 'auto', expectEngine: 'WebAssembly', gpuStub: 'no-adapter', expectReason: 'WebGPU unavailable' },
   // A phone: Auto must pick WebGPU, and the collapsed menu must leave the page content in view.
   { name: 'exposure-mobile', file: 'exposure', spec: testSpec, engine: 'auto', expectEngine: 'WebGPU', device: 'iPhone 14' },
@@ -85,7 +87,8 @@ for (const { name, file, spec, engine, expectEngine, pair, device, gpuStub, expe
     if (!gpu) return;
     const original = gpu.requestAdapter.bind(gpu);
     gpu.requestAdapter = (options = {}) =>
-      stub === 'no-adapter' || options.powerPreference === 'high-performance' ? Promise.resolve(null) : original(options);
+      stub === 'no-adapter' || (stub === 'compat-only' ? !('featureLevel' in options) : options.powerPreference === 'high-performance')
+        ? Promise.resolve(null) : original(options);
   }, gpuStub);
   await page.addInitScript(({ spec, engine }) => {
     if (!sessionStorage.getItem('seeded')) {
