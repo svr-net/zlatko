@@ -1,6 +1,5 @@
-import { run } from '../ccr-client.js';
 import { fmt, lineChart } from '../charts.js';
-import { engineNote, engineSelector, gpuExposure, runWithEngine } from '../gpu/backend.js';
+import { engineNote, engineSelector, runAnalysis } from '../gpu/backend.js';
 import { PAGES, card, el, grid, initPage, runButton, tiles } from '../ui.js';
 
 const page = initPage({
@@ -40,13 +39,7 @@ page.main.insertBefore(map.parentNode, page.toolbar);
 
 const button = runButton(page, 'Run quick exposure', async (spec) => {
   const t0 = performance.now();
-  const runResult = await runWithEngine(spec, {
-    wasm: () => run('exposure', spec),
-    gpu: async () => {
-      const g = await gpuExposure(spec);
-      return { profile: g.profile, numPaths: spec.sim.numPaths, simulationDates: g.plan.times.length, elapsedMs: g.gpuMs, adapter: g.adapter };
-    },
-  });
+  const runResult = await runAnalysis('exposure', spec);
   const r = runResult.result;
   const onGpu = runResult.engine === 'gpu';
   const p = r.profile;
@@ -56,8 +49,8 @@ const button = runButton(page, 'Run quick exposure', async (spec) => {
     { label: 'Peak PFE', value: fmt.compact(p.maxPfe) },
     onGpu
       ? { label: 'Netting benefit (EEPE)', value: '–', hint: 'WebAssembly engine only' }
-      : { label: 'Netting benefit (EEPE)', value: fmt.pct(1 - p.eepe1y / r.grossProfile.eepe1y, 1), hint: 'vs sum of positive trade values' },
-    { label: 'Paths × dates', value: `${fmt.num(r.numPaths)} × ${r.simulationDates}`, hint: `${fmt.num(r.elapsedMs)} ms on ${onGpu ? 'WebGPU' : 'WebAssembly'}` },
+      : { label: 'Netting benefit (EEPE)', value: fmt.pct(r.nettingBenefit, 1), hint: 'vs sum of positive trade values' },
+    { label: 'Paths × dates', value: `${fmt.num(r.numPaths)} × ${r.simulationDates}`, hint: `${fmt.num(onGpu ? r.gpuMs : r.elapsedMs)} ms on ${onGpu ? 'WebGPU' : 'WebAssembly'}` },
   ]);
   const gr = grid(page.content);
   lineChart(card(gr, 'Exposure profile of the default netting set', 'Full analysis on the <a href="exposure.html">exposure page</a>.'), {
@@ -76,12 +69,14 @@ const button = runButton(page, 'Run quick exposure', async (spec) => {
 web/wasm/ccr.{js,wasm}  ── run in a Worker (js/ccr-worker.js)
    │   standalone build: worker + .wasm embedded, started from a blob URL
    │   coreDemo · marketDemo · simulate · priceTrades · amc · exposure
-   │   allocation · cva · wrongWayRisk · hedging · gpuPlan
+   │   allocation · cva · collateral · wrongWayRisk · hedging
    ▼
-gpuPlan(spec) → flat tables (HW step coefficients, bond terms A·e^(−Bx),
-                fixings, options, CSA look-back, Cholesky, CIR++ shift)
+ccr::gpu (C++): compile() → plan buffers (HW step coefficients, bond terms
+   │            A·e^(−Bx), fixings, options, CSA look-back, Cholesky, CIR++)
+   │            + the WGSL kernels; summarise() + analytics on the read-back
    ▼
-WebGPU (js/gpu): fused-exposure ▸ reduce-partials ▸ pfe-quantile` }));
+WebGPU host (js/gpu/engine.js): upload ▸ fused-exposure ▸ reduce-partials
+                                ▸ pfe-quantile ▸ read back → gpuAnalyse` }));
   return engineNote(runResult, performance.now() - t0);
 });
 engineSelector(page, () => button.click());

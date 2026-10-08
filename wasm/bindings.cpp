@@ -44,6 +44,11 @@ val arr(const std::vector<double>& v) {
   return val(emscripten::typed_memory_view(v.size(), v.data())).call<val>("slice");
 }
 
+template <class T>
+val typedArray(const std::vector<T>& v) {
+  return val(emscripten::typed_memory_view(v.size(), v.data())).call<val>("slice");
+}
+
 val u32arr(const std::vector<unsigned>& v) {
   return val(emscripten::typed_memory_view(v.size(), v.data())).call<val>("slice");
 }
@@ -207,6 +212,17 @@ TradeInfo parseTrade(const val& t, const Env& env) {
   return info;
 }
 
+CollateralAgreement parseCsa(const val& c) {
+  CollateralAgreement csa;
+  csa.thresholdCounterparty = num(c, "thresholdCounterparty", 0.0);
+  csa.thresholdOwn = has(c, "thresholdOwn") ? c["thresholdOwn"].as<double>() : std::numeric_limits<double>::infinity();
+  if (csa.thresholdOwn < 0.0) csa.thresholdOwn = std::numeric_limits<double>::infinity();
+  csa.minimumTransferAmount = num(c, "mta", 0.0);
+  csa.independentAmount = num(c, "independentAmount", 0.0);
+  csa.marginPeriodOfRisk = num(c, "mpr", 10.0 / 250.0);
+  return csa;
+}
+
 Env parseEnv(const val& spec) {
   Env env;
   env.domestic = parseCurve(spec["domestic"], 0.03);
@@ -258,17 +274,7 @@ Env parseEnv(const val& spec) {
     env.baseGrid = TimeGrid::standardExposureGrid(num(grid, "horizon", 5.0));
   }
 
-  if (has(spec, "csa") && !(has(spec["csa"], "enabled") && !spec["csa"]["enabled"].as<bool>())) {
-    const val c = spec["csa"];
-    CollateralAgreement csa;
-    csa.thresholdCounterparty = num(c, "thresholdCounterparty", 0.0);
-    csa.thresholdOwn = has(c, "thresholdOwn") ? c["thresholdOwn"].as<double>() : std::numeric_limits<double>::infinity();
-    if (csa.thresholdOwn < 0.0) csa.thresholdOwn = std::numeric_limits<double>::infinity();
-    csa.minimumTransferAmount = num(c, "mta", 0.0);
-    csa.independentAmount = num(c, "independentAmount", 0.0);
-    csa.marginPeriodOfRisk = num(c, "mpr", 10.0 / 250.0);
-    env.csa = csa;
-  }
+  if (has(spec, "csa") && !(has(spec["csa"], "enabled") && !spec["csa"]["enabled"].as<bool>())) env.csa = parseCsa(spec["csa"]);
   env.pfeQuantile = num(spec, "pfeQuantile", 0.95);
   env.counterparty = static_cast<std::size_t>(num(spec, "counterparty", 0));
   if (has(spec, "own")) {
@@ -794,7 +800,10 @@ val exposure(val spec) {
       out.set("collateralBands", bands(coll, {0.05, 0.5, 0.95}));
       out.set("uncollateralisedProfile", profileToJs(profileOn(r, r.nettedValue, env.pfeQuantile)));
     }
-    out.set("grossProfile", profileToJs(profileOn(r, grossPositiveValues(r.tradeValues), env.pfeQuantile)));
+    const ExposureProfile gross = profileOn(r, grossPositiveValues(r.tradeValues), env.pfeQuantile);
+    out.set("grossProfile", profileToJs(gross));
+    const double grossEepe = gross.effectiveExpectedPositiveExposure(1.0);
+    out.set("nettingBenefit", grossEepe > 0.0 ? 1.0 - r.profile.effectiveExpectedPositiveExposure(1.0) / grossEepe : 0.0);
 
     val trades = val::array();
     for (std::size_t i = 0; i < env.trades.size(); ++i) {
@@ -860,10 +869,175 @@ val allocation(val spec) {
   });
 }
 
-// CVA, DVA, term structure, running spread, pathwise CVA.
-// Closed-form CVA analytics on an exposure profile: unilateral CVA and its term structure,
-// bilateral CVA/DVA, running spread and recovery sensitivity. Shared by cva() and
-// cvaFromProfile(), so a profile simulated on the GPU gets exactly the same analytics.
+// ------------------------------------------------------------------ Monte Carlo analyses
+//
+// Each Monte Carlo analysis is a list of exposure jobs (one netting set under one model
+// set-up each) and a combine step. A job runs on the CPU (ExposureEngine) or on the WebGPU
+// fused kernels (gpuJobs -> GPU -> gpuAnalyse). The combine step is the same C++ code for
+// both engines, so the results have the same shape and the JavaScript layer does no maths.
+
+constexpr double kNaN = std::numeric_limits<double>::quiet_NaN();
+
+struct Job {
+  std::string label;
+  std::optional<ExposureEngine> engine;  // empty when the set-up is invalid (see error)
+  NettingSet nettingSet;
+  std::string error;
+};
+
+struct JobResult {
+  ExposureProfile profile;
+  double pathwiseCva = kNaN;                     // stochastic intensity, NaN without credits
+  std::vector<double> conditionalDiscountedEe;   // E[D V+ | default in period k], NaN at k = 0
+  std::vector<double> meanSurvival;              // E[Q(t)] of the simulated intensity
+  std::size_t simulationDates = 0;
+  std::size_t numPaths = 0;
+  double elapsedMs = 0.0;
+  std::string error;
+  std::optional<ExposureResult> paths;           // CPU only, when requested
+};
+
+Job makeJob(std::string label, const Env& env, const std::function<ScenarioGenerator()>& generator,
+            const SimulationConfig& sim, const std::optional<CollateralAgreement>& csa) {
+  Job job;
+  job.label = std::move(label);
+  job.nettingSet = env.nettingSet(false);
+  job.nettingSet.collateral = csa;
+  try {
+    job.engine.emplace(generator(), sim, env.baseGrid);
+  } catch (const std::exception& e) {
+    job.error = e.what();
+  }
+  return job;
+}
+
+struct CsaVariant {
+  std::string name;
+  std::optional<CollateralAgreement> csa;
+};
+
+// The CSA comparison of the collateral page: the CSA in the spec (enabled or not) and variants.
+std::vector<CsaVariant> csaVariants(const val& spec) {
+  const CollateralAgreement c = has(spec, "csa") ? parseCsa(spec["csa"]) : CollateralAgreement{};
+  CollateralAgreement zero = c, mpr20 = c, oneWay = c;
+  zero.thresholdCounterparty = zero.thresholdOwn = zero.minimumTransferAmount = 0.0;
+  mpr20.marginPeriodOfRisk = 20.0 / 250.0;
+  oneWay.thresholdOwn = std::numeric_limits<double>::infinity();
+  return {{"no CSA", std::nullopt}, {"specified CSA", c}, {"zero threshold & MTA", zero}, {"MPR 20 days", mpr20},
+          {"one-way (we never post)", oneWay}};
+}
+
+std::vector<double> wwrRhos(const val& spec) {
+  return has(spec, "rhos") ? vec(spec["rhos"]) : std::vector<double>{-0.6, -0.3, 0.0, 0.3, 0.6};
+}
+
+std::size_t wwrDriver(const val& spec, const Env& env) {
+  return static_cast<std::size_t>(num(spec, "wwrFactor", env.assets.empty() ? 0 : 1));
+}
+
+std::vector<double> hedgingBumps(const val& spec) {
+  return has(spec, "bumps") ? vec(spec["bumps"]) : std::vector<double>{0.04, 0.02, 0.01, 0.005};
+}
+
+std::vector<Job> analysisJobs(const val& spec, const Env& env, const std::string& analysis) {
+  const ScenarioGenerator gen = env.generator();
+  auto fixed = [&](const ScenarioGenerator& g) { return [g] { return g; }; };
+  std::vector<Job> jobs;
+  if (analysis == "exposure" || analysis == "cva" || analysis == "validation") {
+    jobs.push_back(makeJob("base", env, fixed(gen), env.sim, env.csa));
+  } else if (analysis == "collateral") {
+    for (const auto& v : csaVariants(spec)) jobs.push_back(makeJob(v.name, env, fixed(gen), env.sim, v.csa));
+  } else if (analysis == "wrongWayRisk") {
+    if (env.credits.empty()) throw std::invalid_argument("wrong-way risk needs a stochastic counterparty intensity");
+    const std::size_t driver = wwrDriver(spec, env), creditFactor = 1 + env.assets.size() + env.counterparty;
+    for (double rho : wwrRhos(spec)) {
+      Matrix corr = env.correlation;
+      corr(driver, creditFactor) = corr(creditFactor, driver) = rho;
+      jobs.push_back(makeJob("rho " + std::to_string(rho), env,
+                             [&env, corr] { return ScenarioGenerator(env.hw, env.assets, env.credits, corr); }, env.sim, env.csa));
+    }
+  } else if (analysis == "hedging") {
+    // Base run; for each asset and bump size the up/down runs with common random numbers and
+    // with independent seeds; finally the +/- 1bp parallel rate shifts (common random numbers).
+    jobs.push_back(makeJob("base", env, fixed(gen), env.sim, env.csa));
+    SimulationConfig seed1 = env.sim, seed2 = env.sim;
+    seed1.seed += 1;
+    seed2.seed += 2;
+    for (std::size_t a = 0; a < env.assets.size(); ++a)
+      for (double h : hedgingBumps(spec)) {
+        auto bumped = [&](double b) {
+          return gen.withAsset(a, std::make_shared<LognormalAsset>(env.assets[a]->withSpot(env.assets[a]->spot() + b)));
+        };
+        jobs.push_back(makeJob("up", env, fixed(bumped(h)), env.sim, env.csa));
+        jobs.push_back(makeJob("down", env, fixed(bumped(-h)), env.sim, env.csa));
+        jobs.push_back(makeJob("up, seed + 1", env, fixed(bumped(h)), seed1, env.csa));
+        jobs.push_back(makeJob("down, seed + 2", env, fixed(bumped(-h)), seed2, env.csa));
+      }
+    for (double bp : {1.0, -1.0}) {
+      auto curve = std::make_shared<YieldCurve>(env.domestic->shifted(bp * 1e-4));
+      jobs.push_back(makeJob("rates shifted", env,
+                             fixed(gen.withRateModel(std::make_shared<HullWhite1F>(curve, env.hw->meanReversion(), env.hw->volatility()))),
+                             env.sim, env.csa));
+    }
+  } else {
+    throw std::invalid_argument("unknown analysis '" + analysis + "'");
+  }
+  return jobs;
+}
+
+JobResult runOnCpu(const Job& job, const Env& env, bool keepPaths = false) {
+  JobResult r;
+  if (!job.engine) {
+    r.error = job.error;
+    return r;
+  }
+  const double t0 = nowMs();
+  ExposureResult x = job.engine->run(job.nettingSet, env.pfeQuantile);
+  r.elapsedMs = nowMs() - t0;
+  r.profile = x.profile;
+  r.simulationDates = x.scenarios.numTimes();
+  r.numPaths = x.scenarios.numPaths;
+  if (!env.credits.empty()) {
+    const auto& s = x.scenarios;
+    const auto& idx = x.reportingIndices;
+    const Matrix& q = s.survival[env.counterparty];
+    r.pathwiseCva = pathwiseCva(s, x.exposureValue, env.counterparty, env.cptyRecovery(), idx);
+    r.conditionalDiscountedEe.assign(idx.size(), kNaN);
+    for (std::size_t k = 0; k < idx.size(); ++k) {
+      double sum = 0.0;
+      for (std::size_t p = 0; p < s.numPaths; ++p) sum += q(p, idx[k]);
+      r.meanSurvival.push_back(sum / static_cast<double>(s.numPaths));
+    }
+    for (std::size_t k = 1; k < idx.size(); ++k) {
+      double num_ = 0.0, den = 0.0;
+      for (std::size_t p = 0; p < s.numPaths; ++p) {
+        const double dq = q(p, idx[k - 1]) - q(p, idx[k]);
+        num_ += s.deflator(p, idx[k]) * std::max(x.exposureValue(p, idx[k]), 0.0) * dq;
+        den += dq;
+      }
+      if (den != 0.0) r.conditionalDiscountedEe[k] = num_ / den;
+    }
+  }
+  if (keepPaths) r.paths = std::move(x);
+  return r;
+}
+
+JobResult fromFused(const gpu::FusedPlan& plan, const gpu::FusedOutput& output, const Env& env) {
+  const gpu::FusedResult f = gpu::summarise(plan, output);
+  JobResult r;
+  r.profile = f.profile;
+  r.simulationDates = plan.numDates();
+  r.numPaths = plan.numPaths;
+  if (!env.credits.empty()) {
+    r.pathwiseCva = f.pathwiseCva(env.cptyRecovery());
+    r.conditionalDiscountedEe = f.conditionalDiscountedEe;
+    r.meanSurvival = f.meanSurvival;
+  }
+  return r;
+}
+
+// Closed-form CVA analytics on an exposure profile: unilateral CVA, its term structure and
+// accumulation, bilateral CVA/DVA, running spread and recovery sensitivity.
 val cvaAnalytics(const val& spec, const Env& env, const ExposureProfile& profile) {
   const CreditCurve& cc = env.cptyCurve();
   const double rec = env.cptyRecovery();
@@ -872,7 +1046,12 @@ val cvaAnalytics(const val& spec, const Env& env, const ExposureProfile& profile
   val out = val::object();
   out.set("profile", profileToJs(profile));
   out.set("cva", unilateralCva(profile, cc, rec));
-  out.set("termStructure", arr(cvaTermStructure(times, profile.discountedExpectedExposure, cc, rec)));
+  const auto terms = cvaTermStructure(times, profile.discountedExpectedExposure, cc, rec);
+  std::vector<double> cumulative;
+  double running = 0.0;
+  for (double t : terms) cumulative.push_back(running += t);
+  out.set("termStructure", arr(terms));
+  out.set("cumulativeCva", arr(cumulative));
   std::vector<double> surv, own;
   for (double t : times) {
     surv.push_back(cc.survival(t));
@@ -910,97 +1089,7 @@ val cvaAnalytics(const val& spec, const Env& env, const ExposureProfile& profile
   return out;
 }
 
-// CVA, DVA, term structure, running spread, pathwise CVA.
-val cva(val spec) {
-  return guarded([&] {
-    const Env env = parseEnv(spec);
-    const ExposureEngine engine(env.generator(), env.sim, env.baseGrid);
-    const ExposureResult r = engine.run(env.nettingSet(true), env.pfeQuantile);
-    val out = cvaAnalytics(spec, env, r.profile);
-    out.set("pathwiseCva", pathwiseCva(r.scenarios, r.exposureValue, env.counterparty, env.cptyRecovery(), r.reportingIndices));
-    return out;
-  });
-}
-
-// CVA analytics on an exposure profile computed elsewhere (the WebGPU kernels):
-// spec.profile = { times, ee, ene, pfe, discountedEe, discountedEne, expectedValue }.
-ExposureProfile profileFromJs(const val& p, double pfeQuantile, const char* caller) {
-  ExposureProfile profile;
-  profile.times = vec(p["times"]);
-  profile.expectedExposure = vec(p["ee"]);
-  profile.expectedNegativeExposure = vec(p["ene"]);
-  profile.discountedExpectedExposure = vec(p["discountedEe"]);
-  profile.discountedExpectedNegativeExposure = vec(p["discountedEne"]);
-  profile.potentialFutureExposure = has(p, "pfe") ? vec(p["pfe"]) : std::vector<double>(profile.times.size(), 0.0);
-  profile.expectedValue = has(p, "expectedValue") ? vec(p["expectedValue"]) : std::vector<double>(profile.times.size(), 0.0);
-  profile.pfeQuantile = pfeQuantile;
-  const std::size_t n = profile.times.size();
-  if (n == 0 || profile.expectedExposure.size() != n || profile.discountedExpectedExposure.size() != n ||
-      profile.discountedExpectedNegativeExposure.size() != n || profile.expectedNegativeExposure.size() != n)
-    throw std::invalid_argument(std::string(caller) + ": profile arrays must have one value per date");
-  return profile;
-}
-
-val cvaFromProfile(val spec) {
-  return guarded([&] {
-    const Env env = parseEnv(spec);
-    return cvaAnalytics(spec, env, profileFromJs(spec["profile"], env.pfeQuantile, "cvaFromProfile"));
-  });
-}
-
-// Wrong-way risk: pathwise CVA as a function of the exposure/intensity correlation.
-val wrongWayRisk(val spec) {
-  return guarded([&] {
-    const Env env = parseEnv(spec);
-    if (env.credits.empty()) throw std::invalid_argument("wrong-way risk needs a stochastic counterparty intensity");
-    const std::vector<double> rhos = has(spec, "rhos") ? vec(spec["rhos"]) : std::vector<double>{-0.6, -0.3, 0.0, 0.3, 0.6};
-    const auto driver = static_cast<std::size_t>(num(spec, "wwrFactor", env.assets.empty() ? 0 : 1));
-    const std::size_t creditFactor = 1 + env.assets.size() + env.counterparty;
-    const CreditCurve& cc = env.cptyCurve();
-    const double rec = env.cptyRecovery();
-
-    val out = val::object();
-    val results = val::array();
-    for (double rho : rhos) {
-      Matrix corr = env.correlation;
-      corr(driver, creditFactor) = corr(creditFactor, driver) = rho;
-      val o = val::object();
-      o.set("rho", rho);
-      try {
-        const ExposureEngine engine(ScenarioGenerator(env.hw, env.assets, env.credits, corr), env.sim, env.baseGrid);
-        const ExposureResult r = engine.run(env.nettingSet(true), env.pfeQuantile);
-        const auto& s = r.scenarios;
-        const auto& idx = r.reportingIndices;
-        const Matrix& q = s.survival[env.counterparty];
-        // Discounted exposure conditional on default in each period.
-        std::vector<double> conditional(idx.size(), 0.0);
-        for (std::size_t k = 1; k < idx.size(); ++k) {
-          double num_ = 0.0, den = 0.0;
-          for (std::size_t p = 0; p < s.numPaths; ++p) {
-            const double dq = q(p, idx[k - 1]) - q(p, idx[k]);
-            num_ += s.deflator(p, idx[k]) * std::max(r.exposureValue(p, idx[k]), 0.0) * dq;
-            den += dq;
-          }
-          conditional[k] = den != 0.0 ? num_ / den : 0.0;
-        }
-        o.set("pathwiseCva", pathwiseCva(s, r.exposureValue, env.counterparty, rec, idx));
-        o.set("independentCva", unilateralCva(r.profile, cc, rec));
-        o.set("times", arr(r.profile.times));
-        o.set("discountedEe", arr(r.profile.discountedExpectedExposure));
-        o.set("conditionalDiscountedEe", arr(conditional));
-      } catch (const std::exception& e) {
-        o.set("error", std::string(e.what()));
-      }
-      results.call<void>("push", o);
-    }
-    out.set("results", results);
-    out.set("driver", static_cast<double>(driver));
-    return out;
-  });
-}
-
-// CVA hedging: CS01 buckets and CDS hedge, market deltas with/without common random numbers.
-// Credit hedging of CVA for a given exposure profile: bucketed CS01, the CDS hedge Jacobian and
+// Credit hedging of CVA for an exposure profile: bucketed CS01, the CDS hedge Jacobian and
 // notionals, and the P&L of the hedged and unhedged CVA under random spread scenarios.
 val creditHedges(const val& spec, const Env& env, const ExposureProfile& profile) {
   const auto& quotes = env.creditQuotes.at(env.counterparty);
@@ -1014,8 +1103,11 @@ val creditHedges(const val& spec, const Env& env, const ExposureProfile& profile
   const auto notionals = cdsHedgeNotionals(cs01, jac);
   std::vector<double> mats;
   for (const auto& q : quotes) mats.push_back(q.maturity);
+  double parallel = 0.0;
+  for (double c : cs01) parallel += c;
   out.set("maturities", arr(mats));
   out.set("cs01", arr(cs01));
+  out.set("parallelCs01", parallel);
   out.set("jacobian", matrixToJs(jac));
   out.set("hedgeNotionals", arr(notionals));
 
@@ -1027,8 +1119,8 @@ val creditHedges(const val& spec, const Env& env, const ExposureProfile& profile
   const double shockBp = num(spec, "spreadShockBp", 10.0);
   for (int n = 0; n < 60; ++n) {
     auto moved = quotes;
-    const double parallel = rng.next();
-    for (auto& q : moved) q.spread = std::max(q.spread + 1e-4 * shockBp * (0.7 * parallel + 0.3 * rng.next()), 1e-5);
+    const double common = rng.next();
+    for (auto& q : moved) q.spread = std::max(q.spread + 1e-4 * shockBp * (0.7 * common + 0.3 * rng.next()), 1e-5);
     const CreditCurve curve = bootstrapCreditCurve(*env.domestic, moved, rec);
     const double dCva = cvaOf(curve) - baseCva;
     double dHedge = 0.0;
@@ -1039,259 +1131,337 @@ val creditHedges(const val& spec, const Env& env, const ExposureProfile& profile
     unhedged.push_back(-dCva);  // our P&L: CVA is a liability
     hedged.push_back(-dCva + dHedge);
   }
+  auto rms = [](const std::vector<double>& v) {
+    double s = 0.0;
+    for (double x : v) s += x * x;
+    return std::sqrt(s / static_cast<double>(v.size()));
+  };
   out.set("pnlUnhedged", arr(unhedged));
   out.set("pnlHedged", arr(hedged));
+  out.set("pnlVolRatio", rms(hedged) / rms(unhedged));
   return out;
 }
 
-// The credit part of hedging() for a profile simulated elsewhere (the WebGPU kernels).
-val creditHedgingFromProfile(val spec) {
-  return guarded([&] {
-    const Env env = parseEnv(spec);
-    val out = creditHedges(spec, env, profileFromJs(spec["profile"], env.pfeQuantile, "creditHedgingFromProfile"));
-    std::vector<double> carry;
-    for (const auto& a : env.assets) carry.push_back(a->carryCurve().discount(env.baseGrid.horizon()));
-    out.set("carryDiscountAtHorizon", arr(carry));
-    return out;
-  });
+val csaToJs(const std::optional<CollateralAgreement>& c) {
+  val o = val::object();
+  o.set("enabled", c.has_value());
+  if (c) {
+    o.set("thresholdCounterparty", c->thresholdCounterparty);
+    o.set("thresholdOwn", std::isfinite(c->thresholdOwn) ? c->thresholdOwn : -1.0);
+    o.set("oneWay", !std::isfinite(c->thresholdOwn));
+    o.set("mta", c->minimumTransferAmount);
+    o.set("mprDays", c->marginPeriodOfRisk * 250.0);
+  }
+  return o;
 }
 
-val hedging(val spec) {
-  return guarded([&] {
-    const Env env = parseEnv(spec);
-    const ExposureEngine engine(env.generator(), env.sim, env.baseGrid);
-    const NettingSet ns = env.nettingSet(true);
-    const ExposureProfile profile = engine.run(ns, env.pfeQuantile).profile;
-    const double rec = env.cptyRecovery();
-    val out = creditHedges(spec, env, profile);
+val firstError(const std::vector<JobResult>& results) {
+  for (const auto& r : results)
+    if (!r.error.empty()) return val(r.error);
+  return val::undefined();
+}
 
-    // Market-risk deltas of CVA by bump-and-revalue.
-    const CreditCurve& cc = env.cptyCurve();
-    auto cvaWith = [&](const ScenarioGenerator& g, std::uint64_t seed) {
-      SimulationConfig cfg = env.sim;
-      cfg.seed = seed;
-      return unilateralCva(ExposureEngine(g, cfg, env.baseGrid).run(ns, env.pfeQuantile).profile, cc, rec);
-    };
-    const ScenarioGenerator gen = env.generator();
-    const std::vector<double> bumps = has(spec, "bumps") ? vec(spec["bumps"]) : std::vector<double>{0.04, 0.02, 0.01, 0.005};
+// The combine step of every analysis: identical for CPU and GPU job results.
+val combine(const val& spec, const Env& env, const std::string& analysis, const std::vector<Job>& jobs,
+            const std::vector<JobResult>& results) {
+  const CreditCurve* cc = env.creditCurves.empty() ? nullptr : &env.cptyCurve();
+  const double rec = env.creditCurves.empty() ? 0.4 : env.cptyRecovery();
+  val out = val::object();
+  if (analysis == "exposure") {
+    const JobResult& r = results.at(0);
+    if (!r.error.empty()) throw std::invalid_argument(r.error);
+    out.set("profile", profileToJs(r.profile));
+    out.set("numPaths", static_cast<double>(r.numPaths));
+    out.set("simulationDates", static_cast<double>(r.simulationDates));
+    out.set("reportingDates", static_cast<double>(r.profile.times.size()));
+    out.set("elapsedMs", r.elapsedMs);
+  } else if (analysis == "cva") {
+    const JobResult& r = results.at(0);
+    if (!r.error.empty()) throw std::invalid_argument(r.error);
+    out = cvaAnalytics(spec, env, r.profile);
+    const double cva = unilateralCva(r.profile, *cc, rec);
+    out.set("pathwiseCva", r.pathwiseCva);
+    out.set("pathwiseExcess", r.pathwiseCva / cva - 1.0);
+  } else if (analysis == "collateral") {
+    const auto variants = csaVariants(spec);
+    if (val e = firstError(results); !e.isUndefined()) throw std::invalid_argument(e.as<std::string>());
+    const double noCsa = results.at(0).profile.effectiveExpectedPositiveExposure(1.0);
+    val list = val::array();
+    for (std::size_t i = 0; i < results.size(); ++i) {
+      val o = val::object();
+      o.set("name", variants[i].name);
+      o.set("csa", csaToJs(variants[i].csa));
+      o.set("profile", profileToJs(results[i].profile));
+      o.set("eepeVsNoCsa", noCsa > 0.0 ? results[i].profile.effectiveExpectedPositiveExposure(1.0) / noCsa : kNaN);
+      list.call<void>("push", o);
+    }
+    out.set("variants", list);
+  } else if (analysis == "wrongWayRisk") {
+    const auto rhos = wwrRhos(spec);
+    val list = val::array();
+    for (std::size_t i = 0; i < results.size(); ++i) {
+      const JobResult& r = results[i];
+      val o = val::object();
+      o.set("rho", rhos[i]);
+      if (!r.error.empty()) {
+        o.set("error", r.error);
+      } else {
+        const double independent = unilateralCva(r.profile, *cc, rec);
+        o.set("pathwiseCva", r.pathwiseCva);
+        o.set("independentCva", independent);
+        o.set("multiplier", r.pathwiseCva / independent);
+        o.set("times", arr(r.profile.times));
+        o.set("discountedEe", arr(r.profile.discountedExpectedExposure));
+        o.set("conditionalDiscountedEe", arr(r.conditionalDiscountedEe));
+      }
+      list.call<void>("push", o);
+    }
+    out.set("results", list);
+    out.set("driver", static_cast<double>(wwrDriver(spec, env)));
+  } else if (analysis == "hedging") {
+    if (val e = firstError(results); !e.isUndefined()) throw std::invalid_argument(e.as<std::string>());
+    out = creditHedges(spec, env, results.at(0).profile);
+    auto cvaAt = [&](std::size_t i) { return unilateralCva(results.at(i).profile, *cc, rec); };
+    const auto bumps = hedgingBumps(spec);
+    std::size_t i = 1;
     val deltas = val::array();
     for (std::size_t a = 0; a < env.assets.size(); ++a) {
       std::vector<double> crn, independent;
       for (double h : bumps) {
-        const double spot = env.assets[a]->spot();
-        auto bumped = [&](double b) {
-          return gen.withAsset(a, std::make_shared<LognormalAsset>(env.assets[a]->withSpot(spot + b)));
-        };
-        crn.push_back((cvaWith(bumped(h), env.sim.seed) - cvaWith(bumped(-h), env.sim.seed)) / (2 * h));
-        independent.push_back((cvaWith(bumped(h), env.sim.seed + 1) - cvaWith(bumped(-h), env.sim.seed + 2)) / (2 * h));
+        crn.push_back((cvaAt(i) - cvaAt(i + 1)) / (2 * h));
+        independent.push_back((cvaAt(i + 2) - cvaAt(i + 3)) / (2 * h));
+        i += 4;
       }
+      const double carry = env.assets[a]->carryCurve().discount(env.baseGrid.horizon());
+      const double hedgeDelta = crn.size() >= 2 ? crn[crn.size() - 2] : crn.back();
       val o = val::object();
       o.set("name", env.assets[a]->name());
       o.set("bumps", arr(bumps));
       o.set("deltaCrn", arr(crn));
       o.set("deltaIndependent", arr(independent));
-      o.set("carryDiscountAtHorizon", env.assets[a]->carryCurve().discount(env.baseGrid.horizon()));
+      o.set("hedgeBump", crn.size() >= 2 ? bumps[bumps.size() - 2] : bumps.back());
+      o.set("hedgeDelta", hedgeDelta);
+      o.set("hedgeUnits", hedgeDelta / carry);  // forward units at the horizon (+ buy, - sell)
       deltas.call<void>("push", o);
     }
     out.set("assetDeltas", deltas);
+    out.set("cvaDv01", 0.5 * (cvaAt(i) - cvaAt(i + 1)));
+  } else {
+    throw std::invalid_argument("unknown analysis '" + analysis + "'");
+  }
+  (void)jobs;
+  return out;
+}
 
-    // Parallel rate shift (DV01 of CVA), common random numbers.
-    auto shifted = [&](double bp) {
-      auto curve = std::make_shared<YieldCurve>(env.domestic->shifted(bp * 1e-4));
-      return gen.withRateModel(std::make_shared<HullWhite1F>(curve, env.hw->meanReversion(), env.hw->volatility()));
-    };
-    out.set("cvaDv01", 0.5 * (cvaWith(shifted(1.0), env.sim.seed) - cvaWith(shifted(-1.0), env.sim.seed)));
+val runAnalysisOnCpu(const val& spec, const std::string& analysis) {
+  const Env env = parseEnv(spec);
+  const auto jobs = analysisJobs(spec, env, analysis);
+  std::vector<JobResult> results;
+  for (const auto& job : jobs) results.push_back(runOnCpu(job, env));
+  return combine(spec, env, analysis, jobs, results);
+}
+
+// ------------------------------------------------------------------ CPU entry points
+
+val cva(val spec) {
+  return guarded([&] { return runAnalysisOnCpu(spec, "cva"); });
+}
+
+val wrongWayRisk(val spec) {
+  return guarded([&] { return runAnalysisOnCpu(spec, "wrongWayRisk"); });
+}
+
+val hedging(val spec) {
+  return guarded([&] { return runAnalysisOnCpu(spec, "hedging"); });
+}
+
+// CSA comparison; the specified CSA also returns sample paths and collateral bands.
+val collateral(val spec) {
+  return guarded([&] {
+    const Env env = parseEnv(spec);
+    const auto jobs = analysisJobs(spec, env, "collateral");
+    std::vector<JobResult> results;
+    for (std::size_t i = 0; i < jobs.size(); ++i) results.push_back(runOnCpu(jobs[i], env, i == 1));
+    val out = combine(spec, env, "collateral", jobs, results);
+    const ExposureResult& r = *results[1].paths;
+    const auto sampleCount = static_cast<std::size_t>(num(spec, "samplePaths", 12));
+    out.set("nettedSamples", matrixRows(selectColumns(r.nettedValue, r.reportingIndices), sampleCount));
+    out.set("collateralBands", bands(selectColumns(r.collateral, r.reportingIndices), {0.05, 0.5, 0.95}));
     return out;
   });
 }
 
-// Compiles a netting set into the flat tables consumed by the WebGPU fused kernel.
-val gpuPlan(val spec) {
+// ------------------------------------------------------------------ WebGPU entry points
+//
+// gpuKernels() returns the WGSL sources. gpuJobs(spec) compiles the jobs of spec.analysis
+// into GPU plans: ready-made buffers, dispatch sizes and buffer sizes, so the host only
+// uploads, dispatches and reads back. gpuAnalyse(spec) takes the read-backs
+// (spec.gpuOutputs[i] = { sums, pfe }, null for an invalid job) and returns the result in
+// the shape of the CPU analysis. gpuEmulate(spec) runs the kernels on the CPU instead.
+
+val gpuKernels(val) {
+  val o = val::object();
+  o.set("fusedExposure", gpu::fusedExposureKernel());
+  o.set("reducePartials", gpu::reducePartialsKernel());
+  o.set("pfeQuantile", gpu::pfeQuantileKernel());
+  return o;
+}
+
+val planToJs(const gpu::FusedPlan& p, const std::string& label) {
+  val o = val::object();
+  o.set("label", label);
+  o.set("numPaths", static_cast<double>(p.numPaths));
+  o.set("numDates", static_cast<double>(p.numDates()));
+  o.set("numTerms", static_cast<double>(p.numTerms()));
+  o.set("header", typedArray(p.header));
+  o.set("indices", typedArray(p.indices));
+  o.set("params", typedArray(p.params));
+  o.set("steps", typedArray(p.steps));
+  o.set("terms", typedArray(p.terms.empty() ? std::vector<float>{0.0f} : p.terms));
+  val dispatch = val::object();
+  dispatch.set("fused", static_cast<double>(p.fusedDispatch()));
+  dispatch.set("reduce", static_cast<double>(p.reduceDispatch()));
+  dispatch.set("pfe", static_cast<double>(p.pfeDispatch()));
+  o.set("dispatch", dispatch);
+  val bytes = val::object();
+  bytes.set("cube", static_cast<double>(p.cubeBytes()));
+  bytes.set("partials", static_cast<double>(p.partialsBytes()));
+  bytes.set("sums", static_cast<double>(p.sumsBytes()));
+  bytes.set("pfe", static_cast<double>(p.pfeBytes()));
+  o.set("bytes", bytes);
+  return o;
+}
+
+std::string analysisOf(const val& spec) { return str(spec, "analysis", "exposure"); }
+
+// The plans of an analysis, or the reason the kernels cannot run it.
+struct GpuJobs {
+  std::vector<Job> jobs;
+  std::vector<std::optional<gpu::FusedPlan>> plans;
+  std::string unsupported;
+};
+
+GpuJobs compileJobs(const val& spec, const Env& env) {
+  GpuJobs g;
+  g.jobs = analysisJobs(spec, env, analysisOf(spec) == "validation" ? "cva" : analysisOf(spec));
+  for (const auto& job : g.jobs) {
+    if (!job.engine) {
+      g.plans.emplace_back();
+      continue;
+    }
+    if (const std::string why = gpu::limitation(*job.engine, job.nettingSet); !why.empty()) {
+      g.unsupported = why;
+      return g;
+    }
+    g.plans.emplace_back(gpu::compile(*job.engine, job.nettingSet, env.pfeQuantile, env.counterparty));
+  }
+  return g;
+}
+
+val gpuJobs(val spec) {
   return guarded([&] {
-    constexpr std::size_t kMaxAssets = 4, kMaxCredits = 2, kMaxFactors = 7, kMaxSlots = 32, kMaxNormals = 64;
-    constexpr std::size_t kStepStride = 7 + 3 * kMaxAssets + kMaxCredits;
     const Env env = parseEnv(spec);
-    if (env.assets.size() > kMaxAssets) throw std::invalid_argument("GPU kernel supports at most 4 assets");
-    if (env.credits.size() > kMaxCredits) throw std::invalid_argument("GPU kernel supports at most 2 credits");
-
-    const ExposureEngine engine(env.generator(), env.sim, env.baseGrid);
-    const NettingSet ns = env.nettingSet(true);
-    const TimeGrid reporting = engine.reportingGrid(ns);
-    const TimeGrid grid = engine.simulationGrid(ns);
-    const std::size_t nT = grid.size();
-    const HullWhite1F& hw = *env.hw;
-    const double a = hw.meanReversion(), sigma = hw.volatility();
-
-    // Per-step deterministic coefficients (same exact transitions as the C++ scenario generator).
-    std::vector<double> steps(nT * kStepStride, 0.0);
-    for (std::size_t j = 1; j < nT; ++j) {
-      const double t0 = grid[j - 1], t1 = grid[j], dt = t1 - t0, e = std::exp(-a * dt), s2 = sigma * sigma;
-      const double varX = s2 * (1 - e * e) / (2 * a);
-      const double varI = s2 / (a * a) * (dt - 2 * (1 - e) / a + (1 - e * e) / (2 * a));
-      const double cov = s2 / (2 * a * a) * (1 - e) * (1 - e);
-      const double sdX = std::sqrt(varX);
-      const double c1 = sdX > 0 ? cov / sdX : 0.0;
-      const double c2 = std::sqrt(std::max(varI - c1 * c1, 0.0));
-      const double g2 = dt - 2 / a * (std::exp(-a * t0) - std::exp(-a * t1)) + 0.5 / a * (std::exp(-2 * a * t0) - std::exp(-2 * a * t1));
-      const double intPhi = std::log(env.domestic->discount(t0) / env.domestic->discount(t1)) + s2 / (2 * a * a) * g2;
-      double* row = &steps[j * kStepStride];
-      row[0] = e;
-      row[1] = sdX;
-      row[2] = c1;
-      row[3] = c2;
-      row[4] = intPhi;
-      row[5] = (1 - e) / a;
-      row[6] = dt;
-      for (std::size_t k = 0; k < env.assets.size(); ++k) {
-        const auto& m = *env.assets[k];
-        row[7 + 3 * k] = std::log(m.carryCurve().discount(t0) / m.carryCurve().discount(t1));
-        row[8 + 3 * k] = m.volatility() * std::sqrt(dt);
-        row[9 + 3 * k] = 0.5 * m.volatility() * m.volatility() * dt;
-      }
-      for (std::size_t c = 0; c < env.credits.size(); ++c) row[7 + 3 * kMaxAssets + c] = env.credits[c]->integratedShift(t1);
-    }
-
-    // Valuation terms per grid date: [type, slot, c, A, B, p1, p2, p3].
-    enum : int { kBond = 0, kFixedFloat = 1, kAsset = 2, kSetFixing = 3, kOption = 4 };
-    std::vector<std::vector<std::vector<double>>> termsAt(nT);
-    auto addTerm = [&](std::size_t j, int type, double slot, double c, double A, double B, double p1 = 0, double p2 = 0,
-                       double p3 = 0) { termsAt[j].push_back({double(type), slot, c, A, B, p1, p2, p3}); };
-    auto bondA = [&](double t, double T) { return hw.zeroBond(t, T, 0.0); };
-    auto bondB = [&](double t, double T) { return T <= t ? 0.0 : hw.B(t, T); };
-    std::size_t slots = 0;
-    std::vector<std::string> unsupported;
-    for (const auto& info : env.trades) {
-      if (info.type == "swap") {
-        const InterestRateSwap& sw = *info.swap;
-        const double sign = sw.direction() == InterestRateSwap::Direction::PayFixed ? 1.0 : -1.0;
-        const double n = sw.notional(), k = sw.fixedRate();
-        const auto& sch = sw.schedule();
-        if (slots >= kMaxSlots) throw std::invalid_argument("too many swaps for the GPU kernel");
-        const double slot = static_cast<double>(slots++);
-        for (std::size_t i = 1; i < sch.size(); ++i) {
-          const double ts = sch[i - 1], te = sch[i], tau = te - ts;
-          // Record the fixing on the path at the last grid date on or before ts (as the C++ swap does).
-          // Appended after the previous period's terms at that date, which still use the old fixing.
-          const std::size_t kFix = grid.indexAtOrBefore(ts);
-          addTerm(kFix, kSetFixing, slot, tau, bondA(grid[kFix], ts), bondB(grid[kFix], ts), bondA(grid[kFix], te),
-                  bondB(grid[kFix], te));
-          for (std::size_t j = 0; j < nT; ++j) {
-            const double t = grid[j];
-            if (te <= t + 1e-10) continue;
-            if (ts >= t - 1e-10) {
-              addTerm(j, kBond, 0, sign * n, bondA(t, ts), bondB(t, ts));
-              addTerm(j, kBond, 0, -sign * n * (1 + k * tau), bondA(t, te), bondB(t, te));
-            } else {
-              addTerm(j, kFixedFloat, slot, sign * n * tau, bondA(t, te), bondB(t, te));
-              addTerm(j, kBond, 0, -sign * n * k * tau, bondA(t, te), bondB(t, te));
-            }
-          }
-        }
-      } else if (info.type == "forward" || info.type == "option") {
-        const val t = [&] {
-          const val trades = spec["trades"];
-          for (unsigned i = 0; i < trades["length"].as<unsigned>(); ++i)
-            if (str(trades[i], "id", "") == info.trade->id()) return trades[i];
-          throw std::invalid_argument("trade spec not found");
-        }();
-        const std::string assetName = str(t, "asset", "FX");
-        std::size_t ai = env.assets.size();
-        for (std::size_t q = 0; q < env.assets.size(); ++q)
-          if (env.assets[q]->name() == assetName) ai = q;
-        if (ai == env.assets.size()) throw std::invalid_argument("unknown asset " + assetName);
-        const auto& m = *env.assets[ai];
-        const double n = num(t, "notional", 1e6), strike = num(t, "strike", 1.0);
-        const double T = info.type == "forward" ? num(t, "maturity", 1.0) : num(t, "expiry", 1.0);
-        const bool call = str(t, "optionType", "call") == "call";
-        for (std::size_t j = 0; j < nT; ++j) {
-          const double tj = grid[j];
-          if (tj >= T - 1e-10) continue;
-          const double carry = m.carryCurve().discount(T) / m.carryCurve().discount(tj);
-          if (info.type == "forward") {
-            addTerm(j, kAsset, double(ai), n, carry, 0.0);
-            addTerm(j, kBond, 0, -n * strike, bondA(tj, T), bondB(tj, T));
-          } else {
-            const double sd = m.volatility() * std::sqrt(T - tj);
-            addTerm(j, kOption, double(ai), n, bondA(tj, T), bondB(tj, T), carry, strike, call ? sd : -sd);
-          }
-        }
-      } else {
-        unsupported.push_back(info.trade->id() + " (" + info.type + ": needs AMC regression, priced in WASM only)");
-      }
-    }
-
-    std::vector<double> terms;
-    std::vector<unsigned> termStart(nT + 1, 0);
-    for (std::size_t j = 0; j < nT; ++j) {
-      termStart[j] = static_cast<unsigned>(terms.size() / 8);
-      for (const auto& rec : termsAt[j]) terms.insert(terms.end(), rec.begin(), rec.end());
-    }
-    termStart[nT] = static_cast<unsigned>(terms.size() / 8);
-
-    std::vector<unsigned> callIndex(nT, 0), isReporting(nT, 0);
-    const double mpr = env.csa ? env.csa->marginPeriodOfRisk : 0.0;
-    for (std::size_t j = 0; j < nT; ++j) {
-      callIndex[j] = static_cast<unsigned>(grid.indexAtOrBefore(std::max(grid[j] - mpr, 0.0)));
-      isReporting[j] = reporting.find(grid[j]).has_value() ? 1u : 0u;
-    }
-
-    const std::size_t nCorr = 1 + env.assets.size() + env.credits.size();
-    std::size_t nNormals = nCorr + 1;
-    for (const auto& c : env.credits) nNormals += c->extraNormals();
-    if (nNormals > kMaxNormals) throw std::invalid_argument("too many normals per step for the GPU kernel");
-    const Matrix l = cholesky(env.correlation);
-    std::vector<double> fparams(16 + kMaxFactors * kMaxFactors, 0.0);
-    for (std::size_t c = 0; c < env.credits.size(); ++c) {
-      fparams[4 * c + 0] = env.credits[c]->kappa();
-      fparams[4 * c + 1] = env.credits[c]->theta();
-      fparams[4 * c + 2] = env.credits[c]->xi();
-      fparams[4 * c + 3] = env.credits[c]->y0();
-    }
-    if (env.csa) {
-      fparams[8] = env.csa->thresholdCounterparty;
-      fparams[9] = std::isfinite(env.csa->thresholdOwn) ? env.csa->thresholdOwn : -1.0;
-      fparams[10] = env.csa->minimumTransferAmount;
-      fparams[11] = env.csa->independentAmount;
-    }
-    for (std::size_t k = 0; k < env.assets.size(); ++k) fparams[12 + k] = env.assets[k]->spot();
-    for (std::size_t i = 0; i < nCorr; ++i)
-      for (std::size_t k = 0; k <= i; ++k) fparams[16 + i * kMaxFactors + k] = l(i, k);
-
-    std::vector<double> marketSurvival;
-    for (double t : grid.times()) marketSurvival.push_back(env.creditCurves.empty() ? 1.0 : env.cptyCurve().survival(t));
-
+    const double t0 = nowMs();
+    const GpuJobs g = compileJobs(spec, env);
     val out = val::object();
-    out.set("times", arr(grid.times()));
-    out.set("reportingTimes", arr(reporting.times()));
-    out.set("numPaths", static_cast<double>(env.sim.numPaths));
-    out.set("seed", static_cast<double>(env.sim.seed % 4294967296ull));
-    out.set("antithetic", env.sim.antithetic);
-    out.set("numAssets", static_cast<double>(env.assets.size()));
-    out.set("numCredits", static_cast<double>(env.credits.size()));
-    out.set("counterparty", static_cast<double>(env.counterparty));
-    out.set("substeps", static_cast<double>(env.credits.empty() ? 1 : env.credits.front()->substeps()));
-    out.set("numCorrelated", static_cast<double>(nCorr));
-    out.set("numNormals", static_cast<double>(nNormals));
-    out.set("hasCsa", static_cast<bool>(env.csa));
-    out.set("stepStride", static_cast<double>(kStepStride));
-    out.set("maxFactors", static_cast<double>(kMaxFactors));
-    out.set("steps", arr(steps));
-    out.set("terms", arr(terms));
-    out.set("termStart", u32arr(termStart));
-    out.set("callIndex", u32arr(callIndex));
-    out.set("isReporting", u32arr(isReporting));
-    out.set("fparams", arr(fparams));
-    out.set("pfeQuantile", env.pfeQuantile);
-    out.set("recovery", env.creditCurves.empty() ? 0.4 : env.cptyRecovery());
-    out.set("marketSurvival", arr(marketSurvival));
-    out.set("numTerms", static_cast<double>(terms.size() / 8));
-    val un = val::array();
-    for (const auto& u : unsupported) un.call<void>("push", u);
-    out.set("unsupported", un);
-    for (const auto& c : env.credits)
-      if (c->substeps() != env.credits.front()->substeps())
-        throw std::invalid_argument("GPU kernel needs the same CIR substeps for all credits");
+    out.set("compileMs", nowMs() - t0);
+    if (!g.unsupported.empty()) {
+      out.set("unsupported", g.unsupported);
+      return out;
+    }
+    val plans = val::array();
+    for (std::size_t i = 0; i < g.jobs.size(); ++i)
+      plans.call<void>("push", g.plans[i] ? planToJs(*g.plans[i], g.jobs[i].label) : val::null());
+    out.set("plans", plans);
     return out;
+  });
+}
+
+// GPU validation: the fused kernels against the CPU library on the same specification.
+val validation(const val& spec, const Env& env, const JobResult& g) {
+  const JobResult w = runOnCpu(analysisJobs(spec, env, "cva").at(0), env);
+  const CreditCurve& cc = env.cptyCurve();
+  const double rec = env.cptyRecovery();
+  auto maxRelDiff = [](const std::vector<double>& a, const std::vector<double>& b) {
+    double scale = 1e-12, diff = 0.0;
+    for (std::size_t i = 0; i < b.size(); ++i) {
+      scale = std::max(scale, std::fabs(b[i]));
+      diff = std::max(diff, std::fabs(a[i] - b[i]));
+    }
+    return diff / scale;
+  };
+  const double gpuCva = unilateralCva(g.profile, cc, rec), cpuCva = unilateralCva(w.profile, cc, rec);
+  std::vector<double> market;
+  for (double t : g.profile.times) market.push_back(cc.survival(t));
+  double grossNotional = 0.0;
+  for (const auto& t : env.trades) grossNotional += std::fabs(t.notional);
+  const double tol = 4.0 / std::sqrt(static_cast<double>(env.sim.numPaths));
+
+  val checks = val::object();
+  checks.set("tol", tol);
+  // f32 term cancellation: the t = 0 difference per unit of gross notional.
+  checks.set("t0Diff", std::fabs(g.profile.expectedValue[0] - w.profile.expectedValue[0]) / std::max(grossNotional, 1.0));
+  checks.set("eeDiff", maxRelDiff(g.profile.expectedExposure, w.profile.expectedExposure));
+  checks.set("cvaDiff", std::fabs(gpuCva - cpuCva) / std::max(std::fabs(cpuCva), 1e-12));
+  checks.set("survDiff", g.meanSurvival.empty() ? 0.0 : maxRelDiff(g.meanSurvival, market));
+  auto side = [&](const JobResult& r, double cva) {
+    val o = val::object();
+    o.set("profile", profileToJs(r.profile));
+    o.set("cva", cva);
+    o.set("pathwiseCva", r.pathwiseCva);
+    o.set("meanSurvival", arr(r.meanSurvival));
+    o.set("elapsedMs", r.elapsedMs);
+    o.set("simulationDates", static_cast<double>(r.simulationDates));
+    return o;
+  };
+  val out = val::object();
+  out.set("gpu", side(g, gpuCva));
+  out.set("wasm", side(w, cpuCva));
+  out.set("marketSurvival", arr(market));
+  out.set("checks", checks);
+  out.set("numPaths", static_cast<double>(env.sim.numPaths));
+  return out;
+}
+
+val analyseFused(const val& spec, const std::function<std::optional<gpu::FusedOutput>(std::size_t, const gpu::FusedPlan&)>& output) {
+  const Env env = parseEnv(spec);
+  const GpuJobs g = compileJobs(spec, env);
+  if (!g.unsupported.empty()) throw std::invalid_argument(g.unsupported);
+  std::vector<JobResult> results;
+  for (std::size_t i = 0; i < g.jobs.size(); ++i) {
+    if (!g.plans[i]) {
+      JobResult r;
+      r.error = g.jobs[i].error;
+      results.push_back(r);
+      continue;
+    }
+    const auto o = output(i, *g.plans[i]);
+    if (!o) throw std::invalid_argument("missing GPU output for job " + std::to_string(i));
+    results.push_back(fromFused(*g.plans[i], *o, env));
+  }
+  const std::string analysis = analysisOf(spec);
+  if (analysis == "validation") return validation(spec, env, results.at(0));
+  return combine(spec, env, analysis, g.jobs, results);
+}
+
+val gpuAnalyse(val spec) {
+  return guarded([&] {
+    const val outputs = spec["gpuOutputs"];
+    return analyseFused(spec, [&](std::size_t i, const gpu::FusedPlan&) -> std::optional<gpu::FusedOutput> {
+      if (i >= outputs["length"].as<std::size_t>() || outputs[i].isNull() || outputs[i].isUndefined()) return std::nullopt;
+      gpu::FusedOutput o;
+      o.sums = emscripten::convertJSArrayToNumberVector<float>(outputs[i]["sums"]);
+      o.pfe = emscripten::convertJSArrayToNumberVector<float>(outputs[i]["pfe"]);
+      return o;
+    });
+  });
+}
+
+val gpuEmulate(val spec) {
+  return guarded([&] {
+    return analyseFused(spec, [](std::size_t, const gpu::FusedPlan& plan) -> std::optional<gpu::FusedOutput> {
+      return gpu::runFusedReference(plan);
+    });
   });
 }
 
@@ -1307,9 +1477,11 @@ EMSCRIPTEN_BINDINGS(ccr) {
   emscripten::function("exposure", &exposure);
   emscripten::function("allocation", &allocation);
   emscripten::function("cva", &cva);
-  emscripten::function("cvaFromProfile", &cvaFromProfile);
+  emscripten::function("collateral", &collateral);
   emscripten::function("wrongWayRisk", &wrongWayRisk);
   emscripten::function("hedging", &hedging);
-  emscripten::function("creditHedgingFromProfile", &creditHedgingFromProfile);
-  emscripten::function("gpuPlan", &gpuPlan);
+  emscripten::function("gpuKernels", &gpuKernels);
+  emscripten::function("gpuJobs", &gpuJobs);
+  emscripten::function("gpuAnalyse", &gpuAnalyse);
+  emscripten::function("gpuEmulate", &gpuEmulate);
 }

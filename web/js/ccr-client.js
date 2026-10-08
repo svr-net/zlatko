@@ -37,7 +37,7 @@ export function call(fn, spec) {
   const id = nextId++;
   return new Promise((resolve, reject) => {
     pending.set(id, { resolve, reject });
-    w.postMessage({ id, fn, spec: JSON.parse(JSON.stringify(spec)) });
+    w.postMessage({ id, fn, spec }); // structured clone: keeps the typed arrays of GPU read-backs
   });
 }
 

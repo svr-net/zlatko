@@ -136,7 +136,7 @@ for (const { name, file, spec, engine, expectEngine, pair, device } of cases.fil
 const metrics = {
   exposure: [['EEPE 1y', (r) => r.eepe1y]],
   cva: [['CVA', (r) => r.cva]],
-  hedging: [['CVA', (r) => r.cva], ['parallel CS01', (r) => r.cs01.reduce((a, b) => a + b, 0)], ['CVA DV01', (r) => r.cvaDv01],
+  hedging: [['CVA', (r) => r.cva], ['parallel CS01', (r) => r.parallelCs01], ['CVA DV01', (r) => r.cvaDv01],
     ['delta (CRN, h=0.005)', (r) => r.deltaCrn[0][3]]],
 };
 for (const [name, r] of Object.entries(pairs)) {

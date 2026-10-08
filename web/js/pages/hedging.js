@@ -1,6 +1,5 @@
-import { run } from '../ccr-client.js';
 import { barChart, fmt, lineChart, scatterChart } from '../charts.js';
-import { engineNote, engineSelector, gpuHedging, runWithEngine } from '../gpu/backend.js';
+import { engineNote, engineSelector, runAnalysis } from '../gpu/backend.js';
 import { card, grid, initPage, runButton, specEditor, table, tiles } from '../ui.js';
 
 const page = initPage({
@@ -18,19 +17,15 @@ const button = runButton(page, 'Compute hedges', async (spec) => {
   // Every delta is a pair of full Monte Carlo runs per bump, so the path count is capped.
   const sim = { ...spec.sim, numPaths: Math.min(spec.sim.numPaths, 1500) };
   const bumps = [0.04, 0.02, 0.01, 0.005, 0.0025];
-  const runResult = await runWithEngine(spec, {
-    wasm: () => run('hedging', { ...spec, sim, bumps }),
-    gpu: () => gpuHedging({ ...spec, sim }, bumps),
-  });
+  const runResult = await runAnalysis('hedging', { ...spec, sim, bumps });
   const r = runResult.result;
-  window.__ccrEngineRun = { page: 'hedging', engine: runResult.engine, cva: r.cva, cvaDv01: r.cvaDv01, cs01: Array.from(r.cs01), deltaCrn: r.assetDeltas.map((a) => Array.from(a.deltaCrn)) };
-  const sd = (a) => Math.sqrt(a.reduce((s, x) => s + x * x, 0) / a.length);
+  window.__ccrEngineRun = { page: 'hedging', engine: runResult.engine, cva: r.cva, cvaDv01: r.cvaDv01, parallelCs01: r.parallelCs01, deltaCrn: r.assetDeltas.map((a) => Array.from(a.deltaCrn)) };
   const pnlU = Array.from(r.pnlUnhedged), pnlH = Array.from(r.pnlHedged);
   tiles(page.content, [
     { label: 'CVA', value: fmt.num(r.cva) },
-    { label: 'Parallel CS01 (per 1bp)', value: fmt.num(r.cs01.reduce((a, b) => a + b, 0), 1) },
+    { label: 'Parallel CS01 (per 1bp)', value: fmt.num(r.parallelCs01, 1) },
     { label: 'CVA DV01 (rates +1bp)', value: fmt.num(r.cvaDv01, 1), hint: 'common random numbers' },
-    { label: 'Spread P&L vol, hedged / unhedged', value: fmt.pct(sd(pnlH) / sd(pnlU), 2), hint: '60 random spread scenarios' },
+    { label: 'Spread P&L vol, hedged / unhedged', value: fmt.pct(r.pnlVolRatio, 2), hint: '60 random spread scenarios' },
   ]);
   const g = grid(page.content);
   const labels = Array.from(r.maturities).map((m) => fmt.years(m));
@@ -49,11 +44,10 @@ const button = runButton(page, 'Compute hedges', async (spec) => {
       x: bumps, xLabel: 'bump h', xFormat: (v) => v.toFixed(4), zero: true,
       series: [{ name: 'common random numbers', y: Array.from(a.deltaCrn), markers: true }, { name: 'independent seeds', y: Array.from(a.deltaIndependent), markers: true, colorIndex: 1 }],
     });
-    const d = a.deltaCrn[a.deltaCrn.length - 2];
     const box = card(g, `${a.name} hedge`, '');
     table(box, ['quantity', 'value'], [
-      ['CVA delta (CRN, h = 0.005)', fmt.num(d, 0)],
-      ['hedge', `${d > 0 ? 'buy' : 'sell'} ${fmt.num(Math.abs(d) / a.carryDiscountAtHorizon)} units forward (horizon)`],
+      [`CVA delta (CRN, h = ${a.hedgeBump})`, fmt.num(a.hedgeDelta, 0)],
+      ['hedge', `${a.hedgeUnits > 0 ? 'buy' : 'sell'} ${fmt.num(Math.abs(a.hedgeUnits))} units forward (horizon)`],
     ]);
   }
   const box = card(g, 'Hedge Jacobian', 'Change in value of a unit-notional par CDS (rows) for a 1bp move in each quote (columns).');

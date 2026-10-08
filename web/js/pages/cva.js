@@ -1,6 +1,5 @@
-import { run } from '../ccr-client.js';
 import { barChart, fmt, lineChart } from '../charts.js';
-import { engineNote, engineSelector, gpuCva, runWithEngine } from '../gpu/backend.js';
+import { engineNote, engineSelector, runAnalysis } from '../gpu/backend.js';
 import { card, grid, initPage, runButton, specEditor, table, tiles } from '../ui.js';
 
 const page = initPage({
@@ -16,7 +15,7 @@ specEditor(page, ['market', 'assets', 'credit', 'own', 'correlation', 'simulatio
 
 const button = runButton(page, 'Price CVA', async (spec) => {
   const t0 = performance.now();
-  const runResult = await runWithEngine(spec, { wasm: () => run('cva', spec), gpu: () => gpuCva(spec) });
+  const runResult = await runAnalysis('cva', spec);
   const r = runResult.result;
   window.__ccrEngineRun = { page: 'cva', engine: runResult.engine, cva: r.cva, pathwiseCva: r.pathwiseCva, dva: r.bilateral?.dva };
   const p = r.profile;
@@ -25,7 +24,7 @@ const button = runButton(page, 'Price CVA', async (spec) => {
     { label: 'Unilateral CVA', value: fmt.num(r.cva) },
     { label: 'Bilateral: CVA − DVA', value: r.bilateral ? fmt.num(r.bilateral.total) : '–', hint: r.bilateral ? `CVA ${fmt.num(r.bilateral.cva)} · DVA ${fmt.num(r.bilateral.dva)}` : '' },
     { label: 'CVA running spread', value: r.runningSpread !== undefined ? fmt.bp(r.runningSpread, 2) : '–', hint: r.spreadNotional ? `on ${fmt.compact(r.spreadNotional)} over ${fmt.years(r.spreadMaturity)}` : '' },
-    { label: 'Pathwise CVA (CIR++)', value: fmt.num(r.pathwiseCva), hint: `${fmt.pct(r.pathwiseCva / r.cva - 1, 1)} vs independence` },
+    { label: 'Pathwise CVA (CIR++)', value: fmt.num(r.pathwiseCva), hint: `${fmt.pct(r.pathwiseExcess, 1)} vs independence` },
   ]);
   const g = grid(page.content);
   lineChart(card(g, 'Discounted exposures', 'EE* drives CVA and ENE* drives DVA.'), {
@@ -33,10 +32,8 @@ const button = runButton(page, 'Price CVA', async (spec) => {
     series: [{ name: 'EE* (discounted EE)', y: Array.from(p.discountedEe) }, { name: 'ENE* (discounted ENE)', y: Array.from(p.discountedEne), colorIndex: 2 }],
   });
   const terms = Array.from(r.termStructure);
-  let cum = 0;
-  const cumulative = terms.map((v) => (cum += v));
   lineChart(card(g, 'CVA accumulation over time', 'Cumulative CVA by default date. Its slope is LGD · EE* · default density.'), {
-    x: t, xLabel: 't (years)', series: [{ name: 'cumulative CVA', y: cumulative, step: false }],
+    x: t, xLabel: 't (years)', series: [{ name: 'cumulative CVA', y: Array.from(r.cumulativeCva), step: false }],
   });
   barChart(card(g, 'CVA contribution per period', ''), {
     labels: t.slice(1).map((x) => x.toFixed(2)),

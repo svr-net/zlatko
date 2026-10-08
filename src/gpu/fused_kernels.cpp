@@ -1,6 +1,6 @@
-// WGSL compute kernels for the fused exposure pipeline.
+// WGSL compute kernels of the fused exposure pipeline (see fused_exposure.hpp).
 //
-// 1. FUSED_EXPOSURE: one invocation per Monte Carlo path. For every simulation date it
+// 1. fusedExposureKernel: one invocation per Monte Carlo path. For every simulation date it
 //    draws counter-based normals, correlates them (Cholesky), advances Hull-White rates
 //    (exact joint step of x and the integrated short rate), the log-normal assets and
 //    the CIR++ intensities (Brownian-bridge sub-steps), revalues the whole netting set
@@ -8,28 +8,31 @@
 //    margin period of risk), and reduces the exposure statistics across the workgroup.
 //    No scenario cube is ever materialised: only the netted value (needed for the margin
 //    call look-back) and the positive exposure (for PFE) are written.
-// 2. REDUCE_PARTIALS: sums the per-workgroup partial statistics.
-// 3. PFE_QUANTILE: one workgroup per date builds a histogram of the exposure distribution
+// 2. reducePartialsKernel: sums the per-workgroup partial statistics.
+// 3. pfeQuantileKernel: one workgroup per date builds a histogram of the exposure distribution
 //    and reads off the requested quantile.
 //
-// Table layouts are produced by the WASM build of the C++ library (gpuPlan).
+// Buffer layouts are produced by gpu::compile(); constants match fused_exposure.hpp
+// (workgroup 64, 7 statistics per date, 3072 PFE bins, 256 PFE threads), and
+// runFusedReference() mirrors this code on the CPU.
+#include "ccr/gpu/fused_exposure.hpp"
 
-export const WG = 64;
-export const NF = 7; // statistics per date: E[V], EE, ENE, EE*, ENE*, pathwise CVA increment, E[Q]
+namespace ccr::gpu {
 
-const HEADER = /* wgsl */ `
+static_assert(kWorkgroupSize == 64 && kStatsPerDate == 7 && kPfeBins == 3072 && kPfeWorkgroupSize == 256,
+              "the WGSL sources below hard-code these constants");
+
+const std::string& fusedExposureKernel() {
+  static const std::string source = R"wgsl(
 struct Header {
   nP : u32, nT : u32, nA : u32, nC : u32,
   substeps : u32, nNormals : u32, seed : u32, antithetic : u32,
   hasCsa : u32, cpty : u32, stepStride : u32, nCorr : u32,
   offCall : u32, offReporting : u32, quantile : f32, numWG : u32,
 };
-`;
 
-export const FUSED_EXPOSURE = /* wgsl */ `
-${HEADER}
-const WG : u32 = ${WG}u;
-const NF : u32 = ${NF}u;
+const WG : u32 = 64u;
+const NF : u32 = 7u;
 const MAXA : u32 = 4u;
 const MAXF : u32 = 7u;
 
@@ -42,7 +45,7 @@ const MAXF : u32 = 7u;
 @group(0) @binding(6) var<storage, read_write> EXPO : array<f32>;     // [nT][nP] positive exposure
 @group(0) @binding(7) var<storage, read_write> PARTIALS : array<f32>; // [numWG][nT][NF]
 
-var<workgroup> red : array<f32, ${WG * NF}>;
+var<workgroup> red : array<f32, 448>;
 
 fn pcg(v : u32) -> u32 {
   let state = v * 747796405u + 2891336453u;
@@ -83,7 +86,7 @@ fn requiredCollateral(v : f32) -> f32 {
   return c;
 }
 
-@compute @workgroup_size(${WG})
+@compute @workgroup_size(64)
 fn main(@builtin(global_invocation_id) gid : vec3<u32>,
         @builtin(local_invocation_id) lid : vec3<u32>,
         @builtin(workgroup_id) wid : vec3<u32>) {
@@ -216,7 +219,7 @@ fn main(@builtin(global_invocation_id) gid : vec3<u32>,
     // Workgroup tree reduction of the statistics for this date.
     let b = lid.x * NF;
     let m = select(0.0, 1.0, isActive);
-    red[b] = m * v;
+    red[b] = m * e;
     red[b + 1u] = m * ep;
     red[b + 2u] = m * en;
     red[b + 3u] = m * D * ep;
@@ -236,17 +239,26 @@ fn main(@builtin(global_invocation_id) gid : vec3<u32>,
     workgroupBarrier();
   }
 }
-`;
+)wgsl";
+  return source;
+}
 
-export const REDUCE_PARTIALS = /* wgsl */ `
-${HEADER}
+const std::string& reducePartialsKernel() {
+  static const std::string source = R"wgsl(
+struct Header {
+  nP : u32, nT : u32, nA : u32, nC : u32,
+  substeps : u32, nNormals : u32, seed : u32, antithetic : u32,
+  hasCsa : u32, cpty : u32, stepStride : u32, nCorr : u32,
+  offCall : u32, offReporting : u32, quantile : f32, numWG : u32,
+};
+
 @group(0) @binding(0) var<uniform> H : Header;
 @group(0) @binding(1) var<storage, read> PARTIALS : array<f32>;
 @group(0) @binding(2) var<storage, read_write> SUMS : array<f32>;
 
 @compute @workgroup_size(64)
 fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
-  let n = H.nT * ${NF}u;
+  let n = H.nT * 7u;
   let i = gid.x;
   if (i >= n) { return; }
   // Kahan summation across workgroups.
@@ -260,10 +272,19 @@ fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
   }
   SUMS[i] = sum / f32(H.nP);
 }
-`;
+)wgsl";
+  return source;
+}
 
-export const PFE_QUANTILE = /* wgsl */ `
-${HEADER}
+const std::string& pfeQuantileKernel() {
+  static const std::string source = R"wgsl(
+struct Header {
+  nP : u32, nT : u32, nA : u32, nC : u32,
+  substeps : u32, nNormals : u32, seed : u32, antithetic : u32,
+  hasCsa : u32, cpty : u32, stepStride : u32, nCorr : u32,
+  offCall : u32, offReporting : u32, quantile : f32, numWG : u32,
+};
+
 const BINS : u32 = 3072u;  // 12 KiB of histogram: fits the portable 16 KiB workgroup-storage limit
 @group(0) @binding(0) var<uniform> H : Header;
 @group(0) @binding(1) var<storage, read> EXPO : array<f32>;
@@ -316,4 +337,8 @@ fn main(@builtin(workgroup_id) wid : vec3<u32>, @builtin(local_invocation_id) li
     PFE[j] = result;
   }
 }
-`;
+)wgsl";
+  return source;
+}
+
+}  // namespace ccr::gpu

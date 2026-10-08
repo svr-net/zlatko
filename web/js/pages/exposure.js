@@ -1,6 +1,5 @@
-import { run } from '../ccr-client.js';
 import { fmt, histogram, lineChart } from '../charts.js';
-import { engineNote, engineSelector, gpuExposure, gpuScopeNote, runWithEngine } from '../gpu/backend.js';
+import { engineNote, engineSelector, gpuScopeNote, runAnalysis } from '../gpu/backend.js';
 import { card, el, grid, initPage, runButton, specEditor, table, tiles, toArrays } from '../ui.js';
 
 const page = initPage({
@@ -18,13 +17,7 @@ page.toolbar.insertBefore(el('label', { class: 'status' }, 'histogram at t = ', 
 
 const button = runButton(page, 'Compute exposure', async (spec) => {
   const t0 = performance.now();
-  const runResult = await runWithEngine(spec, {
-    wasm: () => run('exposure', { ...spec, samplePaths: 30, histogramTime: Number(histInput.value) }),
-    gpu: async () => {
-      const g = await gpuExposure(spec);
-      return { profile: g.profile, numPaths: spec.sim.numPaths, simulationDates: g.plan.times.length, reportingDates: g.profile.times.length, elapsedMs: g.gpuMs, adapter: g.adapter };
-    },
-  });
+  const runResult = await runAnalysis('exposure', { ...spec, samplePaths: 30, histogramTime: Number(histInput.value) });
   const r = runResult.result;
   const onGpu = runResult.engine === 'gpu';
   const p = r.profile, gp = r.grossProfile;
@@ -38,8 +31,8 @@ const button = runButton(page, 'Compute exposure', async (spec) => {
     { label: 'Lifetime EPE', value: fmt.compact(p.epeLife) },
     onGpu
       ? { label: 'Netting benefit', value: '–', hint: 'WebAssembly engine only' }
-      : { label: 'Netting benefit', value: fmt.pct(1 - p.eepe1y / gp.eepe1y, 1), hint: `EEPE netted ${fmt.compact(p.eepe1y)} vs gross ${fmt.compact(gp.eepe1y)}` },
-    { label: 'Simulation', value: `${fmt.num(r.numPaths)} × ${r.simulationDates}`, hint: `${r.reportingDates} reporting dates, ${fmt.num(r.elapsedMs)} ms on ${onGpu ? 'WebGPU' : 'WebAssembly'}` },
+      : { label: 'Netting benefit', value: fmt.pct(r.nettingBenefit, 1), hint: `EEPE netted ${fmt.compact(p.eepe1y)} vs gross ${fmt.compact(gp.eepe1y)}` },
+    { label: 'Simulation', value: `${fmt.num(r.numPaths)} × ${r.simulationDates}`, hint: `${r.reportingDates} reporting dates, ${fmt.num(onGpu ? r.gpuMs : r.elapsedMs)} ms on ${onGpu ? 'WebGPU' : 'WebAssembly'}` },
   ]);
   const g = grid(page.content);
   lineChart(card(g, 'Exposure profile', onGpu ? 'Exposure statistics aggregated on the GPU.' : 'Grey lines are sample paths of the value at risk on default (netted, net of collateral).'), {

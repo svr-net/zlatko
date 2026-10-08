@@ -31,3 +31,5 @@
 #include "ccr/cva/cva.hpp"
 
 #include "ccr/hedging/sensitivities.hpp"
+
+#include "ccr/gpu/fused_exposure.hpp"

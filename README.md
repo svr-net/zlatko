@@ -121,31 +121,39 @@ python3 -m http.server -d web 8000      # any static server; file:// will not lo
 | `instruments.html` | Swaps, forwards, options, Bermudans on scenarios | `priceTrades` |
 | `amc.html` | Longstaff–Schwartz policy, physical vs cash exposure | `amc` |
 | `exposure.html` | EE/ENE/PFE/EPE/EEPE, netting benefit, distribution | `exposure` |
-| `collateral.html` | Thresholds, MTA, independent amount, margin period of risk | `exposure` |
+| `collateral.html` | Thresholds, MTA, independent amount, margin period of risk | `collateral` |
 | `allocation.html` | Marginal (Euler), incremental and standalone CVA | `allocation` |
 | `cva.html` | Unilateral/bilateral CVA, term structure, running spread | `cva` |
 | `wwr.html` | Pathwise CVA against exposure–intensity correlation | `wrongWayRisk` |
 | `hedging.html` | CS01 buckets, CDS hedge, CRN vs independent-seed deltas | `hedging` |
-| `gpu.html` | Fused WebGPU kernels validated against WASM, with a benchmark | `gpuPlan` + `web/js/gpu` |
+| `gpu.html` | Fused WebGPU kernels validated against WASM, with a benchmark | `gpuJobs` · `gpuAnalyse` (`validation`) |
 
 The pages share one specification: market, models, correlation, portfolio, CSA and simulation settings. You edit it on any
 page, and the browser's local storage keeps it. The WASM module runs in a module worker, so long Monte Carlo runs don't block the page.
 
-**Compute engine.** The Overview, Exposure, Collateral, CVA/DVA, Wrong-way risk and CVA hedging pages have an *Engine* selector: **Auto** (the default) runs the fused WebGPU kernels whenever the browser supports WebGPU, on desktop and mobile alike, and WebAssembly otherwise; **WebGPU** or **WebAssembly** forces one. On the GPU, the kernels compute the exposure profile and pathwise CVA, and the WASM library applies the closed-form analytics to that profile (`cvaFromProfile` for CVA/DVA, `creditHedgingFromProfile` for CS01s, CDS hedge notionals and the spread scenarios). The hedging page also runs its bump-and-revalue deltas and CVA DV01 on the GPU, with the same seed for the up and down runs (common random numbers). Views that need individual paths (sample paths, the netting benefit, per-trade profiles, the exposure histogram) are WebAssembly-only. Unsupported portfolios (Bermudans need AMC) and GPU errors fall back to WebAssembly, and the status line names the engine that ran and why.
+**Compute engine.** The Overview, Exposure, Collateral, CVA/DVA, Wrong-way risk and CVA hedging pages have an *Engine* selector: **Auto** (the default) runs the fused WebGPU kernels whenever the browser supports WebGPU, on desktop and mobile alike, and WebAssembly otherwise; **WebGPU** or **WebAssembly** forces one. Unsupported portfolios (Bermudans need AMC) and GPU errors fall back to WebAssembly, and the status line names the engine that ran and why. Views that need individual paths (sample paths, the netting benefit, per-trade profiles, the exposure histogram) are WebAssembly-only.
 
-**WebGPU fused kernels.** `gpuPlan(spec)` uses the library's own models to compile the netting set into flat tables:
+**All numerics are in C++.** Each Monte Carlo analysis (`exposure`, `collateral`, `cva`, `wrongWayRisk`, `hedging`) is defined once in `wasm/bindings.cpp` as a list of exposure jobs (for example the base run, every bumped run and the rate shifts of the hedging analysis) and a combine step. On WebAssembly each job runs on `ExposureEngine`. On WebGPU:
+
+1. `gpuJobs(spec)` compiles each job with `ccr::gpu::compile` into a plan of ready-made GPU buffers, dispatch sizes and buffer sizes.
+2. `web/js/gpu/engine.js` uploads each plan, dispatches the three kernels and reads back two arrays. The kernel sources come from the library (`gpuKernels`).
+3. `gpuAnalyse(spec)` turns the read-backs into profiles (`ccr::gpu::summarise`) and runs the same combine step as the CPU path.
+
+The JavaScript layer (`web/js/gpu`, about 200 lines) only routes calls and talks to WebGPU, and the pages only render results. `gpuEmulate(spec)` runs the kernels on the CPU instead, which is how Node tests the GPU path.
+
+**WebGPU fused kernels** (`include/ccr/gpu/fused_exposure.hpp`). `compile()` uses the library's own models to turn the netting set into flat tables:
 - exact Hull–White step coefficients;
 - per-date bond terms `A·e^(−Bx)`, fixing records and option terms;
 - the margin-call look-back;
 - the Cholesky factor and the CIR++ shift.
 
-Three compute kernels then run on these tables:
+Three WGSL compute kernels (`src/gpu/fused_kernels.cpp`) then run on these tables:
 1. **fused-exposure** runs once per path. It draws counter-based normals, correlates them, steps rates, FX and CIR++,
-   revalues the netting set, applies the CSA and reduces EE/ENE/EE*/pathwise-CVA across the workgroup. It never builds a scenario cube.
+   revalues the netting set, applies the CSA and reduces E[V−C]/EE/ENE/EE*/ENE*/pathwise-CVA/E[Q] across the workgroup. It never builds a scenario cube.
 2. **reduce-partials** sums the workgroup results.
 3. **pfe-quantile** builds a histogram per date and reads off the quantile.
 
-The GPU works in f32 with its own random number generator, so it agrees with WASM within Monte Carlo error. Bermudans need AMC regression and stay in WASM.
+`runFusedReference()` (`src/gpu/fused_reference.cpp`) executes the same three kernels on the CPU in single precision, so the unit tests check the kernel algorithm natively against `ExposureEngine`. The GPU works in f32 with its own random number generator, so it agrees with the double-precision engine within Monte Carlo error.
 
 **Rebuilding the WASM module.** The built `web/wasm/ccr.{js,wasm}` is committed. Rebuild it with Docker (`--target wasm-artifacts` above), or with a local Emscripten:
 
@@ -172,6 +180,7 @@ node web/tests/e2e.mjs                   # every page in headless Chromium (Play
 | Exposure allocation | `exposure/allocation.hpp` | Marginal (Euler) contributions that add up to the netting-set EE/CVA, and incremental exposure of a new trade |
 | Pricing counterparty risk | `cva/cva.hpp` | Unilateral CVA, CVA term structure, bilateral CVA/DVA with first-to-default, CVA as a running spread |
 | Wrong-way risk | `cva/cva.hpp` (`pathwiseCva`) | Path-by-path CVA using the simulated survival probabilities, with the intensity correlated to the exposure drivers |
+| GPU exposure | `gpu/fused_exposure.hpp` | The exposure pipeline as fused WGSL kernels: plan compiler, kernel sources, read-back summary, and a CPU reference of the kernels |
 | Hedging | `hedging/sensitivities.hpp` | Bucketed CS01 of CVA with re-bootstrapped curves, CDS hedge notionals from the hedge Jacobian, and market-risk deltas by bump-and-revalue with common random numbers |
 
 ## Conventions
