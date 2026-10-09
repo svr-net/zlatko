@@ -119,6 +119,22 @@ std::string limitation(const ExposureEngine& engine, const NettingSet& nettingSe
 /// Turns the GPU read-back into an exposure profile on the reporting dates.
 FusedResult summarise(const FusedPlan& plan, const FusedOutput& output);
 
+/// The fused-exposure kernel for workgroups [wgBegin, wgEnd) on the CPU: their partial
+/// statistics and the positive exposure of their paths ([date][path in the slice]).
+struct FusedSlice {
+  std::size_t wgBegin = 0, wgEnd = 0;      ///< workgroups covered
+  std::size_t pathBegin = 0, pathEnd = 0;  ///< paths covered
+  std::vector<float> partials;             ///< [workgroup][date][stat]
+  std::vector<float> exposure;             ///< [date][path - pathBegin]
+};
+
+/// Runs workgroups [wgBegin, wgEnd) of the fused kernel on the CPU in single precision.
+FusedSlice runFusedWorkgroups(const FusedPlan& plan, std::size_t wgBegin, std::size_t wgEnd);
+
+/// The reduce-partials and pfe-quantile kernels over slices that cover every workgroup in
+/// order. The result is the same however the workgroups were split.
+FusedOutput finishFused(const FusedPlan& plan, const std::vector<FusedSlice>& slices);
+
 /// The three kernels executed on the CPU in single precision, as the GPU runs them.
 FusedOutput runFusedReference(const FusedPlan& plan);
 

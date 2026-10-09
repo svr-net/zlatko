@@ -1465,6 +1465,73 @@ val gpuEmulate(val spec) {
   });
 }
 
+// ------------------------------------------------------------------ CPU fused-kernel backend
+//
+// The fused kernels on the CPU, split across Web Workers like workgroups across GPU cores:
+// each worker calls cpuKernelSlices with spec.part / spec.parts and runs that share of the
+// workgroups of every job; cpuKernelAnalyse(spec) with spec.parts = the workers' results (in
+// part order) finishes each job exactly as the GPU's reduce and PFE kernels do and returns
+// the same result as the GPU path. The result does not depend on the number of workers.
+
+val cpuKernelSlices(val spec) {
+  return guarded([&] {
+    const Env env = parseEnv(spec);
+    const GpuJobs g = compileJobs(spec, env);
+    val out = val::object();
+    if (!g.unsupported.empty()) {
+      out.set("unsupported", g.unsupported);
+      return out;
+    }
+    const auto part = static_cast<std::size_t>(num(spec, "part", 0));
+    const auto parts = static_cast<std::size_t>(std::max(1.0, num(spec, "parts", 1)));
+    if (part >= parts) throw std::invalid_argument("cpuKernelSlices: part out of range");
+    const double t0 = nowMs();
+    val jobs = val::array();
+    for (const auto& plan : g.plans) {
+      if (!plan) {
+        jobs.call<void>("push", val::null());
+        continue;
+      }
+      const std::size_t numWG = plan->numWorkgroups();
+      const gpu::FusedSlice sl = gpu::runFusedWorkgroups(*plan, numWG * part / parts, numWG * (part + 1) / parts);
+      val o = val::object();
+      o.set("wgBegin", static_cast<double>(sl.wgBegin));
+      o.set("wgEnd", static_cast<double>(sl.wgEnd));
+      o.set("pathBegin", static_cast<double>(sl.pathBegin));
+      o.set("pathEnd", static_cast<double>(sl.pathEnd));
+      o.set("partials", typedArray(sl.partials));
+      o.set("exposure", typedArray(sl.exposure));
+      jobs.call<void>("push", o);
+    }
+    out.set("jobs", jobs);
+    out.set("kernelMs", nowMs() - t0);
+    return out;
+  });
+}
+
+val cpuKernelAnalyse(val spec) {
+  return guarded([&] {
+    const val parts = spec["parts"];
+    const auto nParts = parts["length"].as<std::size_t>();
+    return analyseFused(spec, [&](std::size_t job, const gpu::FusedPlan& plan) -> std::optional<gpu::FusedOutput> {
+      std::vector<gpu::FusedSlice> slices;
+      for (std::size_t k = 0; k < nParts; ++k) {
+        const val o = parts[k]["jobs"][job];
+        if (o.isNull() || o.isUndefined()) return std::nullopt;
+        gpu::FusedSlice sl;
+        sl.wgBegin = o["wgBegin"].as<std::size_t>();
+        sl.wgEnd = o["wgEnd"].as<std::size_t>();
+        sl.pathBegin = o["pathBegin"].as<std::size_t>();
+        sl.pathEnd = o["pathEnd"].as<std::size_t>();
+        sl.partials = emscripten::convertJSArrayToNumberVector<float>(o["partials"]);
+        sl.exposure = emscripten::convertJSArrayToNumberVector<float>(o["exposure"]);
+        slices.push_back(std::move(sl));
+      }
+      return gpu::finishFused(plan, slices);
+    });
+  });
+}
+
 }  // namespace
 
 EMSCRIPTEN_BINDINGS(ccr) {
@@ -1484,4 +1551,6 @@ EMSCRIPTEN_BINDINGS(ccr) {
   emscripten::function("gpuJobs", &gpuJobs);
   emscripten::function("gpuAnalyse", &gpuAnalyse);
   emscripten::function("gpuEmulate", &gpuEmulate);
+  emscripten::function("cpuKernelSlices", &cpuKernelSlices);
+  emscripten::function("cpuKernelAnalyse", &cpuKernelAnalyse);
 }

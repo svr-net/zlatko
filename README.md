@@ -131,7 +131,12 @@ python3 -m http.server -d web 8000      # any static server; file:// will not lo
 The pages share one specification: market, models, correlation, portfolio, CSA and simulation settings. You edit it on any
 page, and the browser's local storage keeps it. The WASM module runs in a module worker, so long Monte Carlo runs don't block the page.
 
-**Compute engine.** The Overview, Exposure, Collateral, CVA/DVA, Wrong-way risk and CVA hedging pages have an *Engine* selector: **Auto** (the default) runs the fused WebGPU kernels whenever the browser supports WebGPU, on desktop and mobile alike, and WebAssembly otherwise; **WebGPU** or **WebAssembly** forces one. Unsupported portfolios (Bermudans need AMC) and GPU errors fall back to WebAssembly, and the status line names the engine that ran and why. Views that need individual paths (sample paths, the netting benefit, per-trade profiles, the exposure histogram) are WebAssembly-only.
+**Compute engine.** The Overview, Exposure, Collateral, CVA/DVA, Wrong-way risk and CVA hedging pages have an *Engine* selector:
+- **Auto** (the default) uses the fused **WebGPU** kernels wherever the browser offers a WebGPU adapter, on desktop and mobile alike. On Android it also tries a WebGPU compatibility-mode adapter.
+- Where there is no adapter, for example where Chrome blocks WebGPU for the GPU or driver, Auto runs the **same fused kernels on the CPU**. The workgroups are split across Web Workers, one per core and at most 8, and reduced exactly as the GPU's reduce and PFE kernels do. The result is identical however many workers run, and agrees with WebGPU to about 0.004%.
+- Portfolios the kernels cannot price (Bermudans need AMC) and failures fall back to **WebAssembly** (the library's `ExposureEngine`).
+- **WebGPU**, **CPU fused kernels** or **WebAssembly** forces one engine. The status line names the engine that ran and why. Views that need individual paths (sample paths, the netting benefit, per-trade profiles, the exposure histogram) are WebAssembly-only.
+- On the WebGPU page, a device without WebGPU validates the CPU fused kernels against WebAssembly instead.
 
 **All numerics are in C++.** Each Monte Carlo analysis (`exposure`, `collateral`, `cva`, `wrongWayRisk`, `hedging`) is defined once in `wasm/bindings.cpp` as a list of exposure jobs (for example the base run, every bumped run and the rate shifts of the hedging analysis) and a combine step. On WebAssembly each job runs on `ExposureEngine`. On WebGPU:
 
@@ -155,7 +160,7 @@ Three WGSL compute kernels (`src/gpu/fused_kernels.cpp`) then run on these table
 2. **reduce-partials** sums the workgroup results.
 3. **pfe-quantile** builds a histogram per date and reads off the quantile.
 
-`runFusedReference()` (`src/gpu/fused_reference.cpp`) executes the same three kernels on the CPU in single precision, so the unit tests check the kernel algorithm natively against `ExposureEngine`. The GPU works in f32 with its own random number generator, so it agrees with the double-precision engine within Monte Carlo error.
+`runFusedReference()` (`src/gpu/fused_reference.cpp`) executes the same three kernels on the CPU in single precision, so the unit tests check the kernel algorithm natively against `ExposureEngine`. It is split into `runFusedWorkgroups()` (any range of workgroups) and `finishFused()` (the reduce and PFE kernels). That split is the CPU backend: the WASM entry points `cpuKernelSlices` and `cpuKernelAnalyse` run it across Web Workers. The GPU works in f32 with its own random number generator, so it agrees with the double-precision engine within Monte Carlo error.
 
 **Rebuilding the WASM module.** The built `web/wasm/ccr.{js,wasm}` is committed. Rebuild it with Docker (`--target wasm-artifacts` above), or with a local Emscripten:
 

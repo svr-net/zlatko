@@ -19,11 +19,11 @@ const button = runButton(page, 'Compute exposure', async (spec) => {
   const t0 = performance.now();
   const runResult = await runAnalysis('exposure', { ...spec, samplePaths: 30, histogramTime: Number(histInput.value) });
   const r = runResult.result;
-  const onGpu = runResult.engine === 'gpu';
+  const onGpu = runResult.fused; // WebGPU or the CPU fused kernels: aggregates only
   const p = r.profile, gp = r.grossProfile;
   const t = Array.from(p.times);
   window.__ccrEngineRun = { page: 'exposure', engine: runResult.engine, eepe1y: p.eepe1y, maxPfe: p.maxPfe };
-  if (onGpu) gpuScopeNote(page.content, 'sample paths, the netting benefit, per-trade profiles and the exposure distribution');
+  if (onGpu) gpuScopeNote(page.content, 'sample paths, the netting benefit, per-trade profiles and the exposure distribution', runResult.label);
   tiles(page.content, [
     { label: 'EPE (1y)', value: fmt.compact(p.epe1y), hint: 'time-average of EE' },
     { label: 'Effective EPE (1y)', value: fmt.compact(p.eepe1y), hint: 'Basel EAD = α · EEPE' },
@@ -32,10 +32,10 @@ const button = runButton(page, 'Compute exposure', async (spec) => {
     onGpu
       ? { label: 'Netting benefit', value: '–', hint: 'WebAssembly engine only' }
       : { label: 'Netting benefit', value: fmt.pct(r.nettingBenefit, 1), hint: `EEPE netted ${fmt.compact(p.eepe1y)} vs gross ${fmt.compact(gp.eepe1y)}` },
-    { label: 'Simulation', value: `${fmt.num(r.numPaths)} × ${r.simulationDates}`, hint: `${r.reportingDates} reporting dates, ${fmt.num(onGpu ? r.gpuMs : r.elapsedMs)} ms on ${onGpu ? 'WebGPU' : 'WebAssembly'}` },
+    { label: 'Simulation', value: `${fmt.num(r.numPaths)} × ${r.simulationDates}`, hint: `${r.reportingDates} reporting dates, ${fmt.num(onGpu ? r.gpuMs : r.elapsedMs)} ms on ${runResult.label}` },
   ]);
   const g = grid(page.content);
-  lineChart(card(g, 'Exposure profile', onGpu ? 'Exposure statistics aggregated on the GPU.' : 'Grey lines are sample paths of the value at risk on default (netted, net of collateral).'), {
+  lineChart(card(g, 'Exposure profile', onGpu ? `Exposure statistics aggregated by the ${runResult.label}.` : 'Grey lines are sample paths of the value at risk on default (netted, net of collateral).'), {
     x: t, xLabel: 't (years)', zero: true, samples: onGpu ? undefined : toArrays(r.exposureSamples),
     series: [
       { name: 'EE', y: Array.from(p.ee) },

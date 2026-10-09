@@ -60,13 +60,17 @@ const cases = [
   ...['exposure', 'cva', 'hedging'].flatMap((name) => [
     { name: `${name}-wasm-pair`, file: name, spec: pairSpec, engine: 'wasm', expectEngine: 'WebAssembly', pair: name },
     { name: `${name}-gpu-pair`, file: name, spec: pairSpec, engine: 'gpu', expectEngine: 'WebGPU', pair: name },
+    { name: `${name}-cpu-pair`, file: name, spec: pairSpec, engine: 'cpu', expectEngine: 'CPU fused kernels', pair: name },
   ]),
   // Android drivers: no adapter for a high-performance request but one for a plain request
   // (Auto must still reach WebGPU), and no adapter at all (WebAssembly, with the reason).
   { name: 'exposure-android-quirk', file: 'exposure', spec: testSpec, engine: 'auto', expectEngine: 'WebGPU', gpuStub: 'no-high-performance', device: 'Pixel 7' },
   // Chrome offers only a WebGPU compatibility-mode adapter (OpenGL ES): Auto must use it.
   { name: 'exposure-compat-only', file: 'exposure', spec: testSpec, engine: 'auto', expectEngine: 'WebGPU', gpuStub: 'compat-only', device: 'Pixel 7', expectReason: 'compatibility mode' },
-  { name: 'exposure-no-adapter', file: 'exposure', spec: testSpec, engine: 'auto', expectEngine: 'WebAssembly', gpuStub: 'no-adapter', expectReason: 'WebGPU unavailable' },
+  // No adapter at all (WebGPU blocked by Chrome): Auto runs the same fused kernels on the CPU.
+  { name: 'exposure-no-adapter', file: 'exposure', spec: testSpec, engine: 'auto', expectEngine: 'CPU fused kernels', gpuStub: 'no-adapter', expectReason: 'WebGPU unavailable', device: 'Pixel 7' },
+  { name: 'gpu-no-adapter', file: 'gpu', spec: gpuSpec, gpuStub: 'no-adapter', expectEngine: 'CPU fused kernels' },
+  { name: 'hedging-no-adapter', file: 'hedging', spec: testSpec, engine: 'auto', expectEngine: 'CPU fused kernels', gpuStub: 'no-adapter' },
   // A phone: Auto must pick WebGPU, and the collapsed menu must leave the page content in view.
   { name: 'exposure-mobile', file: 'exposure', spec: testSpec, engine: 'auto', expectEngine: 'WebGPU', device: 'iPhone 14' },
 ];
@@ -119,8 +123,11 @@ for (const { name, file, spec, engine, expectEngine, pair, device, gpuStub, expe
   // The status line is not enough: the fused kernels must really have been dispatched on WebGPU
   // (and never when WebAssembly ran).
   const gpuRuns = await page.evaluate(() => globalThis.__ccrGpuRuns || 0);
+  const cpuRuns = await page.evaluate(() => globalThis.__ccrCpuKernelRuns || 0);
   if (expectEngine === 'WebGPU' && gpuRuns === 0) problems.push('no fused pipeline was dispatched on WebGPU');
-  if (expectEngine === 'WebAssembly' && gpuRuns > 0) problems.push(`${gpuRuns} WebGPU dispatches while WebAssembly ran`);
+  if (expectEngine === 'CPU fused kernels' && cpuRuns === 0) problems.push('the CPU fused kernels did not run');
+  if (expectEngine && expectEngine !== 'WebGPU' && gpuRuns > 0) problems.push(`${gpuRuns} WebGPU dispatches while the ${expectEngine} engine ran`);
+  if (expectEngine && expectEngine !== 'CPU fused kernels' && cpuRuns > 0) problems.push(`CPU kernels ran while the ${expectEngine} engine ran`);
   if (pair) pairs[pair] = { ...(pairs[pair] || {}), [engine]: await page.evaluate(() => window.__ccrEngineRun) };
   if (device) {
     const layout = await page.evaluate(() => ({
@@ -134,7 +141,7 @@ for (const { name, file, spec, engine, expectEngine, pair, device, gpuStub, expe
     await page.click('.menu-toggle');
     if (await page.evaluate(() => document.getElementById('nav-links').offsetParent === null)) problems.push('menu button does not open the menu');
   }
-  if (file === 'gpu') {
+  if (file === 'gpu' && !gpuStub) {
     const probe = await page.waitForFunction(() => window.__ccrWebGpuProbe, null, { timeout: 30000 }).then((h) => h.jsonValue()).catch(() => null);
     if (!probe || !probe.adapters.some((a) => a.adapter)) problems.push(`WebGPU diagnostics found no adapter: ${JSON.stringify(probe)}`);
   }
@@ -166,13 +173,24 @@ const metrics = {
     ['delta (CRN, h=0.005)', (r) => r.deltaCrn[0][3]]],
 };
 for (const [name, r] of Object.entries(pairs)) {
-  if (!r.wasm || !r.gpu) continue;
   const tol = 4 / Math.sqrt(name === 'hedging' ? 1500 : pairSpec.sim.numPaths);
-  for (const [label, get] of metrics[name]) {
-    const w = get(r.wasm), g = get(r.gpu);
-    const diff = Math.abs(g - w) / Math.abs(w);
-    const ok = diff < tol;
-    console.log(`${ok ? 'ok  ' : 'FAIL'} ${`${name} engines`.padEnd(16)} ${label}: WASM ${w.toFixed(1)} vs GPU ${g.toFixed(1)} (${(100 * diff).toFixed(2)}%, tol ${(100 * tol).toFixed(1)}%)`);
+  for (const fused of ['gpu', 'cpu']) {
+    if (!r.wasm || !r[fused]) continue;
+    for (const [label, get] of metrics[name]) {
+      const w = get(r.wasm), g = get(r[fused]);
+      const diff = Math.abs(g - w) / Math.abs(w);
+      const ok = diff < tol;
+      console.log(`${ok ? 'ok  ' : 'FAIL'} ${`${name} WASM/${fused}`.padEnd(16)} ${label}: WASM ${w.toFixed(1)} vs ${fused.toUpperCase()} ${g.toFixed(1)} (${(100 * diff).toFixed(2)}%, tol ${(100 * tol).toFixed(1)}%)`);
+      if (!ok) failures++;
+    }
+  }
+  // The CPU kernels run the GPU's algorithm and random numbers in f32: they agree with the GPU
+  // far more closely than either agrees with WebAssembly.
+  if (r.gpu && r.cpu) {
+    const [label, get] = metrics[name][0];
+    const diff = Math.abs(get(r.cpu) - get(r.gpu)) / Math.abs(get(r.gpu));
+    const ok = diff < 1e-3;
+    console.log(`${ok ? 'ok  ' : 'FAIL'} ${`${name} GPU/CPU`.padEnd(16)} ${label}: GPU ${get(r.gpu).toFixed(2)} vs CPU kernels ${get(r.cpu).toFixed(2)} (${(100 * diff).toFixed(4)}%, tol 0.1%)`);
     if (!ok) failures++;
   }
 }
