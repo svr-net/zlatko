@@ -9,7 +9,7 @@ const page = initPage({
   description:
     'Interactive front end for the library modelling <i>Modelling, Pricing, and Hedging Counterparty Credit Exposure</i> ' +
     '(Cesari, Aquilina, Charpillon, Filipović, Lee, Manda; Springer 2009). The C++ library is compiled to WebAssembly and runs in a worker. ' +
-    'The exposure pipeline also runs as fused WebGPU compute kernels. Each page below exercises one context of the library on a shared, editable specification.',
+    'The exposure pipeline also runs as fused compute kernels, on WebGPU or, where the browser offers no GPU, on the CPU across Web Workers. Each page below exercises one context of the library on a shared, editable specification.',
 });
 
 const DESCRIPTIONS = {
@@ -41,7 +41,7 @@ const button = runButton(page, 'Run quick exposure', async (spec) => {
   const t0 = performance.now();
   const runResult = await runAnalysis('exposure', spec);
   const r = runResult.result;
-  const onGpu = runResult.engine === 'gpu';
+  const onGpu = runResult.fused; // WebGPU or the CPU fused kernels: aggregates only
   const p = r.profile;
   window.__ccrEngineRun = { page: 'index', engine: runResult.engine, eepe1y: p.eepe1y };
   tiles(page.content, [
@@ -50,7 +50,7 @@ const button = runButton(page, 'Run quick exposure', async (spec) => {
     onGpu
       ? { label: 'Netting benefit (EEPE)', value: '–', hint: 'WebAssembly engine only' }
       : { label: 'Netting benefit (EEPE)', value: fmt.pct(r.nettingBenefit, 1), hint: 'vs sum of positive trade values' },
-    { label: 'Paths × dates', value: `${fmt.num(r.numPaths)} × ${r.simulationDates}`, hint: `${fmt.num(onGpu ? r.gpuMs : r.elapsedMs)} ms on ${onGpu ? 'WebGPU' : 'WebAssembly'}` },
+    { label: 'Paths × dates', value: `${fmt.num(r.numPaths)} × ${r.simulationDates}`, hint: `${fmt.num(onGpu ? r.gpuMs : r.elapsedMs)} ms on ${runResult.label}` },
   ]);
   const gr = grid(page.content);
   lineChart(card(gr, 'Exposure profile of the default netting set', 'Full analysis on the <a href="exposure.html">exposure page</a>.'), {

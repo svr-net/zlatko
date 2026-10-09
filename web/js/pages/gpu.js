@@ -1,7 +1,7 @@
 import { run } from '../ccr-client.js';
 import { barChart, fmt, lineChart } from '../charts.js';
 import { probeAdapters } from '../gpu/engine.js';
-import { runOnGpu } from '../gpu/backend.js';
+import { runOnCpuKernels, runOnGpu } from '../gpu/backend.js';
 import { card, el, grid, initPage, passFail, runButton, specEditor, table, tiles } from '../ui.js';
 
 const page = initPage({
@@ -18,16 +18,30 @@ const page = initPage({
 specEditor(page, ['market', 'assets', 'credit', 'correlation', 'simulation', 'csa', 'portfolio']);
 
 runButton(page, 'Run on GPU and validate against WASM', async (spec) => {
-  const g = await runOnGpu('validation', spec, { warmUp: true });
+  // Without a WebGPU adapter (e.g. Chrome blocks WebGPU for the GPU), validate the same fused
+  // kernels running on the CPU across Web Workers instead.
+  let g, onCpu = false;
+  try {
+    g = await runOnGpu('validation', spec, { warmUp: true });
+  } catch (e) {
+    if (!/no WebGPU adapter|too limited|not available/.test(e.message)) throw e;
+    g = await runOnCpuKernels('validation', spec);
+    onCpu = true;
+    page.content.append(el('p', { class: 'note engine-note' }, el('b', { text: 'No WebGPU on this device. ' }),
+      `${e.message.replace('no WebGPU adapter: ', '')}. The same fused kernels ran on the CPU across ${g.result.workers} Web Workers and are validated below.`));
+  }
   if (g.unsupported) throw new Error('not on GPU: ' + g.unsupported);
   const r = g.result;
   const gp = r.gpu.profile, wp = r.wasm.profile, c = r.checks;
+  const engineName = onCpu ? `CPU fused kernels (${r.workers} workers)` : 'GPU fused pipeline';
 
   tiles(page.content, [
-    { label: 'GPU fused pipeline', value: fmt.num(r.gpuMs, 1) + ' ms', hint: `${fmt.num(r.numPaths)} paths × ${r.numDates} dates` },
+    { label: engineName, value: fmt.num(r.gpuMs, 1) + ' ms', hint: `${fmt.num(r.numPaths)} paths × ${r.numDates ?? r.gpu.simulationDates} dates` },
     { label: 'WASM (CPU, 1 thread)', value: fmt.num(r.wasm.elapsedMs, 0) + ' ms', hint: 'scenarios + pricing' },
-    { label: 'Speed-up', value: (r.wasm.elapsedMs / r.gpuMs).toFixed(1) + '×', hint: 'includes upload & read-back' },
-    { label: 'Plan compile (C++)', value: fmt.num(r.compileMs, 1) + ' ms', hint: `${fmt.num(r.numTerms)} valuation terms` },
+    { label: 'Speed-up', value: (r.wasm.elapsedMs / r.gpuMs).toFixed(1) + '×', hint: onCpu ? 'workers vs one thread' : 'includes upload & read-back' },
+    onCpu
+      ? { label: 'Workers', value: String(r.workers), hint: 'one per CPU core, at most 8' }
+      : { label: 'Plan compile (C++)', value: fmt.num(r.compileMs, 1) + ' ms', hint: `${fmt.num(r.numTerms)} valuation terms` },
     { label: 'CVA (GPU / WASM)', value: `${fmt.compact(r.gpu.cva)} / ${fmt.compact(r.wasm.cva)}`, hint: 'independence, market survival' },
     { label: 'Pathwise CVA (GPU / WASM)', value: `${fmt.compact(r.gpu.pathwiseCva)} / ${fmt.compact(r.wasm.pathwiseCva)}`, hint: 'stochastic CIR++ intensity' },
   ]);
@@ -71,7 +85,9 @@ runButton(page, 'Run on GPU and validate against WASM', async (spec) => {
     ['EEPE (1y) GPU / WASM', `${fmt.compact(gp.eepe1y)} / ${fmt.compact(wp.eepe1y)}`, '', ''],
   ]);
   window.__ccrLastRun = { checks: c };
-  return `GPU ${fmt.num(r.gpuMs, 1)} ms · WASM ${fmt.num(r.wasm.elapsedMs)} ms · adapter: ${r.adapter}`;
+  return onCpu
+    ? `Done · CPU fused kernels ${fmt.num(r.gpuMs, 1)} ms · WASM ${fmt.num(r.wasm.elapsedMs)} ms · ${r.adapter}`
+    : `GPU ${fmt.num(r.gpuMs, 1)} ms · WASM ${fmt.num(r.wasm.elapsedMs)} ms · adapter: ${r.adapter}`;
 });
 
 const bench = el('button', { text: 'Benchmark path scaling' });

@@ -129,3 +129,21 @@ TEST(gpu_fused_kernel_common_random_numbers) {
   const double fine = (bumped(0.005) - bumped(-0.005)) / 0.01;
   CHECK_NEAR(fine, coarse, 0.05 * std::fabs(coarse));
 }
+
+TEST(gpu_fused_kernel_split_across_workers_is_exact) {
+  // The CPU backend splits the workgroups across workers: any split must reproduce the
+  // single-pass result bit for bit (same per-workgroup partials, same reduction order).
+  const auto s = gpuSetup(1000, true);  // 16 workgroups, the last one partial
+  const auto plan = gpu::compile(s.engine, s.nettingSet, 0.95, 0);
+  const auto whole = gpu::runFusedReference(plan);
+  const std::size_t numWG = plan.numWorkgroups();
+  for (const std::size_t parts : {std::size_t(2), std::size_t(3), std::size_t(7), numWG + 3}) {
+    std::vector<gpu::FusedSlice> slices;
+    for (std::size_t k = 0; k < parts; ++k) slices.push_back(gpu::runFusedWorkgroups(plan, numWG * k / parts, numWG * (k + 1) / parts));
+    const auto split = gpu::finishFused(plan, slices);
+    CHECK(split.sums == whole.sums);
+    CHECK(split.pfe == whole.pfe);
+  }
+  // Slices that leave a gap are rejected.
+  CHECK_THROWS(gpu::finishFused(plan, {gpu::runFusedWorkgroups(plan, 0, numWG / 2)}));
+}

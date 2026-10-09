@@ -21,7 +21,7 @@ const button = runButton(page, 'Compare CSAs', async (spec) => {
   const r = runResult.result;
   const v = r.variants;
   window.__ccrEngineRun = { page: 'collateral', engine: runResult.engine, eepe1y: v.map((x) => x.profile.eepe1y) };
-  if (runResult.engine === 'gpu') gpuScopeNote(page.content, 'the sample paths of value and collateral held');
+  if (runResult.fused) gpuScopeNote(page.content, 'the sample paths of value and collateral held', runResult.label);
   const t = Array.from(v[0].profile.times);
   const g = grid(page.content);
   lineChart(card(g, 'Expected exposure by CSA', ''), {

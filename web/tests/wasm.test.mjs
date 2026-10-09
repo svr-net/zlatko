@@ -89,6 +89,21 @@ if (valid) {
   const c = valid.checks;
   check(c.t0Diff < 1e-6 && c.eeDiff < c.tol && c.cvaDiff < c.tol && c.survDiff < 0.01, `validation checks ${JSON.stringify(c)}`);
 }
+// CPU fused-kernel backend: the workgroups split across 3 "workers" must give exactly the
+// single-pass emulation, for a multi-job analysis too.
+for (const analysis of ['cva', 'hedging']) {
+  const base = analysis === 'cva' ? pairSpec : hedgeSpec;
+  const t0 = performance.now();
+  const parts = [0, 1, 2].map((part) => ccr.cpuKernelSlices({ ...base, analysis, part, parts: 3 }));
+  const split = run(`cpuKernelAnalyse ${analysis} (3 parts, ${(performance.now() - t0).toFixed(0)} ms kernels)`, () => ccr.cpuKernelAnalyse({ ...base, analysis, parts }));
+  const single = ccr.gpuEmulate({ ...base, analysis });
+  if (split) {
+    const key = analysis === 'cva' ? 'pathwiseCva' : 'parallelCs01';
+    check(split.cva === single.cva && split[key] === single[key], `${analysis}: split CPU kernels match the single pass exactly (${split.cva} vs ${single.cva})`);
+  }
+}
+check(typeof ccr.cpuKernelSlices({ ...spec, analysis: 'exposure', part: 0, parts: 2, trades: [{ type: 'bermudan', id: 'B', ...defaultBermudan() }] }).unsupported === 'string',
+  'CPU kernels report a Bermudan as unsupported');
 // gpuAnalyse with read-backs from the emulated kernels' shape: wrong sizes are rejected.
 const badOut = ccr.gpuAnalyse({ ...spec, analysis: 'exposure', gpuOutputs: [{ sums: new Float32Array(3), pfe: new Float32Array(1) }] });
 check(typeof badOut.error === 'string', 'gpuAnalyse rejects read-backs that do not match the plan');
