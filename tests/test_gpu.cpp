@@ -82,12 +82,13 @@ TEST(gpu_plan_layout) {
   CHECK(plan.pfeDispatch() == plan.reporting.size());
   CHECK(gpu::compile(gpuSetup(1000, false).engine, gpuSetup(1000, false).nettingSet).valsBytes() == 16);
 
-  // A Bermudan needs AMC: reported, left out of the plan.
+  // A Bermudan is priced by AMC inside the kernel: supported, with its regression terms located.
   NettingSet withBermudan = s.nettingSet;
   const auto underlying = InterestRateSwap::vanilla("u", 1e6, 0.03, 1.0, 4.0, 1, InterestRateSwap::Direction::ReceiveFixed);
   withBermudan.trades.push_back(std::make_shared<BermudanSwaption>("berm", underlying, std::vector<double>{1.0, 2.0, 3.0}));
-  CHECK(!gpu::limitation(s.engine, withBermudan).empty());
-  CHECK(gpu::compile(s.engine, withBermudan).unsupported.size() == 1);
+  CHECK(gpu::limitation(s.engine, withBermudan).empty());
+  const auto bplan = gpu::compile(s.engine, withBermudan);
+  CHECK(bplan.unsupported.empty() && bplan.amc.size() == 1 && bplan.amc[0].decideTerm.size() == 3);
 }
 
 TEST(gpu_fused_kernel_matches_exposure_engine) {
@@ -270,5 +271,34 @@ TEST(gpu_cpu_kernels_are_bit_identical_on_any_number_of_threads) {
     const auto a = gpu::runFusedReference(plan, one), b = gpu::runFusedReference(plan, eight);
     CHECK(a.sums == b.sums);
     CHECK(a.pfe == b.pfe);
+  }
+}
+
+TEST(gpu_amc_bermudan_matches_exposure_engine) {
+  // Bermudan swaptions by Longstaff-Schwartz inside the fused kernel (regressions fitted on a CPU
+  // pass of the kernel) against BermudanSwaption on ExposureEngine: price and exposure profile
+  // within Monte Carlo error, for physical and cash settlement, alone and in a netting set.
+  const auto s = gpuSetup(8000, false);
+  const auto u = InterestRateSwap::vanilla("u", 1e6, 0.03, 1.0, 4.0, 1, InterestRateSwap::Direction::ReceiveFixed);
+  for (const Settlement settle : {Settlement::Physical, Settlement::Cash}) {
+    NettingSet alone, mixed = s.nettingSet;
+    const auto berm = std::make_shared<BermudanSwaption>("berm", u, std::vector<double>{1.0, 2.0, 3.0, 4.0}, settle, 1.0, 2);
+    alone.trades.push_back(berm);
+    mixed.trades.push_back(std::make_shared<BermudanSwaption>("short", u, std::vector<double>{2.0, 3.0}, settle, -0.5, 3));
+    for (const auto* ns : {&alone, &mixed}) {
+      const auto plan = gpu::compile(s.engine, *ns);
+      CHECK(plan.unsupported.empty());
+      const auto fused = gpu::summarise(plan, gpu::runFusedReference(plan)).profile;
+      const auto cpu = s.engine.run(*ns, 0.95).profile;
+      const double scale = std::max(1e3, *std::max_element(cpu.expectedExposure.begin(), cpu.expectedExposure.end()));
+      CHECK_NEAR(fused.expectedValue[0], cpu.expectedValue[0], 0.04 * scale);
+      CHECK(maxRelDiff(fused.expectedExposure, cpu.expectedExposure) < 0.06);
+      CHECK(maxRelDiff(fused.discountedExpectedExposure, cpu.discountedExpectedExposure) < 0.06);
+      // ENE is small next to EE for a long option: measured against the exposure scale.
+      double worst = 0.0;
+      for (std::size_t k = 0; k < cpu.times.size(); ++k)
+        worst = std::max(worst, std::fabs(fused.expectedNegativeExposure[k] - cpu.expectedNegativeExposure[k]));
+      CHECK(worst < 0.03 * scale);
+    }
   }
 }

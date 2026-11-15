@@ -86,7 +86,25 @@ float tradeStat(std::uint32_t m, float vi, float v, float D) {
 
 // fused-exposure for one path (invocation p): the per-date statistics into `stats`
 // ([nT][nS]) and quantile row r (positive exposure, then margin |dV|) into expo[r * stride].
-void simulatePath(const PlanView& v, std::uint32_t p, float* stats, float* expo, std::size_t stride, float* vals) {
+// The AMC regression pass records the state of every path into these (see runAmcStates).
+struct AmcSink {
+  float* x;
+  float* deflator;
+  float* exercise;
+  std::size_t nP;
+  const std::vector<std::size_t>* offsets;  // first exercise row of each Bermudan
+};
+
+constexpr std::uint32_t kNotExercised = 0xFFFFFFFFu;
+
+// The AMC regression z = (x - c) * A, B + p1 z + p2 z^2 + p3 z^3 (Horner), as amcPoly in the kernel.
+float amcPoly(const float* rec, float x) {
+  const float z = (x - rec[2]) * rec[3];
+  return ((rec[7] * z + rec[6]) * z + rec[5]) * z + rec[4];
+}
+
+void simulatePath(const PlanView& v, std::uint32_t p, float* stats, float* expo, std::size_t stride, float* vals,
+                  const AmcSink* sink = nullptr) {
   const auto& IDX = v.plan.indices;
   const auto& FP = v.plan.params;
   const auto& STEPS = v.plan.steps;
@@ -104,6 +122,8 @@ void simulatePath(const PlanView& v, std::uint32_t p, float* stats, float* expo,
   for (std::uint32_t a = 0; a < kMaxAssets; ++a) S[a] = FP[12 + a];
   for (std::uint32_t c = 0; c < kMaxCredits; ++c) y[c] = FP[4 * c + 3], Y[c] = 0.0f;
   float held = 0.0f, prevDE = 0.0f, prevQ = 1.0f, prevRV = 0.0f;
+  std::uint32_t exercised[kMaxBermudans];  // exercise index of each Bermudan on this path
+  for (auto& e : exercised) e = kNotExercised;
   const float ia = FP[11], mta = FP[10];
 
   for (std::uint32_t j = 0; j < nT; ++j) {
@@ -153,25 +173,47 @@ void simulatePath(const PlanView& v, std::uint32_t p, float* stats, float* expo,
 
     float value = 0.0f;
     float vt[kMaxTradeGroups] = {};
+    float ev[kMaxBermudans] = {};  // exercise values on this date
     const std::uint32_t nTr = std::min<std::uint32_t>(v.nTr, kMaxTradeGroups);
+    if (sink) sink->x[std::size_t(j) * sink->nP + p] = x, sink->deflator[std::size_t(j) * sink->nP + p] = D;
     for (std::uint32_t t = IDX[j]; t < IDX[j + 1]; ++t) {
       const std::size_t r = std::size_t(t) * kTermStride;
-      const auto code = static_cast<std::uint32_t>(TERMS[r]);  // kind + 8 * trade
-      const auto slot = static_cast<std::uint32_t>(TERMS[r + 1]);
-      const float c = TERMS[r + 2];
-      const float bond = TERMS[r + 3] * std::exp(-TERMS[r + 4] * x);
+      const float* rec = &TERMS[r];
+      const auto code = static_cast<std::uint32_t>(rec[0]);  // kind + 16 trade + 256 bermudan + 4096 extra
+      const std::uint32_t kind = code & 15u, bm = std::min<std::uint32_t>((code >> 8u) & 15u, kMaxBermudans - 1),
+                          extra = code >> 12u;
+      const auto slot = static_cast<std::uint32_t>(rec[1]);
+      const float c = rec[2];
+      auto bond = [&] { return rec[3] * std::exp(-rec[4] * x); };
       float term = 0.0f;
-      switch (code & 7u) {
-        case kBond: term = c * bond; break;
-        case kFixedFloat: term = (c * fix[slot] + TERMS[r + 5]) * bond; break;
-        case kAsset: term = c * S[slot] * TERMS[r + 3]; break;
-        case kSetFixing: fix[slot] = (bond - 1.0f) / c; break;
-        default: {
-          const float p3 = TERMS[r + 7];
-          term = c * black(S[slot] * TERMS[r + 5] / bond, TERMS[r + 6], std::fabs(p3), bond, p3 > 0.0f);
+      switch (kind) {
+        case kBond: term = c * bond(); break;
+        case kFixedFloat: term = (c * fix[slot] + rec[5]) * bond(); break;
+        case kAsset: term = c * S[slot] * rec[3]; break;
+        case kSetFixing: fix[slot] = (bond() - 1.0f) / c; break;
+        case kOption: {
+          const float b0 = bond(), p3 = rec[7];
+          term = c * black(S[slot] * rec[5] / b0, rec[6], std::fabs(p3), b0, p3 > 0.0f);
+          break;
         }
+        case kBermExercise: ev[bm] += c * bond(); break;
+        case kBermDecide:
+          if (sink) {
+            sink->exercise[((*sink->offsets)[bm] + extra) * sink->nP + p] = ev[bm];
+          } else if (exercised[bm] == kNotExercised && ev[bm] > 0.0f && ev[bm] > amcPoly(rec, x)) {
+            exercised[bm] = extra;
+          }
+          break;
+        case kBermContinue:
+          if (exercised[bm] == kNotExercised) term = rec[1] * std::max(amcPoly(rec, x), 0.0f);
+          break;
+        case kBermBond:
+          if (exercised[bm] != kNotExercised && exercised[bm] <= extra) term = c * bond();
+          break;
+        default:  // kBermFloat
+          if (exercised[bm] != kNotExercised && exercised[bm] <= extra) term = (c * fix[slot] + rec[5]) * bond();
       }
-      if (v.nTr > 0) vt[std::min<std::uint32_t>(code >> 3u, kMaxTradeGroups - 1)] += term;
+      if (v.nTr > 0) vt[std::min<std::uint32_t>((code >> 4u) & 15u, kMaxTradeGroups - 1)] += term;
       else value += term;
     }
     for (std::uint32_t i = 0; i < nTr; ++i) value += vt[i];
@@ -359,6 +401,25 @@ FusedOutput finishFused(const FusedPlan& plan, const std::vector<FusedSlice>& sl
     }
     out.pfe[r] = result;
   }
+  });
+  return out;
+}
+
+AmcStates runAmcStates(const FusedPlan& plan, SpinPool& pool) {
+  const PlanView v(plan);
+  const std::size_t nP = v.nP, nT = v.nT, nS = v.nS, nQ = plan.quantileRows();
+  std::vector<std::size_t> offsets;
+  std::size_t rows = 0;
+  for (const auto& a : plan.amc) offsets.push_back(rows), rows += a.exerciseDates.size();
+  AmcStates out;
+  out.x.assign(nT * nP, 0.0f);
+  out.deflator.assign(nT * nP, 0.0f);
+  out.exercise.assign(rows * nP, 0.0f);
+  const AmcSink sink{out.x.data(), out.deflator.data(), out.exercise.data(), nP, &offsets};
+  // Paths are independent: the pool runs them in parallel, each writing its own column.
+  pool.parallelFor(nP, 0, [&](std::size_t pb, std::size_t pe) {
+    std::vector<float> stats(nT * nS), expo(nQ), vals(nT);
+    for (std::size_t p = pb; p < pe; ++p) simulatePath(v, static_cast<std::uint32_t>(p), stats.data(), expo.data(), 1, vals.data(), &sink);
   });
   return out;
 }

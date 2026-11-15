@@ -20,7 +20,7 @@
 
 namespace ccr::gpu {
 
-static_assert(kWorkgroupSize == 64 && kStatsPerDate == 8 && kTradeStats == 5 && kMaxTradeGroups == 16 &&
+static_assert(kWorkgroupSize == 64 && kStatsPerDate == 8 && kTradeStats == 5 && kMaxTradeGroups == 16 && kMaxBermudans == 4 &&
                   kPfeBins == 3072 && kPfeWorkgroupSize == 256 && kHeaderWords == 24,
               "the WGSL sources below hard-code these constants");
 
@@ -47,6 +47,8 @@ const std::string& fusedExposureKernel(bool perTrade) {
 
 const WG : u32 = 64u;
 const NB : u32 = 8u;          // netting-set statistics per date, before the per-trade ones
+const NB_BERM : u32 = 4u;     // Bermudan swaptions per netting set
+const NOT_EXERCISED : u32 = 0xFFFFFFFFu;
 const STEP_VEC : u32 = 6u;    // vec4s per date in STEPS
 const TERM_TILE : u32 = 64u;  // valuation terms staged in workgroup memory at a time
 const CHOL_VEC : u32 = 16u;   // Cholesky factor: 8 padded rows of 2 vec4s
@@ -67,6 +69,12 @@ var<workgroup> stepTile : array<vec4<f32>, 6>;
 var<workgroup> termTile : array<vec4<f32>, 128>;
 var<workgroup> termRange : vec2<u32>;
 var<workgroup> red : array<vec4<f32>, 128>;  // statistics reduction, 8 statistics (2 vec4) per invocation at a time
+
+// AMC regression of a policy / continuation term: z = (x - c) * A, B + p1 z + p2 z^2 + p3 z^3.
+fn amcPoly(a : vec4<f32>, b : vec4<f32>, x : f32) -> f32 {
+  let z = (x - a.z) * a.w;
+  return ((b.w * z + b.z) * z + b.y) * z + b.x;
+}
 
 // Per-trade statistic m of trade value vi in netting-set value v (uncollateralised), weight D.
 fn tradeStat(m : u32, vi : f32, v : f32, D : f32) -> f32 {
@@ -161,6 +169,8 @@ fn main(@builtin(global_invocation_id) gid : vec3<u32>,
   var prevDE = 0.0;
   var prevQ = 1.0;
   var prevRV = 0.0;  // netted value on the previous reporting date (margin)
+  var exercised : array<u32, 4>;  // exercise index of each Bermudan on this path
+  for (var i = 0u; i < NB_BERM; i++) { exercised[i] = NOT_EXERCISED; }
   let nZ = (H.nNormals + 3u) / 4u;
 
   for (var j = 0u; j < nT; j++) {
@@ -228,6 +238,8 @@ fn main(@builtin(global_invocation_id) gid : vec3<u32>,
     // hoist a function-scope var to the function entry and zero it only once.
     var vt : array<f32, MAX_TRADES>;
     for (var i = 0u; i < MAX_TRADES; i++) { vt[i] = 0.0; }
+    var ev : array<f32, 4>;  // Bermudan exercise values on this date (reset explicitly, see vt)
+    for (var i = 0u; i < NB_BERM; i++) { ev[i] = 0.0; }
     for (var t0 = range.x; t0 < range.y; t0 += TERM_TILE) {
       let n = min(TERM_TILE, range.y - t0);
       for (var q = l; q < 2u * n; q += WG) { termTile[q] = TERMS[2u * t0 + q]; }
@@ -236,18 +248,33 @@ fn main(@builtin(global_invocation_id) gid : vec3<u32>,
         let a = termTile[2u * t];       // (kind, slot, c, A)
         let b = termTile[2u * t + 1u];  // (B, p1, p2, p3)
         let slot = u32(a.y);
-        let code = u32(a.x);  // kind + 8 * trade
-        let bond = a.w * exp(-b.x * x);
+        let code = u32(a.x);  // kind + 16 trade + 256 bermudan + 4096 extra
+        let kind = code & 15u;
+        let bm = min((code >> 8u) & 15u, NB_BERM - 1u);
+        let extra = code >> 12u;
         var term = 0.0;
-        switch code & 7u {
-          case 0u: { term = a.z * bond; }
-          case 1u: { term = (a.z * fix[slot] + b.y) * bond; }
+        switch kind {
+          case 0u: { term = a.z * a.w * exp(-b.x * x); }
+          case 1u: { term = (a.z * fix[slot] + b.y) * a.w * exp(-b.x * x); }
           case 2u: { term = a.z * S[slot] * a.w; }
-          case 3u: { fix[slot] = (bond - 1.0) / a.z; }
-          default: { term = a.z * black(S[slot] * b.y / bond, b.z, abs(b.w), bond, b.w > 0.0); }
+          case 3u: { fix[slot] = (a.w * exp(-b.x * x) - 1.0) / a.z; }
+          case 4u: {
+            let bond = a.w * exp(-b.x * x);
+            term = a.z * black(S[slot] * b.y / bond, b.z, abs(b.w), bond, b.w > 0.0);
+          }
+          // American Monte Carlo: exercise value, policy, continuation, exercised tail.
+          case 5u: { ev[bm] = ev[bm] + a.z * a.w * exp(-b.x * x); }
+          case 6u: {
+            if (exercised[bm] == NOT_EXERCISED && ev[bm] > 0.0 && ev[bm] > amcPoly(a, b, x)) { exercised[bm] = extra; }
+          }
+          case 7u: { if (exercised[bm] == NOT_EXERCISED) { term = a.y * max(amcPoly(a, b, x), 0.0); } }
+          case 8u: { if (exercised[bm] != NOT_EXERCISED && exercised[bm] <= extra) { term = a.z * a.w * exp(-b.x * x); } }
+          default: {
+            if (exercised[bm] != NOT_EXERCISED && exercised[bm] <= extra) { term = (a.z * fix[slot] + b.y) * a.w * exp(-b.x * x); }
+          }
         }
         if (H.nTr > 0u) {
-          let tr = min(code >> 3u, MAX_TRADES - 1u);
+          let tr = min((code >> 4u) & 15u, MAX_TRADES - 1u);
           vt[tr] = vt[tr] + term;
         } else {
           v = v + term;

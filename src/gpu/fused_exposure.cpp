@@ -7,7 +7,9 @@
 #include <stdexcept>
 
 #include "ccr/core/matrix.hpp"
+#include "ccr/core/regression.hpp"
 #include "ccr/instruments/asset_forward.hpp"
+#include "ccr/instruments/bermudan_swaption.hpp"
 #include "ccr/instruments/european_option.hpp"
 #include "ccr/instruments/interest_rate_swap.hpp"
 
@@ -27,7 +29,7 @@ std::size_t assetIndex(const ScenarioGenerator& gen, const std::string& name) {
   throw std::invalid_argument("unknown asset " + name);
 }
 
-using TermRecord = std::vector<double>;  // [kind, slot, c, A, B, p1, p2, p3]
+using TermRecord = std::vector<double>;  // [kind, slot, c, A, B, p1, p2, p3, trade, bermudan, extra]
 
 // Merges the valuation terms of one date in double precision, so the kernel evaluates one
 // exponential per distinct cash-flow date instead of one per cash flow, and large coupons that
@@ -37,10 +39,11 @@ using TermRecord = std::vector<double>;  // [kind, slot, c, A, B, p1, p2, p3]
 //  - a bond on the payment date of a running floating coupon is folded into that coupon's
 //    fixed part p1, so the kernel prices (c fix + p1) A e^{-B x} with one exponential;
 //  - forwards on the same asset are summed as one c S term;
-//  - options stay as they are, and fixings come last: they only ever feed later dates, because
-//    a period is priced from its fixing strictly after the fixing date.
+//  - options stay as they are, AMC terms keep their order (exercise values, then policies, then
+//    continuation and exercised tails), and fixings come last: they only ever feed later dates,
+//    because a period is priced from its fixing strictly after the fixing date.
 std::vector<TermRecord> mergeTerms(const std::vector<TermRecord>& in) {
-  std::vector<TermRecord> floating, bonds, assets, options, fixings;
+  std::vector<TermRecord> floating, bonds, assets, options, fixings, exerciseBonds, amcTerms;
   auto sameBond = [](const TermRecord& a, const TermRecord& b) { return a[3] == b[3] && a[4] == b[4]; };
   for (const auto& r : in) {
     switch (static_cast<int>(r[0])) {
@@ -65,7 +68,15 @@ std::vector<TermRecord> mergeTerms(const std::vector<TermRecord>& in) {
         break;
       }
       case kSetFixing: fixings.push_back(r); break;
-      default: options.push_back(r);
+      case kOption: options.push_back(r); break;
+      case kBermExercise: {  // the exercise value of one Bermudan: bonds of one maturity merged
+        auto it = std::find_if(exerciseBonds.begin(), exerciseBonds.end(),
+                               [&](const TermRecord& b) { return b[9] == r[9] && sameBond(b, r); });
+        if (it == exerciseBonds.end()) exerciseBonds.push_back(r);
+        else (*it)[2] += r[2];
+        break;
+      }
+      default: amcTerms.push_back(r);  // policy, continuation and exercised-tail terms, in order
     }
   }
   std::vector<TermRecord> out;
@@ -81,8 +92,68 @@ std::vector<TermRecord> mergeTerms(const std::vector<TermRecord>& in) {
   for (auto& a : assets)
     if (a[2] != 0.0) out.push_back(a);
   out.insert(out.end(), options.begin(), options.end());
+  // AMC: exercise values first, then the policies that read them, then continuation and tails.
+  out.insert(out.end(), exerciseBonds.begin(), exerciseBonds.end());
+  out.insert(out.end(), amcTerms.begin(), amcTerms.end());
   out.insert(out.end(), fixings.begin(), fixings.end());
   return out;
+}
+
+// Longstaff-Schwartz for the Bermudans of a plan, exactly as BermudanSwaption does it, on the
+// paths of the kernel itself: a CPU pass records the state, the deflator and the exercise values,
+// the regressions are fitted in double precision backwards over the exercise dates, and their
+// standardisation and coefficients go into the policy and continuation terms.
+void fitAmc(FusedPlan& plan) {
+  const std::size_t nT = plan.numDates(), nP = plan.numPaths;
+  for (auto& a : plan.amc) a.decideTerm.assign(a.exerciseDates.size(), std::numeric_limits<std::size_t>::max());
+  for (std::size_t j = 0; j < nT; ++j)
+    for (std::size_t t = plan.indices[j]; t < plan.indices[j + 1]; ++t) {
+      const auto code = static_cast<std::uint32_t>(plan.terms[t * kTermStride]);
+      const std::uint32_t kind = code & 15u, b = (code >> 8u) & 15u, extra = code >> 12u;
+      if (kind == kBermDecide) plan.amc.at(b).decideTerm.at(extra) = t;
+      if (kind == kBermContinue) plan.amc.at(b).continueTerm.at(j) = t;
+    }
+  const AmcStates st = runAmcStates(plan);
+  auto write = [&](std::size_t term, const PolynomialRegression& reg) {
+    float* r = &plan.terms[term * kTermStride];
+    r[2] = static_cast<float>(reg.center());
+    r[3] = static_cast<float>(1.0 / reg.scale());
+    for (std::size_t d = 0; d < 4; ++d) r[4 + d] = d < reg.coefficients().size() ? static_cast<float>(reg.coefficients()[d]) : 0.0f;
+  };
+  std::size_t row = 0;
+  std::vector<double> xs(nP), target(nP);
+  std::vector<bool> mask(nP);
+  for (const auto& a : plan.amc) {
+    const std::size_t nE = a.exerciseDates.size();
+    PolynomialRegression reg(a.degree);
+    std::vector<double> realised(nP, 0.0);
+    std::vector<std::vector<double>> strategy(nE + 1, std::vector<double>(nP, 0.0));
+    for (std::size_t k = nE; k-- > 0;) {
+      const std::size_t j = a.exerciseDates[k];
+      const float* E = &st.exercise[(row + k) * nP];
+      for (std::size_t p = 0; p < nP; ++p) {
+        xs[p] = st.x[j * nP + p];
+        target[p] = realised[p] / st.deflator[j * nP + p];
+        mask[p] = E[p] > 0.0f;
+      }
+      reg.fit(xs, target, mask);
+      write(a.decideTerm.at(k), reg);
+      for (std::size_t p = 0; p < nP; ++p)
+        if (E[p] > 0.0f && E[p] > reg.predict(xs[p])) realised[p] = st.deflator[j * nP + p] * E[p];
+      strategy[k] = realised;
+    }
+    for (std::size_t j = 0; j < nT; ++j) {
+      if (a.continueTerm[j] == std::numeric_limits<std::size_t>::max()) continue;
+      const auto& s = strategy[a.nextExercise[j]];
+      for (std::size_t p = 0; p < nP; ++p) {
+        xs[p] = st.x[j * nP + p];
+        target[p] = s[p] / st.deflator[j * nP + p];
+      }
+      reg.fit(xs, target);
+      write(a.continueTerm[j], reg);
+    }
+    row += nE;
+  }
 }
 
 }  // namespace
@@ -91,16 +162,25 @@ std::string limitation(const ExposureEngine& engine, const NettingSet& nettingSe
   const ScenarioGenerator& gen = engine.generator();
   if (perTrade && nettingSet.trades.size() > kMaxTradeGroups)
     return "per-trade statistics on the GPU support at most 16 trades";
-  for (const auto& t : nettingSet.trades)
-    if (!dynamic_cast<const InterestRateSwap*>(t.get()) && !dynamic_cast<const AssetForward*>(t.get()) &&
+  std::size_t bermudans = 0;
+  for (const auto& t : nettingSet.trades) {
+    const auto* bs = dynamic_cast<const BermudanSwaption*>(t.get());
+    if (!bs && !dynamic_cast<const InterestRateSwap*>(t.get()) && !dynamic_cast<const AssetForward*>(t.get()) &&
         !dynamic_cast<const EuropeanOption*>(t.get()))
-      return t->id() + " needs American Monte Carlo, which runs in WebAssembly only";
+      return t->id() + " is not a trade type the fused kernels price";
+    if (bs) {
+      if (++bermudans > kMaxBermudans) return "the fused kernels price at most 4 Bermudan swaptions";
+      if (bs->exerciseTimes().size() > kMaxExercises) return t->id() + " has more than 64 exercise dates";
+      if (bs->regressionDegree() > kMaxAmcDegree) return t->id() + ": the fused kernels regress with degree at most 3";
+    }
+  }
   if (gen.assets().size() > kMaxAssets) return "the GPU kernel supports at most 4 FX/equity assets";
   if (gen.credits().size() > kMaxCredits) return "the GPU kernel supports at most 2 credit curves";
   for (const auto& c : gen.credits())
     if (c->substeps() != gen.credits().front()->substeps()) return "the GPU kernel needs the same CIR sub-steps for all credits";
   std::size_t swaps = 0;
-  for (const auto& t : nettingSet.trades) swaps += dynamic_cast<const InterestRateSwap*>(t.get()) ? 1 : 0;
+  for (const auto& t : nettingSet.trades)
+    swaps += dynamic_cast<const InterestRateSwap*>(t.get()) || dynamic_cast<const BermudanSwaption*>(t.get()) ? 1 : 0;
   if (swaps > kMaxSwapSlots) return "the GPU kernel supports at most 32 swaps";
   std::size_t normals = gen.numFactors() + 1;
   for (const auto& c : gen.credits()) normals += c->extraNormals();
@@ -187,8 +267,13 @@ FusedPlan compile(const ExposureEngine& engine, const NettingSet& nettingSet, co
   std::size_t tradeIndex = 0;
   auto addTerm = [&](std::size_t j, TermKind kind, double slot, double c, double A, double B, double p1 = 0,
                      double p2 = 0, double p3 = 0) {
-    termsAt[j].push_back({double(kind), slot, c, A, B, p1, p2, p3, double(tradeIndex)});
+    termsAt[j].push_back({double(kind), slot, c, A, B, p1, p2, p3, double(tradeIndex), 0.0, 0.0});
   };
+  auto addAmcTerm = [&](std::size_t j, TermKind kind, std::size_t bermudan, std::size_t extra, double slot, double c,
+                        double A, double B, double p1 = 0) {
+    termsAt[j].push_back({double(kind), slot, c, A, B, p1, 0.0, 0.0, double(tradeIndex), double(bermudan), double(extra)});
+  };
+  std::size_t bermudans = 0;
   auto bondA = [&](double t, double T) { return hw.zeroBond(t, T, 0.0); };
   auto bondB = [&](double t, double T) { return T <= t ? 0.0 : hw.B(t, T); };
   std::size_t slots = 0;
@@ -241,8 +326,77 @@ FusedPlan compile(const ExposureEngine& engine, const NettingSet& nettingSet, co
         addTerm(j, kOption, double(ai), op->notional(), bondA(tj, T), bondB(tj, T), m.carryDiscount(tj, T), op->strike(),
                 op->type() == OptionType::Call ? sd : -sd);
       }
+    } else if (const auto* bs = dynamic_cast<const BermudanSwaption*>(trade.get())) {
+      if (bermudans >= kMaxBermudans) throw std::invalid_argument("the GPU kernel prices at most 4 Bermudan swaptions");
+      if (bs->exerciseTimes().size() > kMaxExercises) throw std::invalid_argument("too many exercise dates for the GPU kernel");
+      if (bs->regressionDegree() > kMaxAmcDegree) throw std::invalid_argument("AMC regression degree above 3 on the GPU");
+      const std::size_t b = bermudans++;
+      const InterestRateSwap& u = bs->underlying();
+      const double sign = u.direction() == InterestRateSwap::Direction::PayFixed ? 1.0 : -1.0;
+      const double n = u.notional(), k = u.fixedRate(), pos = bs->position();
+      const bool physical = bs->settlement() == Settlement::Physical;
+      const auto& sch = u.schedule();
+      const auto& ex = bs->exerciseTimes();
+      const std::size_t nE = ex.size();
+      AmcTerms info;
+      info.degree = bs->regressionDegree();
+      for (double e : ex) {
+        const auto idx = grid.find(e, 1e-8);
+        if (!idx) throw std::invalid_argument("Bermudan exercise date not on the simulation grid");
+        info.exerciseDates.push_back(*idx);
+      }
+      // Period i belongs to the tail entered at exercise k iff e_k <= ts_i: the last such k.
+      std::vector<long> lastExercise(sch.size() - 1, -1);
+      for (std::size_t i = 1; i < sch.size(); ++i)
+        for (std::size_t e = 0; e < nE; ++e)
+          if (ex[e] <= sch[i - 1] + 1e-10) lastExercise[i - 1] = static_cast<long>(e);
+      if (slots >= kMaxSwapSlots) throw std::invalid_argument("too many swaps for the GPU kernel");
+      const double slot = static_cast<double>(slots++);
+      if (physical)
+        for (std::size_t i = 1; i < sch.size(); ++i) {
+          if (lastExercise[i - 1] < 0) continue;
+          const double ts = sch[i - 1], te = sch[i];
+          const std::size_t kFix = grid.indexAtOrBefore(ts);
+          addTerm(kFix, kSetFixing, slot, te - ts, bondA(grid[kFix], ts) / bondA(grid[kFix], te),
+                  bondB(grid[kFix], ts) - bondB(grid[kFix], te));
+        }
+      info.continueTerm.assign(nT, std::numeric_limits<std::size_t>::max());
+      for (std::size_t j = 0; j < nT; ++j) {
+        const double t = grid[j];
+        std::size_t next = 0;
+        while (next < nE && ex[next] <= t + 1e-10) ++next;
+        info.nextExercise.push_back(next);
+        // At an exercise date: the value of the tail swap entered (no position), then the policy.
+        for (std::size_t e = 0; e < nE; ++e) {
+          if (info.exerciseDates[e] != j) continue;
+          for (std::size_t i = 1; i < sch.size(); ++i) {
+            const double ts = sch[i - 1], te = sch[i], tau = te - ts;
+            if (ts < ex[e] - 1e-10) continue;
+            addAmcTerm(j, kBermExercise, b, e, 0.0, sign * n, bondA(t, ts), bondB(t, ts));
+            addAmcTerm(j, kBermExercise, b, e, 0.0, -sign * n * (1 + k * tau), bondA(t, te), bondB(t, te));
+          }
+          addAmcTerm(j, kBermDecide, b, e, 0.0, 0.0, 0.0, 0.0);  // coefficients fitted below
+        }
+        // Not exercised yet and an exercise still ahead: the regressed continuation value.
+        if (next < nE) addAmcTerm(j, kBermContinue, b, 0, pos, 0.0, 0.0, 0.0);
+        // Exercised (physical): the tail swap, period by period, as long as the period is alive.
+        if (physical)
+          for (std::size_t i = 1; i < sch.size(); ++i) {
+            if (lastExercise[i - 1] < 0) continue;
+            const double ts = sch[i - 1], te = sch[i], tau = te - ts;
+            if (te <= t + 1e-10) continue;
+            const auto kMax = static_cast<std::size_t>(lastExercise[i - 1]);
+            if (ts >= t - 1e-10) {
+              addAmcTerm(j, kBermBond, b, kMax, 0.0, pos * sign * n, bondA(t, ts), bondB(t, ts));
+              addAmcTerm(j, kBermBond, b, kMax, 0.0, -pos * sign * n * (1 + k * tau), bondA(t, te), bondB(t, te));
+            } else {
+              addAmcTerm(j, kBermFloat, b, kMax, slot, pos * sign * n * tau, bondA(t, te), bondB(t, te), -pos * sign * n * k * tau);
+            }
+          }
+      }
+      plan.amc.push_back(std::move(info));
     } else {
-      plan.unsupported.push_back(trade->id() + " needs American Monte Carlo, which runs in WebAssembly only");
+      plan.unsupported.push_back(trade->id() + " is not a trade type the fused kernels price");
     }
   }
 
@@ -251,10 +405,11 @@ FusedPlan compile(const ExposureEngine& engine, const NettingSet& nettingSet, co
   plan.indices.assign(offReporting + nT, 0u);
   for (std::size_t j = 0; j < nT; ++j) {
     plan.indices[j] = static_cast<std::uint32_t>(plan.terms.size() / kTermStride);
-    // Kind and trade share the first word: kind + 8 * trade (small integers, exact in f32).
+    // The first word packs kind, trade, bermudan and extra (see TermKind).
     auto emit = [&](const std::vector<TermRecord>& recs, std::size_t group) {
       for (const auto& rec : mergeTerms(recs)) {
-        plan.terms.push_back(static_cast<float>(rec[0] + 8.0 * static_cast<double>(group)));
+        const double bermudan = rec.size() > 9 ? rec[9] : 0.0, extra = rec.size() > 10 ? rec[10] : 0.0;
+        plan.terms.push_back(static_cast<float>(rec[0] + 16.0 * static_cast<double>(group) + 256.0 * bermudan + 4096.0 * extra));
         for (std::size_t k = 1; k < kTermStride; ++k) plan.terms.push_back(static_cast<float>(rec[k]));
       }
     };
@@ -316,6 +471,7 @@ FusedPlan compile(const ExposureEngine& engine, const NettingSet& nettingSet, co
                  static_cast<std::uint32_t>(plan.statsPerDate), static_cast<std::uint32_t>(plan.reporting.size()),
                  static_cast<std::uint32_t>(plan.numTradeGroups), plan.hasInitialMargin() ? 1u : 0u,
                  floatBits(static_cast<float>(plan.imQuantile)), 0u, 0u, 0u};
+  if (!plan.amc.empty()) fitAmc(plan);
   return plan;
 }
 

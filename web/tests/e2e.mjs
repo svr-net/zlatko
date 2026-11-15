@@ -42,6 +42,7 @@ const browser = await chromium.launch({
 const testSpec = { sim: { numPaths: 1000, seed: 11, antithetic: true } };
 const gpuSpec = { sim: { numPaths: 8000, seed: 11, antithetic: true } };
 const pairSpec = { sim: { numPaths: 4000, seed: 11, antithetic: true } };
+const bermudanTrade = { type: 'bermudan', id: 'Berm 1y×4y', notional: 1e6, fixedRate: 0.035, start: 1, tenor: 4, freq: 1, direction: 'receiver', degree: 2 };
 // Pages with the engine selector. With no stored choice they run on Auto, which must pick the
 // WebGPU kernels on desktop too; each also runs once forced onto WebAssembly.
 const enginePages = ['index', 'exposure', 'collateral', 'allocation', 'cva', 'xva', 'wwr', 'hedging'];
@@ -51,12 +52,15 @@ const cases = [
   ...['index', 'collateral', 'wwr'].map((name) => ({ name: `${name}-wasm`, file: name, spec: testSpec, engine: 'wasm', expectEngine: 'WebAssembly' })),
   // A first visit (nothing stored): the default is Auto, which must dispatch the fused kernels.
   { name: 'cva-first-visit', file: 'cva', spec: testSpec, expectEngine: 'WebGPU' },
-  // A Bermudan needs American Monte Carlo: Auto must fall back to WebAssembly and say why.
-  { name: 'exposure-amc', file: 'exposure', spec: { ...testSpec, trades: [{ type: 'bermudan', id: 'Berm 1y×4y', notional: 1e6, fixedRate: 0.035, start: 1, tenor: 4, freq: 1, direction: 'receiver', degree: 2 }] }, engine: 'auto', expectEngine: 'WebAssembly' },
+  // A Bermudan is priced by American Monte Carlo inside the fused kernels: Auto stays on WebGPU.
+  { name: 'exposure-amc', file: 'exposure', spec: { ...testSpec, trades: [bermudanTrade] }, engine: 'auto', expectEngine: 'WebGPU' },
   { name: 'gpu', file: 'gpu', spec: gpuSpec },
   // Collateralised netting set: exercises the margin-call look-back inside the fused kernel.
   { name: 'gpu-csa', file: 'gpu', spec: { ...gpuSpec, csa: { enabled: true, thresholdCounterparty: 250e3, thresholdOwn: 250e3, mta: 50e3, independentAmount: 0, mpr: 10 / 250 } } },
   // WASM/GPU pairs on the same spec whose headline numbers must agree within Monte Carlo error.
+  // A Bermudan on all three engines: AMC in the WGSL kernel, in its CPU mirror and in ExposureEngine.
+  ...[['wasm', 'WebAssembly'], ['gpu', 'WebGPU'], ['cpu', 'CPU fused kernels']].map(([engine, expectEngine]) => (
+    { name: `amc-${engine}-pair`, file: 'exposure', spec: { ...pairSpec, trades: [bermudanTrade] }, engine, expectEngine, pair: 'amc' })),
   ...['exposure', 'cva', 'xva', 'allocation', 'hedging'].flatMap((name) => [
     { name: `${name}-wasm-pair`, file: name, spec: pairSpec, engine: 'wasm', expectEngine: 'WebAssembly', pair: name },
     { name: `${name}-gpu-pair`, file: name, spec: pairSpec, engine: 'gpu', expectEngine: 'WebGPU', pair: name },
@@ -168,6 +172,7 @@ for (const { name, file, spec, engine, expectEngine, pair, device, gpuStub, expe
 // Monte Carlo error at 4,000 paths (hedging caps its runs at 1,500 paths).
 const metrics = {
   exposure: [['EEPE 1y', (r) => r.eepe1y]],
+  amc: [['EEPE 1y', (r) => r.eepe1y]],
   cva: [['CVA', (r) => r.cva]],
   xva: [['total XVA', (r) => r.total], ['CVA', (r) => r.cva], ['MVA', (r) => r.mva], ['KVA', (r) => r.kva]],
   allocation: [['CVA', (r) => r.totalCva], ['Σ marginal CVA', (r) => r.marginalSum]],

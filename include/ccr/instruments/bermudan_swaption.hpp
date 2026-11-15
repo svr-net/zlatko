@@ -48,6 +48,8 @@ class BermudanSwaption : public Trade {
   const InterestRateSwap& underlying() const { return underlying_; }
   const std::vector<double>& exerciseTimes() const { return exerciseTimes_; }
   Settlement settlement() const { return settlement_; }
+  double position() const { return position_; }
+  std::size_t regressionDegree() const { return degree_; }
 
  private:
   InterestRateSwap underlying_;

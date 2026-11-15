@@ -1,9 +1,9 @@
 // Runs a Monte Carlo analysis of the library on one of three engines:
 //   WebGPU       the fused kernels on the GPU;
 //   CPU kernels  the same fused kernels on the CPU, in C++ (one call);
-//   WebAssembly  the library's ExposureEngine (path-level views, AMC).
+//   WebAssembly  the library's ExposureEngine (path-level views).
 // Auto tries them in that order: WebGPU where the browser offers an adapter, the CPU kernels
-// where it does not, WebAssembly for portfolios the kernels cannot price (Bermudans).
+// where it does not, WebAssembly for what the kernels cannot run.
 //
 // GPU path: gpuJobs (C++ compiles the plans) -> GpuEngine.run per plan (upload, dispatch,
 // read back) -> gpuAnalyse. CPU kernel path: cpuKernels. Both end in the same C++ analysis;

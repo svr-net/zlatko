@@ -52,13 +52,39 @@ constexpr std::size_t kHeaderWords = 24;
 constexpr std::size_t kPfeBins = 3072;       ///< histogram bins of the PFE kernel (12 KiB of workgroup storage)
 constexpr std::size_t kPfeWorkgroupSize = 256;
 
+constexpr std::size_t kMaxBermudans = 4;     ///< Bermudan swaptions priced by AMC inside the kernel
+constexpr std::size_t kMaxExercises = 64;    ///< exercise dates per Bermudan
+constexpr std::size_t kMaxAmcDegree = 3;     ///< polynomial degree of the AMC regressions
+
+/// The first word of a term packs kind + 16 * trade + 256 * bermudan + 4096 * extra (small
+/// integers, exact in f32): trade is the trade group in per-trade mode, bermudan and extra
+/// (an exercise index) address the AMC terms.
+///
 /// Valuation term kinds in the term table, as (kind, slot, c, A) (B, p1, p2, p3):
 ///  kBond        c A e^{-B x}                          (bonds of one maturity merged, c A pre-multiplied)
 ///  kFixedFloat  (c fix[slot] + p1) A e^{-B x}         (running floating coupon with its fixed leg folded in)
 ///  kAsset       c S[slot] A                            (forwards on one asset merged)
 ///  kSetFixing   fix[slot] = (A e^{-B x} - 1) / c       (A, B: the ratio P(t, ts) / P(t, te))
 ///  kOption      c Black(S[slot] p1 / bond, p2, |p3|)   (call when p3 > 0)
-enum TermKind : int { kBond = 0, kFixedFloat = 1, kAsset = 2, kSetFixing = 3, kOption = 4 };
+/// American Monte Carlo (Bermudan b, Longstaff-Schwartz in the kernel; z = (x - c) * A, poly = B + p1 z + p2 z^2 + p3 z^3):
+///  kBermExercise  ev[b] += c A e^{-B x}                  (the tail swap entered on exercise, at an exercise date)
+///  kBermDecide    exercise[b] = extra if not yet exercised, ev[b] > 0 and ev[b] > poly  (policy of exercise `extra`)
+///  kBermContinue  slot * max(poly, 0) if not exercised   (continuation value, slot = position)
+///  kBermBond      c A e^{-B x}              if exercised at an index <= extra (physical settlement)
+///  kBermFloat     (c fix[slot] + p1) A e^{-B x}  if exercised at an index <= extra
+enum TermKind : int {
+  kBond = 0, kFixedFloat = 1, kAsset = 2, kSetFixing = 3, kOption = 4,
+  kBermExercise = 5, kBermDecide = 6, kBermContinue = 7, kBermBond = 8, kBermFloat = 9,
+};
+
+/// Where the AMC regressions of one Bermudan live in the term table (filled by compile).
+struct AmcTerms {
+  std::size_t degree = 2;
+  std::vector<std::size_t> exerciseDates;   ///< grid index of each exercise date
+  std::vector<std::size_t> decideTerm;      ///< term index of each exercise's policy
+  std::vector<std::size_t> continueTerm;    ///< term index of the continuation on each grid date (npos: none)
+  std::vector<std::size_t> nextExercise;    ///< per grid date: first exercise strictly after it (as BermudanSwaption)
+};
 
 struct FusedPlan {
   // Problem size.
@@ -86,8 +112,10 @@ struct FusedPlan {
 
   /// Market survival of the counterparty on the simulation dates (1 without credits).
   std::vector<double> marketSurvival;
-  /// Trades the kernel cannot price (Bermudans need AMC regression); empty if all are supported.
+  /// Trades the kernel cannot price; empty if all are supported.
   std::vector<std::string> unsupported;
+  /// Bermudan swaptions: their regression terms, fitted by compile() on a CPU pass of the kernel.
+  std::vector<AmcTerms> amc;
 
   std::size_t numDates() const { return times.size(); }
   std::size_t numTerms() const { return terms.size() / kTermStride; }
@@ -154,8 +182,12 @@ struct FusedOptions {
   bool perTrade = false;
 };
 
-/// Compiles a netting set for the fused kernels. Swaps, asset forwards and European
-/// options are supported; other trades are listed in FusedPlan::unsupported and left out.
+/// Compiles a netting set for the fused kernels. Swaps, asset forwards, European options and
+/// Bermudan swaptions are supported; other trades are listed in FusedPlan::unsupported and left
+/// out. Bermudans are priced by American Monte Carlo in two passes of the same kernel: compile
+/// runs it once on the CPU to record the Hull-White state, the deflator and the exercise values,
+/// fits the Longstaff-Schwartz regressions in double precision, and writes their coefficients
+/// into the plan's policy and continuation terms; the kernel then exercises path by path.
 /// Throws std::invalid_argument when the models exceed the kernel's fixed limits.
 FusedPlan compile(const ExposureEngine& engine, const NettingSet& nettingSet, const FusedOptions& options);
 FusedPlan compile(const ExposureEngine& engine, const NettingSet& nettingSet, double pfeQuantile = 0.95,
@@ -185,6 +217,13 @@ FusedSlice runFusedWorkgroups(const FusedPlan& plan, std::size_t wgBegin, std::s
 /// order, statistics and quantile rows in parallel. The result is the same however the
 /// workgroups were split and on any number of threads.
 FusedOutput finishFused(const FusedPlan& plan, const std::vector<FusedSlice>& slices, SpinPool& pool = defaultPool());
+
+/// The AMC regression pass: per path the Hull-White state and the deflator on every date
+/// ([date][path]) and the exercise value of every Bermudan exercise ([bermudan][exercise][path]).
+struct AmcStates {
+  std::vector<float> x, deflator, exercise;
+};
+AmcStates runAmcStates(const FusedPlan& plan, SpinPool& pool = defaultPool());
 
 /// The three kernels executed on the CPU in single precision, as the GPU runs them: the CPU
 /// backend of the fused pipeline, parallel on every core of `pool`.

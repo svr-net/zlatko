@@ -30,6 +30,9 @@ class PolynomialRegression {
   /// Degree actually used by the last fit (reduced for degenerate samples).
   std::size_t effectiveDegree() const { return coefficients_.empty() ? 0 : coefficients_.size() - 1; }
   const std::vector<double>& coefficients() const { return coefficients_; }
+  /// The standardisation of the last fit: predict(x) = sum_d c_d ((x - center) / scale)^d.
+  double center() const { return center_; }
+  double scale() const { return scale_; }
 
  private:
   std::size_t degree_;
