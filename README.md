@@ -123,11 +123,11 @@ Every Monte Carlo page runs one analysis of the library (`spec.analysis`) on the
 | `instruments.html` | Swaps, forwards, options, Bermudans on scenarios, against their analytic prices | `instruments` |
 | `amc.html` | Longstaff–Schwartz policy inside the kernel, physical vs cash exposure | `amc` |
 | `exposure.html` | EE/ENE/PFE/EPE/EEPE, sample paths, netting benefit, per-trade profiles, distribution | `exposure` |
-| `collateral.html` | Thresholds, MTA, independent amount, margin period of risk | `collateral` |
+| `collateral.html` | Thresholds, MTA, independent amount, margin period of risk; cash, bond or equity collateral with haircuts | `collateral` |
 | `allocation.html` | Marginal (Euler), incremental and standalone CVA | `allocation` |
 | `cva.html` | Unilateral/bilateral CVA, term structure, running spread | `cva` |
 | `wwr.html` | Pathwise CVA against exposure–intensity correlation | `wrongWayRisk` |
-| `xva.html` | CVA, DVA, FVA, MVA and KVA with cumulative profiles, sweeps, allocation and sensitivities | `xva` |
+| `xva.html` | CVA, DVA, FVA, MVA (nested conditional IM, the proxy alongside) and KVA with cumulative profiles, sweeps, allocation and sensitivities | `xva` |
 | `hedging.html` | CS01 buckets, CDS hedge, CRN vs independent-seed deltas, XVA credit and funding sensitivities | `hedging` |
 | `ai.html` | Surrogate XVA (ridge, MLP) fitted and back tested in C++, and a provider-neutral LLM agent skill (OpenAI, Anthropic, Gemini, MCP) whose tools call `xva` / `xvaCompare` | `surrogateBacktest` · dataset from `xva_ai_dataset` |
 | `gpu.html` | Fused WebGPU kernels validated against the same kernels in C++, with a benchmark | `validation` |
