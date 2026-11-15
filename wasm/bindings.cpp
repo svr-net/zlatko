@@ -1512,7 +1512,7 @@ val collateral(val spec) {
 // into GPU plans: ready-made buffers, dispatch sizes and buffer sizes, so the host only
 // uploads, dispatches and reads back. gpuAnalyse(spec) takes the read-backs
 // (spec.gpuOutputs[i] = { sums, pfe }, null for an invalid job) and returns the result in
-// the shape of the CPU analysis. gpuEmulate(spec) runs the kernels on the CPU instead.
+// the shape of the CPU analysis. cpuKernels(spec) runs the same kernels on the CPU instead.
 
 val gpuKernels(val) {
   val o = val::object();
@@ -1651,7 +1651,11 @@ val validation(const val& spec, const Env& env, const JobResult& g) {
 val analyseFused(const val& spec, const std::function<std::optional<gpu::FusedOutput>(std::size_t, const gpu::FusedPlan&)>& output) {
   const Env env = parseEnv(spec);
   const GpuJobs g = compileJobs(spec, env);
-  if (!g.unsupported.empty()) throw std::invalid_argument(g.unsupported);
+  if (!g.unsupported.empty()) {  // e.g. a Bermudan: the caller falls back to ExposureEngine
+    val out = val::object();
+    out.set("unsupported", g.unsupported);
+    return out;
+  }
   std::vector<JobResult> results;
   for (std::size_t i = 0; i < g.jobs.size(); ++i) {
     if (!g.plans[i]) {
@@ -1682,78 +1686,23 @@ val gpuAnalyse(val spec) {
   });
 }
 
-val gpuEmulate(val spec) {
+// The CPU backend of the fused pipeline: the same kernels in C++ (runFusedReference), parallel
+// on the lock-free SpinPool where the build has threads (natively; one thread in this
+// single-threaded WebAssembly build). One call per analysis, the same result shape as gpuAnalyse.
+val cpuKernels(val spec) {
   return guarded([&] {
-    return analyseFused(spec, [](std::size_t, const gpu::FusedPlan& plan) -> std::optional<gpu::FusedOutput> {
-      return gpu::runFusedReference(plan);
+    double kernelMs = 0.0;  // the kernels only (validation also runs ExposureEngine in this call)
+    val out = analyseFused(spec, [&](std::size_t, const gpu::FusedPlan& plan) -> std::optional<gpu::FusedOutput> {
+      const double t0 = nowMs();
+      gpu::FusedOutput o = gpu::runFusedReference(plan);
+      kernelMs += nowMs() - t0;
+      return o;
     });
-  });
-}
-
-// ------------------------------------------------------------------ CPU fused-kernel backend
-//
-// The fused kernels on the CPU, split across Web Workers like workgroups across GPU cores:
-// each worker calls cpuKernelSlices with spec.part / spec.parts and runs that share of the
-// workgroups of every job; cpuKernelAnalyse(spec) with spec.parts = the workers' results (in
-// part order) finishes each job exactly as the GPU's reduce and PFE kernels do and returns
-// the same result as the GPU path. The result does not depend on the number of workers.
-
-val cpuKernelSlices(val spec) {
-  return guarded([&] {
-    const Env env = parseEnv(spec);
-    const GpuJobs g = compileJobs(spec, env);
-    val out = val::object();
-    if (!g.unsupported.empty()) {
-      out.set("unsupported", g.unsupported);
-      return out;
+    if (out["unsupported"].isUndefined()) {
+      out.set("kernelMs", kernelMs);
+      out.set("threads", static_cast<double>(defaultPool().concurrency()));
     }
-    const auto part = static_cast<std::size_t>(num(spec, "part", 0));
-    const auto parts = static_cast<std::size_t>(std::max(1.0, num(spec, "parts", 1)));
-    if (part >= parts) throw std::invalid_argument("cpuKernelSlices: part out of range");
-    const double t0 = nowMs();
-    val jobs = val::array();
-    for (const auto& plan : g.plans) {
-      if (!plan) {
-        jobs.call<void>("push", val::null());
-        continue;
-      }
-      const std::size_t numWG = plan->numWorkgroups();
-      const gpu::FusedSlice sl = gpu::runFusedWorkgroups(*plan, numWG * part / parts, numWG * (part + 1) / parts);
-      val o = val::object();
-      o.set("wgBegin", static_cast<double>(sl.wgBegin));
-      o.set("wgEnd", static_cast<double>(sl.wgEnd));
-      o.set("pathBegin", static_cast<double>(sl.pathBegin));
-      o.set("pathEnd", static_cast<double>(sl.pathEnd));
-      o.set("partials", typedArray(sl.partials));
-      o.set("exposure", typedArray(sl.exposure));
-      jobs.call<void>("push", o);
-    }
-    out.set("jobs", jobs);
-    out.set("kernelMs", nowMs() - t0);
     return out;
-  });
-}
-
-val cpuKernelAnalyse(val spec) {
-  return guarded([&] {
-    const val parts = spec["parts"];
-    const auto nParts = parts["length"].as<std::size_t>();
-    return analyseFused(spec, [&](std::size_t job, const gpu::FusedPlan& plan) -> std::optional<gpu::FusedOutput> {
-      std::vector<gpu::FusedSlice> slices;
-      for (std::size_t k = 0; k < nParts; ++k) {
-        const val o = parts[k]["jobs"][job];
-        if (o.isNull() || o.isUndefined()) return std::nullopt;
-        gpu::FusedSlice sl;
-        sl.wgBegin = o["wgBegin"].as<std::size_t>();
-        sl.wgEnd = o["wgEnd"].as<std::size_t>();
-        sl.pathBegin = o["pathBegin"].as<std::size_t>();
-        sl.pathEnd = o["pathEnd"].as<std::size_t>();
-        sl.partials = emscripten::convertJSArrayToNumberVector<float>(o["partials"]);
-        sl.exposure = emscripten::convertJSArrayToNumberVector<float>(o["exposure"]);
-        slices.push_back(std::move(sl));
-      }
-      return gpu::finishFused(plan, slices);
-    });
   });
 }
 
@@ -1776,7 +1725,5 @@ EMSCRIPTEN_BINDINGS(ccr) {
   emscripten::function("gpuKernels", &gpuKernels);
   emscripten::function("gpuJobs", &gpuJobs);
   emscripten::function("gpuAnalyse", &gpuAnalyse);
-  emscripten::function("gpuEmulate", &gpuEmulate);
-  emscripten::function("cpuKernelSlices", &cpuKernelSlices);
-  emscripten::function("cpuKernelAnalyse", &cpuKernelAnalyse);
+  emscripten::function("cpuKernels", &cpuKernels);
 }

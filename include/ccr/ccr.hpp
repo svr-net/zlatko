@@ -4,6 +4,7 @@
 
 #include "ccr/core/math.hpp"
 #include "ccr/core/matrix.hpp"
+#include "ccr/core/parallel.hpp"
 #include "ccr/core/random.hpp"
 #include "ccr/core/regression.hpp"
 #include "ccr/core/time_grid.hpp"

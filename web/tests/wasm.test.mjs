@@ -60,7 +60,7 @@ const hedge = run('hedging', () => ccr.hedging(hedgeSpec));
 if (hedge) check(hedge.pnlVolRatio < 0.1, 'CDS hedge removes most spread P&L');
 
 // WebGPU path: plans and the combine step. No GPU in Node, so the kernels run through the
-// C++ CPU reference (gpuEmulate); results must agree with the CPU library within MC error.
+// C++ CPU reference (cpuKernels); results must agree with the CPU library within MC error.
 const kernels = run('gpuKernels', () => ccr.gpuKernels({}));
 if (kernels) check(kernels.fusedExposure.includes('fn main') && kernels.pfeQuantile.includes('3072'), 'WGSL sources');
 const jobs = run('gpuJobs', () => ccr.gpuJobs({ ...spec, analysis: 'hedging', bumps: [0.02, 0.01] }));
@@ -73,25 +73,25 @@ const berm = ccr.gpuJobs({ ...spec, analysis: 'exposure', trades: [{ type: 'berm
 check(typeof berm.unsupported === 'string', 'Bermudan reported as unsupported on the GPU');
 const pathTol = 4 / Math.sqrt(4000);
 const pairSpec = { ...spec, sim: { ...spec.sim, numPaths: 4000 } };
-const emuCva = run('gpuEmulate cva', () => ccr.gpuEmulate({ ...pairSpec, analysis: 'cva' }));
+const emuCva = run('cpuKernels cva', () => ccr.cpuKernels({ ...pairSpec, analysis: 'cva' }));
 const cpuCva = ccr.cva(pairSpec);
 if (emuCva) {
   near(emuCva.cva, cpuCva.cva, pathTol * cpuCva.cva, 'emulated kernels CVA vs CPU');
   near(emuCva.pathwiseCva, cpuCva.pathwiseCva, pathTol * cpuCva.pathwiseCva, 'emulated kernels pathwise CVA vs CPU');
 }
-const emuHedge = run('gpuEmulate hedging', () => ccr.gpuEmulate({ ...hedgeSpec, analysis: 'hedging' }));
+const emuHedge = run('cpuKernels hedging', () => ccr.cpuKernels({ ...hedgeSpec, analysis: 'hedging' }));
 if (emuHedge && hedge) {
   near(emuHedge.parallelCs01, hedge.parallelCs01, 0.2 * Math.abs(hedge.parallelCs01), 'emulated CS01 vs CPU');
   near(emuHedge.cvaDv01, hedge.cvaDv01, 0.2 * Math.abs(hedge.cvaDv01), 'emulated DV01 vs CPU');
 }
-const valid = run('gpuEmulate validation', () => ccr.gpuEmulate({ ...pairSpec, analysis: 'validation' }));
+const valid = run('cpuKernels validation', () => ccr.cpuKernels({ ...pairSpec, analysis: 'validation' }));
 if (valid) {
   const c = valid.checks;
   check(c.t0Diff < 1e-6 && c.eeDiff < c.tol && c.cvaDiff < c.tol && c.survDiff < 0.01, `validation checks ${JSON.stringify(c)}`);
 }
 // XVA and allocation on the fused kernels (per-trade statistics and the margin quantile in the
 // kernel) against the CPU library on the same spec.
-const emuXva = run('gpuEmulate xva', () => ccr.gpuEmulate({ ...pairSpec, analysis: 'xva' }));
+const emuXva = run('cpuKernels xva', () => ccr.cpuKernels({ ...pairSpec, analysis: 'xva' }));
 const cpuXva = ccr.xva(pairSpec);
 if (emuXva) {
   for (const k of ['cva', 'dva', 'fca', 'mva', 'kva', 'total'])
@@ -99,7 +99,7 @@ if (emuXva) {
   check(emuXva.trades.length === cpuXva.trades.length && emuXva.initialMargin.length === cpuXva.initialMargin.length, 'xva result shape');
   near(emuXva.trades.reduce((s, t) => s + t.cva, 0), emuXva.xva.cva, 1e-4 * emuXva.xva.cva, 'emulated XVA allocation adds up (f32)');
 }
-const emuAlloc = run('gpuEmulate allocation', () => ccr.gpuEmulate({ ...pairSpec, analysis: 'allocation' }));
+const emuAlloc = run('cpuKernels allocation', () => ccr.cpuKernels({ ...pairSpec, analysis: 'allocation' }));
 const cpuAlloc = ccr.allocation(pairSpec);
 if (emuAlloc) {
   near(emuAlloc.totalCva, cpuAlloc.totalCva, pathTol * cpuAlloc.totalCva, 'emulated allocation CVA vs CPU');
@@ -111,21 +111,10 @@ if (emuAlloc) {
     near(t.standaloneCva, c.standaloneCva, pathTol * Math.max(scale, c.standaloneCva), `${t.id} standalone CVA vs CPU`);
   });
 }
-// CPU fused-kernel backend: the workgroups split across 3 "workers" must give exactly the
-// single-pass emulation, for a multi-job analysis too.
-for (const analysis of ['cva', 'hedging', 'xva']) {
-  const base = analysis === 'hedging' ? hedgeSpec : pairSpec;
-  const t0 = performance.now();
-  const parts = [0, 1, 2].map((part) => ccr.cpuKernelSlices({ ...base, analysis, part, parts: 3 }));
-  const split = run(`cpuKernelAnalyse ${analysis} (3 parts, ${(performance.now() - t0).toFixed(0)} ms kernels)`, () => ccr.cpuKernelAnalyse({ ...base, analysis, parts }));
-  const single = ccr.gpuEmulate({ ...base, analysis });
-  if (split) {
-    const pick = { cva: (r) => [r.cva, r.pathwiseCva], hedging: (r) => [r.cva, r.parallelCs01], xva: (r) => [r.xva.total, r.xva.mva] }[analysis];
-    const [a1, a2] = pick(split), [b1, b2] = pick(single);
-    check(a1 === b1 && a2 === b2, `${analysis}: split CPU kernels match the single pass exactly (${a1} vs ${b1})`);
-  }
-}
-check(typeof ccr.cpuKernelSlices({ ...spec, analysis: 'exposure', part: 0, parts: 2, trades: [{ type: 'bermudan', id: 'B', ...defaultBermudan() }] }).unsupported === 'string',
+// CPU fused-kernel backend: one call; a Bermudan is reported as unsupported (falls back to WASM).
+const one = ccr.cpuKernels({ ...pairSpec, analysis: 'cva' });
+check(one.threads === 1 && one.kernelMs > 0 && one.cva === emuCva.cva, 'cpuKernels: one thread in WebAssembly, deterministic');
+check(typeof ccr.cpuKernels({ ...spec, analysis: 'exposure', trades: [{ type: 'bermudan', id: 'B', ...defaultBermudan() }] }).unsupported === 'string',
   'CPU kernels report a Bermudan as unsupported');
 // gpuAnalyse with read-backs from the emulated kernels' shape: wrong sizes are rejected.
 const badOut = ccr.gpuAnalyse({ ...spec, analysis: 'exposure', gpuOutputs: [{ sums: new Float32Array(3), pfe: new Float32Array(1) }] });

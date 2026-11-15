@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.16)
 
 project(zlatko_ccr
-  VERSION 0.3.0
+  VERSION 0.4.0
   DESCRIPTION "Modelling, pricing and hedging counterparty credit exposure"
   LANGUAGES CXX)
 
@@ -18,6 +18,7 @@ option(CCR_BUILD_EXAMPLES "Build the example programs" ON)
 
 add_library(ccr
   src/core/matrix.cpp
+  src/core/parallel.cpp
   src/core/regression.cpp
   src/core/time_grid.cpp
   src/market/yield_curve.cpp
@@ -44,6 +45,11 @@ add_library(ccr
   src/gpu/fused_reference.cpp
 )
 add_library(ccr::ccr ALIAS ccr)
+if(NOT EMSCRIPTEN)
+  # The lock-free SpinPool runs the CPU fused kernels on every core (std::thread).
+  find_package(Threads REQUIRED)
+  target_link_libraries(ccr PUBLIC Threads::Threads)
+endif()
 
 target_include_directories(ccr PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
@@ -89,6 +95,7 @@ if(CCR_BUILD_TESTS)
     tests/test_xva.cpp
     tests/test_hedging.cpp
     tests/test_gpu.cpp
+    tests/test_parallel.cpp
   )
   target_link_libraries(ccr_tests PRIVATE ccr)
   add_test(NAME ccr_tests COMMAND ccr_tests)

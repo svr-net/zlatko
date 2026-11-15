@@ -6,6 +6,7 @@
 #include <string>
 #include <vector>
 
+#include "ccr/core/parallel.hpp"
 #include "ccr/exposure/exposure_engine.hpp"
 #include "ccr/exposure/exposure_profile.hpp"
 #include "ccr/models/scenario_generator.hpp"
@@ -175,15 +176,19 @@ struct FusedSlice {
   std::vector<float> exposure;             ///< [reporting date][path - pathBegin]
 };
 
-/// Runs workgroups [wgBegin, wgEnd) of the fused kernel on the CPU in single precision.
-FusedSlice runFusedWorkgroups(const FusedPlan& plan, std::size_t wgBegin, std::size_t wgEnd);
+/// Runs workgroups [wgBegin, wgEnd) of the fused kernel on the CPU in single precision. The
+/// workgroups run in parallel on `pool` (lock-free; see SpinPool), like workgroups across GPU
+/// cores, and the result is bit-identical on any number of threads.
+FusedSlice runFusedWorkgroups(const FusedPlan& plan, std::size_t wgBegin, std::size_t wgEnd, SpinPool& pool = defaultPool());
 
 /// The reduce-partials and pfe-quantile kernels over slices that cover every workgroup in
-/// order. The result is the same however the workgroups were split.
-FusedOutput finishFused(const FusedPlan& plan, const std::vector<FusedSlice>& slices);
+/// order, statistics and quantile rows in parallel. The result is the same however the
+/// workgroups were split and on any number of threads.
+FusedOutput finishFused(const FusedPlan& plan, const std::vector<FusedSlice>& slices, SpinPool& pool = defaultPool());
 
-/// The three kernels executed on the CPU in single precision, as the GPU runs them.
-FusedOutput runFusedReference(const FusedPlan& plan);
+/// The three kernels executed on the CPU in single precision, as the GPU runs them: the CPU
+/// backend of the fused pipeline, parallel on every core of `pool`.
+FusedOutput runFusedReference(const FusedPlan& plan, SpinPool& pool = defaultPool());
 
 /// WGSL sources of the kernels. The per-trade variant of the fused kernel (for plans with
 /// perTrade()) carries the per-trade value array; the default one does not pay for it.

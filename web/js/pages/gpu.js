@@ -19,7 +19,7 @@ specEditor(page, ['market', 'assets', 'credit', 'correlation', 'simulation', 'cs
 
 runButton(page, 'Run on GPU and validate against WASM', async (spec) => {
   // Without a WebGPU adapter (e.g. Chrome blocks WebGPU for the GPU), validate the same fused
-  // kernels running on the CPU across Web Workers instead.
+  // kernels running on the CPU (C++) instead.
   let g, onCpu = false;
   try {
     g = await runOnGpu('validation', spec, { warmUp: true });
@@ -28,19 +28,19 @@ runButton(page, 'Run on GPU and validate against WASM', async (spec) => {
     g = await runOnCpuKernels('validation', spec);
     onCpu = true;
     page.content.append(el('p', { class: 'note engine-note' }, el('b', { text: 'No WebGPU on this device. ' }),
-      `${e.message.replace('no WebGPU adapter: ', '')}. The same fused kernels ran on the CPU across ${g.result.workers} Web Workers and are validated below.`));
+      `${e.message.replace('no WebGPU adapter: ', '')}. The same fused kernels ran on the CPU (C++, ${g.result.threads} thread${g.result.threads === 1 ? '' : 's'}) and are validated below.`));
   }
   if (g.unsupported) throw new Error('not on GPU: ' + g.unsupported);
   const r = g.result;
   const gp = r.gpu.profile, wp = r.wasm.profile, c = r.checks;
-  const engineName = onCpu ? `CPU fused kernels (${r.workers} workers)` : 'GPU fused pipeline';
+  const engineName = onCpu ? 'CPU fused kernels' : 'GPU fused pipeline';
 
   tiles(page.content, [
     { label: engineName, value: fmt.num(r.gpuMs, 1) + ' ms', hint: `${fmt.num(r.numPaths)} paths × ${r.numDates ?? r.gpu.simulationDates} dates` },
     { label: 'WASM (CPU, 1 thread)', value: fmt.num(r.wasm.elapsedMs, 0) + ' ms', hint: 'scenarios + pricing' },
-    { label: 'Speed-up', value: (r.wasm.elapsedMs / r.gpuMs).toFixed(1) + '×', hint: onCpu ? 'workers vs one thread' : 'includes upload & read-back' },
+    { label: 'Speed-up', value: (r.wasm.elapsedMs / r.gpuMs).toFixed(1) + '×', hint: onCpu ? 'fused f32 kernels vs ExposureEngine' : 'includes upload & read-back' },
     onCpu
-      ? { label: 'Workers', value: String(r.workers), hint: 'one per CPU core, at most 8' }
+      ? { label: 'Threads', value: String(r.threads), hint: 'lock-free C++ pool (one thread in WebAssembly)' }
       : { label: 'Plan compile (C++)', value: fmt.num(r.compileMs, 1) + ' ms', hint: `${fmt.num(r.numTerms)} valuation terms` },
     { label: 'CVA (GPU / WASM)', value: `${fmt.compact(r.gpu.cva)} / ${fmt.compact(r.wasm.cva)}`, hint: 'independence, market survival' },
     { label: 'Pathwise CVA (GPU / WASM)', value: `${fmt.compact(r.gpu.pathwiseCva)} / ${fmt.compact(r.wasm.pathwiseCva)}`, hint: 'stochastic CIR++ intensity' },
