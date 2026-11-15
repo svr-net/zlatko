@@ -37,7 +37,7 @@ struct Header {
   nS : u32, nR : u32, nTr : u32, rowDV : u32,       // stats per date, reporting dates, trades; rows (see RowLayout)
   rowE : u32, rowV : u32, rowC : u32, rowGross : u32,
   rowTrades : u32, rowEx : u32, nReq : u32, nBerm : u32,
-  rowEP : u32, pad0 : u32, pad1 : u32, pad2 : u32,
+  rowEP : u32, rowIm : u32, nInner : u32, imLevel : f32,  // nested IM: its row, inner paths, quantile
 };
 )wgsl";
 
@@ -78,6 +78,96 @@ var<workgroup> red : array<vec4<f32>, 128>;  // statistics reduction, 8 statisti
 fn amcPoly(a : vec4<f32>, b : vec4<f32>, x : f32) -> f32 {
   let z = (x - a.z) * a.w;
   return ((b.w * z + b.z) * z + b.y) * z + b.x;
+}
+
+// ---- Nested Monte Carlo (conditional initial margin): the inner simulations of an outer path.
+// They step the same models with the same step coefficients and value the same term table as
+// the outer path (statement for statement as main), with their own counter-based normals.
+struct Path {
+  x : f32, lnD : f32,
+  lnS : vec4<f32>, S : vec4<f32>,
+  y : vec2<f32>, Y : vec2<f32>,
+};
+
+fn innerStep(st : ptr<function, Path>, j : u32, stream : u32, sign : f32) {
+  let nZ = (H.nNormals + 3u) / 4u;
+  var z : array<vec4<f32>, 16>;
+  for (var q = 0u; q < 16u; q++) { z[q] = vec4<f32>(0.0); }
+  for (var q = 0u; q < nZ; q++) { z[q] = sign * vec4<f32>(gauss2(stream, j, 2u * q), gauss2(stream, j, 2u * q + 1u)); }
+  var w : array<f32, 8>;
+  for (var i = 0u; i < 8u; i++) { w[i] = dot(chol[2u * i], z[0]) + dot(chol[2u * i + 1u], z[1]); }
+  let hw0 = STEPS[j * STEP_VEC];
+  let hw1 = STEPS[j * STEP_VEC + 1u];
+  let nC = H.nCorr;
+  let zI = z[nC >> 2u][nC & 3u];
+  let integratedRate = (*st).x * hw1.y + hw0.z * w[0] + hw0.w * zI + hw1.x;
+  (*st).x = (*st).x * hw0.x + hw0.y * w[0];
+  (*st).lnD = (*st).lnD - integratedRate;
+  let wa = vec4<f32>(w[1], w[2], w[3], w[4]);
+  (*st).lnS = (*st).lnS + (vec4<f32>(integratedRate) - STEPS[j * STEP_VEC + 2u] - STEPS[j * STEP_VEC + 4u] + STEPS[j * STEP_VEC + 3u] * wa);
+  (*st).S = FP[3] * exp((*st).lnS);
+  let dt = hw1.z;
+  var off = nC + 1u;
+  for (var c = 0u; c < H.nC; c++) {
+    let prm = FP[c];
+    let h = dt / f32(H.substeps);
+    var rem = sqrt(dt) * w[1u + H.nA + c];
+    var remT = dt;
+    var yy = (*st).y[c];
+    var YY = (*st).Y[c];
+    for (var s = 0u; s < H.substeps; s++) {
+      var dW = rem;
+      if (s + 1u < H.substeps) {
+        let k = off + s;
+        dW = h / remT * rem + sqrt(max(h * (remT - h) / remT, 0.0)) * z[k >> 2u][k & 3u];
+      }
+      rem = rem - dW;
+      remT = remT - h;
+      let yp = max(yy, 0.0);
+      let yn = yy + prm.x * (prm.y - yp) * h + prm.z * sqrt(yp) * dW;
+      YY = YY + 0.5 * (yp + max(yn, 0.0)) * h;
+      yy = yn;
+    }
+    (*st).y[c] = yy;
+    (*st).Y[c] = YY;
+    off = off + H.substeps - 1u;
+  }
+}
+
+// The netted value on date j of an inner path (the terms read directly from storage).
+fn innerValue(st : ptr<function, Path>, fix : ptr<function, array<f32, 32>>, ex : ptr<function, array<u32, 4>>, j : u32) -> f32 {
+  var v = 0.0;
+  var ev : array<f32, 4>;
+  for (var i = 0u; i < NB_BERM; i++) { ev[i] = 0.0; }
+  let x = (*st).x;
+  for (var t = IDX[j]; t < IDX[j + 1u]; t++) {
+    let a = TERMS[2u * t];
+    let b = TERMS[2u * t + 1u];
+    let slot = u32(a.y);
+    let code = u32(a.x);
+    let kind = code & 15u;
+    let bm = min((code >> 8u) & 15u, NB_BERM - 1u);
+    let extra = code >> 12u;
+    switch kind {
+      case 0u: { v = v + a.z * a.w * exp(-b.x * x); }
+      case 1u: { v = v + ((*fix)[slot] * a.z + b.y) * a.w * exp(-b.x * x); }
+      case 2u: { v = v + a.z * (*st).S[slot] * a.w; }
+      case 3u: { (*fix)[slot] = (a.w * exp(-b.x * x) - 1.0) / a.z; }
+      case 4u: {
+        let bond = a.w * exp(-b.x * x);
+        v = v + a.z * black((*st).S[slot] * b.y / bond, b.z, abs(b.w), bond, b.w > 0.0);
+      }
+      case 5u: { ev[bm] = ev[bm] + a.z * a.w * exp(-b.x * x); }
+      case 6u: {
+        if ((*ex)[bm] == NOT_EXERCISED && ev[bm] > 0.0 && ev[bm] > amcPoly(a, b, x)) { (*ex)[bm] = extra; }
+      }
+      case 7u: { if ((*ex)[bm] == NOT_EXERCISED) { v = v + a.y * max(amcPoly(a, b, x), 0.0); } }
+      case 8u: { if ((*ex)[bm] != NOT_EXERCISED && (*ex)[bm] <= extra) { v = v + a.z * a.w * exp(-b.x * x); } }
+      case 9u: { if ((*ex)[bm] != NOT_EXERCISED && (*ex)[bm] <= extra) { v = v + ((*fix)[slot] * a.z + b.y) * a.w * exp(-b.x * x); } }
+      default: { }  // probes write rows of the outer path only
+    }
+  }
+  return v;
 }
 
 // Per-trade statistic m of trade value vi in netting-set value v (uncollateralised), weight D.
@@ -308,13 +398,27 @@ fn main(@builtin(global_invocation_id) gid : vec3<u32>,
     // Collateral called on the value at t - MPR (already written by this invocation).
     var collateral = 0.0;
     if (H.hasCsa == 1u) {
-      if (isActive) { VALS[j * nP + p] = v; }
+      // Units of the collateral (cash: the amount) fixed at the call date, revalued at t.
+      let ca = FP[20];  // (type, asset, haircut, -)
+      let ctype = u32(ca.x);
+      var price = 1.0;
+      if (ctype == 1u) { price = stepTile[5].z * exp(-stepTile[5].w * x); }
+      if (ctype == 2u) { price = S[min(u32(ca.y), 3u)]; }
+      if (isActive) {
+        VALS[j * nP + p] = v;
+        if (ctype != 0u) { VALS[(nT + j) * nP + p] = price; }
+      }
       let callJ = IDX[H.offCall + j];
       var vc = v;
-      if (callJ != j) { vc = VALS[callJ * nP + pp]; }
+      var pc = price;
+      if (callJ != j) {
+        vc = VALS[callJ * nP + pp];
+        if (ctype != 0u) { pc = VALS[(nT + callJ) * nP + pp]; }
+      }
+      let keep = select(1.0, 1.0 - ca.z, ctype != 0u);
       let required = requiredCollateral(vc, csa);
-      if (j == 0u || abs(required - held) >= csa.z) { held = required; }
-      collateral = held + csa.w;
+      if (j == 0u || abs(required - held * keep * pc) >= csa.z) { held = required / (keep * pc); }
+      collateral = held * price + csa.w;
     }
     let e = v - collateral;
     let ep = max(e, 0.0);
@@ -337,6 +441,41 @@ fn main(@builtin(global_invocation_id) gid : vec3<u32>,
       if (H.rowTrades != NO_ROW) {
         for (var i = 0u; i < min(H.nTr, MAX_TRADES); i++) { EXPO[(H.rowTrades + i * H.nR + k) * nP + p] = vt[i]; }
       }
+    }
+    // Nested Monte Carlo: the conditional initial margin of this path on this reporting date, the
+    // imLevel quantile of |V(t + MPR) - V(t)| over nInner inner paths (antithetic pairs) from the
+    // path's state, from the 16 largest inner samples (streamed: no inner cube is stored).
+    if (rs > 0u && H.nInner > 0u) {
+      let imTo = IDX[H.offReporting + nT + j];
+      var im = 0.0;
+      if (imTo != NO_ROW) {
+        var top : array<f32, 16>;
+        for (var k = 0u; k < 16u; k++) { top[k] = 0.0; }
+        let start = Path(x, lnD, lnS, S, y, Y);
+        for (var i = 0u; i < H.nInner; i++) {
+          var st = start;
+          var f2 = fix;
+          var e2 = exercised;
+          let istream = pcg(stream ^ pcg(0x85EBCA6Bu + (i >> 1u) * 0x9E3779B9u + j));
+          let isign = select(1.0, -1.0, (i & 1u) == 1u);
+          var vi = v;
+          for (var jj = j + 1u; jj <= imTo; jj++) {
+            innerStep(&st, jj, istream, isign);
+            vi = innerValue(&st, &f2, &e2, jj);
+          }
+          var cur = abs(vi - v);
+          for (var k = 0u; k < 16u; k++) {
+            if (cur > top[k]) { let t = top[k]; top[k] = cur; cur = t; }
+          }
+        }
+        let rank = H.imLevel * f32(H.nInner - 1u);
+        let k = u32(floor(rank));
+        let hiIdx = min(H.nInner - 1u - k, 15u);  // order statistic k among the 16 largest
+        let ok = top[hiIdx];
+        let ok1 = select(ok, top[max(hiIdx, 1u) - 1u], hiIdx > 0u);
+        im = ok + (rank - f32(k)) * (ok1 - ok);
+      }
+      if (isActive && H.rowIm != NO_ROW) { EXPO[(H.rowIm + rs - 1u) * nP + p] = im; }
     }
     if (isActive && H.rowEx != NO_ROW) {
       for (var i = 0u; i < min(H.nBerm, NB_BERM); i++) {

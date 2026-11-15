@@ -215,7 +215,20 @@ FusedPlan compile(const ExposureEngine& engine, const NettingSet& nettingSet, co
   if (!credits.empty() && counterparty >= credits.size()) throw std::invalid_argument("counterparty index out of range");
 
   const TimeGrid reporting = engine.reportingGrid(nettingSet);
-  const TimeGrid grid = engine.simulationGrid(nettingSet);
+  TimeGrid grid = engine.simulationGrid(nettingSet);
+  // Nested initial margin: the inner paths run from every reporting date t to t + MPR, so t + MPR
+  // joins the simulation grid (its terms, step coefficients and fixings are then in the plan).
+  if (options.imInnerPaths > 0) {
+    if (options.imInnerPaths > kMaxInnerPaths || options.imInnerPaths < 2)
+      throw std::invalid_argument("nested initial margin: 2 to 1024 inner paths");
+    const double rank = options.imQuantile * static_cast<double>(options.imInnerPaths - 1);
+    if (static_cast<double>(options.imInnerPaths - 1) - std::floor(rank) >= static_cast<double>(kInnerTop - 1))
+      throw std::invalid_argument("nested initial margin: the quantile needs more inner paths (keeps the 16 largest)");
+    std::vector<double> ahead;
+    for (double t : reporting.times())
+      if (t + options.imMarginPeriod <= grid.horizon() + 1e-10) ahead.push_back(t + options.imMarginPeriod);
+    grid = grid.merged(ahead);
+  }
   const std::size_t nT = grid.size();
   const HullWhite1F& hw = *gen.rateModel();
   const double a = hw.meanReversion(), sigma = hw.volatility();
@@ -426,8 +439,10 @@ FusedPlan compile(const ExposureEngine& engine, const NettingSet& nettingSet, co
   auto probe = [&](std::size_t j, std::uint32_t row, int what, std::size_t index, double offset = 0.0, double A = 0.0, double B = 0.0) {
     termsAt[j].push_back({double(kProbe), double(what + 16 * static_cast<int>(index)), offset, A, B, double(row), 0.0, 0.0, 0.0, 0.0, 0.0});
   };
+  plan.imInnerPaths = options.imInnerPaths;
+  if (options.imInnerPaths > 0) L.conditionalIm = block(nR);
   std::uint32_t deflatorRows = kNoRow;
-  if (options.gross || options.tradeViews || options.factorViews) {
+  if (options.gross || options.tradeViews || options.factorViews || options.imInnerPaths > 0) {
     deflatorRows = block(nR);
     for (std::uint32_t r = 0; r < nR; ++r) probe(reportingDates[r], deflatorRows + r, 1, 0);
   }
@@ -501,6 +516,11 @@ FusedPlan compile(const ExposureEngine& engine, const NettingSet& nettingSet, co
     V.nettedSamples = perDate(kRowSamples, L.netted, static_cast<std::uint32_t>(S));
     if (L.collateral != kNoRow) V.collateralSamples = perDate(kRowSamples, L.collateral, static_cast<std::uint32_t>(S));
   }
+  if (L.conditionalIm != kNoRow) {
+    V.conditionalIm = perDate(kRowMeanProduct, L.conditionalIm, 1, 0.0, deflatorRows);
+    V.conditionalImMean = perDate(kRowMean, L.conditionalIm);
+    for (double q : {0.05, 0.5, 0.95}) V.conditionalImBands.push_back(perDate(kRowQuantile, L.conditionalIm, 1, q));
+  }
   if (options.collateralBands && L.collateral != kNoRow)
     for (double q : options.bandLevels) V.collateralBands.push_back(perDate(kRowQuantile, L.collateral, 1, q));
   if (options.gross) {
@@ -568,8 +588,13 @@ FusedPlan compile(const ExposureEngine& engine, const NettingSet& nettingSet, co
   }
 
   // Index table: termStart[nT+1] | callIndex[nT] | reportingSlot[nT] (1 + rank among the reporting dates, 0 if not one).
-  const std::size_t offCall = nT + 1, offReporting = offCall + nT;
-  plan.indices.assign(offReporting + nT, 0u);
+  const std::size_t offCall = nT + 1, offReporting = offCall + nT, offImTarget = offReporting + nT;
+  plan.indices.assign(offImTarget + nT, kNoRow);
+  for (std::size_t j = 0; j < offImTarget; ++j) plan.indices[j] = 0u;
+  if (options.imInnerPaths > 0)
+    for (std::size_t r = 0; r < reportingDates.size(); ++r)
+      if (const auto target = grid.find(grid[reportingDates[r]] + options.imMarginPeriod, 1e-8))
+        plan.indices[offImTarget + reportingDates[r]] = static_cast<std::uint32_t>(*target);
   for (std::size_t j = 0; j < nT; ++j) {
     plan.indices[j] = static_cast<std::uint32_t>(plan.terms.size() / kTermStride);
     // The first word packs kind, trade, bermudan and extra (see TermKind).
@@ -620,6 +645,21 @@ FusedPlan compile(const ExposureEngine& engine, const NettingSet& nettingSet, co
     plan.params[9] = static_cast<float>(std::isfinite(csa.thresholdOwn) ? csa.thresholdOwn : -1.0);
     plan.params[10] = static_cast<float>(csa.minimumTransferAmount);
     plan.params[11] = static_cast<float>(csa.independentAmount);
+    // Securities collateral: its type, asset and haircut; a bond's A and B go in the step table.
+    const std::size_t o = 16 + kCholeskyStride * kCholeskyStride;
+    plan.params[o] = static_cast<float>(static_cast<int>(csa.type));
+    plan.params[o + 1] = static_cast<float>(csa.assetIndex);
+    plan.params[o + 2] = static_cast<float>(csa.type == CollateralAgreement::Type::Cash ? 0.0 : csa.haircut);
+    plan.securitiesCollateral = csa.type != CollateralAgreement::Type::Cash;
+    if (csa.type == CollateralAgreement::Type::Asset && csa.assetIndex >= assets.size())
+      throw std::invalid_argument("collateral asset index out of range");
+    if (csa.type == CollateralAgreement::Type::Bond) {
+      if (csa.bondMaturity < grid.horizon() - 1e-10) throw std::invalid_argument("the collateral bond must mature after the horizon");
+      for (std::size_t j = 0; j < nT; ++j) {
+        plan.steps[j * kStepStride + 22] = static_cast<float>(bondA(grid[j], csa.bondMaturity));
+        plan.steps[j * kStepStride + 23] = static_cast<float>(bondB(grid[j], csa.bondMaturity));
+      }
+    }
   }
   for (std::size_t k = 0; k < assets.size(); ++k) plan.params[12 + k] = static_cast<float>(assets[k]->spot());
   for (std::size_t i = 0; i < plan.numCorrelated; ++i)
@@ -639,7 +679,8 @@ FusedPlan compile(const ExposureEngine& engine, const NettingSet& nettingSet, co
                  static_cast<std::uint32_t>(plan.numTradeGroups), plan.rows.valueChange, plan.rows.exposureValue,
                  plan.rows.netted, plan.rows.collateral, plan.rows.gross, plan.rows.trades, plan.rows.exercise,
                  static_cast<std::uint32_t>(plan.numRequests()), static_cast<std::uint32_t>(plan.amc.size()),
-                 plan.rows.exposure, 0u, 0u, 0u};
+                 plan.rows.exposure, plan.rows.conditionalIm, static_cast<std::uint32_t>(plan.imInnerPaths),
+                 floatBits(static_cast<float>(options.imQuantile))};
   if (!plan.amc.empty()) fitAmc(plan);
   return plan;
 }
@@ -680,6 +721,11 @@ void addViews(const FusedPlan& plan, const std::vector<float>& out, FusedResult&
     return p;
   };
   constexpr std::size_t none = ViewOutputs::none;
+  if (V.conditionalIm != none) {
+    r.conditionalImDiscounted = series(V.conditionalIm);
+    r.conditionalImMean = series(V.conditionalImMean);
+    r.conditionalImBands = bands(V.conditionalImBands);
+  }
   if (V.exposureSamples != none) r.exposureSamples = samples(V.exposureSamples);
   if (V.nettedSamples != none) r.nettedSamples = samples(V.nettedSamples);
   if (V.collateralSamples != none) r.collateralSamples = samples(V.collateralSamples);

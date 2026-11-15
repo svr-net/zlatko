@@ -56,7 +56,8 @@ namespace {
 struct PlanView {
   const FusedPlan& plan;
   std::uint32_t nP, nT, nA, nC, substeps, nNormals, seed, cpty, nCorr, offCall, offReporting, numWG, nS, nR, nTr;
-  std::uint32_t rowDV, rowE, rowV, rowC, rowGross, rowTrades, rowEx, nReq, nBerm, rowEP;
+  std::uint32_t rowDV, rowE, rowV, rowC, rowGross, rowTrades, rowEx, nReq, nBerm, rowEP, rowIm, nInner;
+  float imLevel;
   bool antithetic, hasCsa;
   float quantileLevel;
 
@@ -68,7 +69,8 @@ struct PlanView {
     cpty = H[9], nCorr = H[11], offCall = H[12], offReporting = H[13], numWG = H[15];
     std::memcpy(&quantileLevel, &H[14], sizeof quantileLevel);
     nS = H[16], nR = H[17], nTr = H[18], rowDV = H[19], rowE = H[20], rowV = H[21], rowC = H[22], rowGross = H[23];
-    rowTrades = H[24], rowEx = H[25], nReq = H[26], nBerm = H[27], rowEP = H[28];
+    rowTrades = H[24], rowEx = H[25], nReq = H[26], nBerm = H[27], rowEP = H[28], rowIm = H[29], nInner = H[30];
+    std::memcpy(&imLevel, &H[31], sizeof imLevel);
     if (nP == 0 || nT == 0) throw std::invalid_argument("fused kernels: empty plan");
   }
 };
@@ -102,6 +104,95 @@ constexpr std::uint32_t kNotExercised = 0xFFFFFFFFu;
 float amcPoly(const float* rec, float x) {
   const float z = (x - rec[2]) * rec[3];
   return ((rec[7] * z + rec[6]) * z + rec[5]) * z + rec[4];
+}
+
+// ---- Nested Monte Carlo (conditional initial margin), as innerStep / innerValue in the kernel.
+struct InnerPath {
+  float x, lnD, lnS[kMaxAssets], S[kMaxAssets], y[kMaxCredits], Y[kMaxCredits];
+};
+
+void innerStep(const PlanView& v, InnerPath& st, std::uint32_t j, std::uint32_t stream, float sign) {
+  const auto& FP = v.plan.params;
+  const auto& STEPS = v.plan.steps;
+  const std::size_t base = std::size_t(j) * kStepStride;
+  float z[kMaxNormals] = {}, w[kCholeskyStride];
+  const std::uint32_t nZ = 4 * ((v.nNormals + 3) / 4);
+  for (std::uint32_t k = 0; k < nZ; k += 2) gauss2(stream, j, k / 2, &z[k]);
+  for (std::uint32_t k = 0; k < nZ; ++k) z[k] *= sign;
+  for (std::uint32_t i = 0; i < kCholeskyStride; ++i) {
+    const float* row = &FP[16 + i * kCholeskyStride];
+    const float d0 = row[0] * z[0] + row[1] * z[1] + row[2] * z[2] + row[3] * z[3];
+    const float d1 = row[4] * z[4] + row[5] * z[5] + row[6] * z[6] + row[7] * z[7];
+    w[i] = d0 + d1;
+  }
+  const float integratedRate = st.x * STEPS[base + 5] + STEPS[base + 2] * w[0] + STEPS[base + 3] * z[v.nCorr] + STEPS[base + 4];
+  st.x = st.x * STEPS[base] + STEPS[base + 1] * w[0];
+  st.lnD = st.lnD - integratedRate;
+  for (std::uint32_t a = 0; a < kMaxAssets; ++a) {
+    st.lnS[a] = st.lnS[a] + (integratedRate - STEPS[base + 8 + a] - STEPS[base + 16 + a] + STEPS[base + 12 + a] * w[1 + a]);
+    st.S[a] = FP[12 + a] * std::exp(st.lnS[a]);
+  }
+  const float dt = STEPS[base + 6];
+  std::uint32_t off = v.nCorr + 1;
+  for (std::uint32_t c = 0; c < v.nC; ++c) {
+    const float kappa = FP[4 * c], theta = FP[4 * c + 1], xi = FP[4 * c + 2];
+    const float h = dt / static_cast<float>(v.substeps);
+    float rem = std::sqrt(dt) * w[1 + v.nA + c], remT = dt, yy = st.y[c], YY = st.Y[c];
+    for (std::uint32_t s = 0; s < v.substeps; ++s) {
+      float dW = rem;
+      if (s + 1 < v.substeps) dW = h / remT * rem + std::sqrt(std::max(h * (remT - h) / remT, 0.0f)) * z[off + s];
+      rem -= dW;
+      remT -= h;
+      const float yp = std::max(yy, 0.0f);
+      const float yn = yy + kappa * (theta - yp) * h + xi * std::sqrt(yp) * dW;
+      YY += 0.5f * (yp + std::max(yn, 0.0f)) * h;
+      yy = yn;
+    }
+    st.y[c] = yy;
+    st.Y[c] = YY;
+    off += v.substeps - 1;
+  }
+}
+
+float innerValue(const PlanView& v, const InnerPath& st, float* fix, std::uint32_t* ex, std::uint32_t j) {
+  const auto& IDX = v.plan.indices;
+  const auto& TERMS = v.plan.terms;
+  float value = 0.0f, ev[kMaxBermudans] = {};
+  const float x = st.x;
+  for (std::uint32_t t = IDX[j]; t < IDX[j + 1]; ++t) {
+    const float* rec = &TERMS[std::size_t(t) * kTermStride];
+    const auto code = static_cast<std::uint32_t>(rec[0]);
+    const std::uint32_t kind = code & 15u, bm = std::min<std::uint32_t>((code >> 8u) & 15u, kMaxBermudans - 1), extra = code >> 12u;
+    const auto slot = static_cast<std::uint32_t>(rec[1]);
+    const float c = rec[2];
+    auto bond = [&] { return rec[3] * std::exp(-rec[4] * x); };
+    switch (kind) {
+      case kBond: value += c * bond(); break;
+      case kFixedFloat: value += (fix[slot] * c + rec[5]) * bond(); break;
+      case kAsset: value += c * st.S[slot] * rec[3]; break;
+      case kSetFixing: fix[slot] = (bond() - 1.0f) / c; break;
+      case kOption: {
+        const float b0 = bond(), p3 = rec[7];
+        value += c * black(st.S[slot] * rec[5] / b0, rec[6], std::fabs(p3), b0, p3 > 0.0f);
+        break;
+      }
+      case kBermExercise: ev[bm] += c * bond(); break;
+      case kBermDecide:
+        if (ex[bm] == kNotExercised && ev[bm] > 0.0f && ev[bm] > amcPoly(rec, x)) ex[bm] = extra;
+        break;
+      case kBermContinue:
+        if (ex[bm] == kNotExercised) value += rec[1] * std::max(amcPoly(rec, x), 0.0f);
+        break;
+      case kBermBond:
+        if (ex[bm] != kNotExercised && ex[bm] <= extra) value += c * bond();
+        break;
+      case kBermFloat:
+        if (ex[bm] != kNotExercised && ex[bm] <= extra) value += (fix[slot] * c + rec[5]) * bond();
+        break;
+      default: break;  // probes write rows of the outer path only
+    }
+  }
+  return value;
 }
 
 void simulatePath(const PlanView& v, std::uint32_t p, float* stats, float* expo, std::size_t stride, float* vals,
@@ -239,14 +330,22 @@ void simulatePath(const PlanView& v, std::uint32_t p, float* stats, float* expo,
     float collateral = 0.0f;
     vals[j] = value;
     if (v.hasCsa) {
+      // Units of the collateral (cash: the amount) fixed at the call date, revalued at t.
+      const float* ca = &FP[16 + kCholeskyStride * kCholeskyStride];  // (type, asset, haircut, -)
+      const auto ctype = static_cast<std::uint32_t>(ca[0]);
+      float price = 1.0f;
+      if (ctype == 1) price = STEPS[std::size_t(j) * kStepStride + 22] * std::exp(-STEPS[std::size_t(j) * kStepStride + 23] * x);
+      else if (ctype == 2) price = S[std::min(static_cast<std::uint32_t>(ca[1]), 3u)];
+      vals[nT + j] = price;
       const std::uint32_t callJ = IDX[v.offCall + j];
-      const float vc = callJ != j ? vals[callJ] : value;
+      const float vc = callJ != j ? vals[callJ] : value, pc = callJ != j ? vals[nT + callJ] : price;
+      const float keep = ctype != 0 ? 1.0f - ca[2] : 1.0f;
       const float hc = FP[8], hb = FP[9];
       float required = 0.0f;
       if (vc > hc) required += vc - hc;
       if (hb >= 0.0f && -vc > hb) required -= -vc - hb;
-      if (j == 0 || std::fabs(required - held) >= mta) held = required;
-      collateral = held + ia;
+      if (j == 0 || std::fabs(required - held * keep * pc) >= mta) held = required / (keep * pc);
+      collateral = held * price + ia;
     }
     const float e = value - collateral, ep = std::max(e, 0.0f), en = std::min(e, 0.0f);
     const std::uint32_t rs = IDX[v.offReporting + j];
@@ -268,6 +367,40 @@ void simulatePath(const PlanView& v, std::uint32_t p, float* stats, float* expo,
         for (std::uint32_t i = 0; i < nTr; ++i) put(v.rowTrades, i * v.nR + k, vt[i]);
     }
 
+    // Nested Monte Carlo: the conditional initial margin of this path on this reporting date.
+    if (rs > 0 && v.nInner > 0) {
+      const std::uint32_t target = IDX[v.offReporting + nT + j];
+      float im = 0.0f;
+      if (target != kNoRow) {
+        float top[kInnerTop] = {};
+        InnerPath start{x, lnD, {}, {}, {}, {}};
+        for (std::uint32_t a = 0; a < kMaxAssets; ++a) start.lnS[a] = lnS[a], start.S[a] = S[a];
+        for (std::uint32_t c = 0; c < kMaxCredits; ++c) start.y[c] = y[c], start.Y[c] = Y[c];
+        for (std::uint32_t i = 0; i < v.nInner; ++i) {
+          InnerPath st = start;
+          float f2[kMaxSwapSlots];
+          std::uint32_t e2[kMaxBermudans];
+          std::copy(std::begin(fix), std::end(fix), f2);
+          std::copy(std::begin(exercised), std::end(exercised), e2);
+          const std::uint32_t istream = pcg(stream ^ pcg(0x85EBCA6Bu + (i >> 1u) * 0x9E3779B9u + j));
+          const float isign = (i & 1u) == 1u ? -1.0f : 1.0f;
+          float vi = value;
+          for (std::uint32_t jj = j + 1; jj <= target; ++jj) {
+            innerStep(v, st, jj, istream, isign);
+            vi = innerValue(v, st, f2, e2, jj);
+          }
+          float cur = std::fabs(vi - value);
+          for (std::uint32_t k = 0; k < kInnerTop; ++k)
+            if (cur > top[k]) std::swap(cur, top[k]);
+        }
+        const float rank = v.imLevel * static_cast<float>(v.nInner - 1);
+        const auto k = static_cast<std::uint32_t>(std::floor(rank));
+        const std::uint32_t hiIdx = std::min<std::uint32_t>(v.nInner - 1 - k, kInnerTop - 1);
+        const float ok = top[hiIdx], ok1 = hiIdx > 0 ? top[hiIdx - 1] : ok;
+        im = ok + (rank - static_cast<float>(k)) * (ok1 - ok);
+      }
+      if (v.rowIm != kNoRow) expo[std::size_t(v.rowIm + rs - 1) * stride] = im;
+    }
     if (v.rowEx != kNoRow)
       for (std::uint32_t i = 0; i < std::min<std::uint32_t>(v.nBerm, kMaxBermudans); ++i)
         expo[(v.rowEx + i) * stride] = exercised[i] == kNotExercised ? -1.0f : static_cast<float>(exercised[i]);
@@ -309,7 +442,7 @@ FusedSlice runFusedWorkgroups(const FusedPlan& plan, std::size_t wgBegin, std::s
   float* partials = slice.partials.data();
   float* exposure = slice.exposure.data();
   pool.parallelFor(wgEnd - wgBegin, 1, [&](std::size_t cb, std::size_t ce) {
-    std::vector<float> stats(kWorkgroupSize * nT * nS), vals(nT), red(kWorkgroupSize * nS);
+    std::vector<float> stats(kWorkgroupSize * nT * nS), vals(2 * nT), red(kWorkgroupSize * nS);
     for (std::size_t g = wgBegin + cb; g < wgBegin + ce; ++g) {
       // The 64 invocations of the workgroup; inactive ones (past the last path) contribute zeros.
       std::fill(stats.begin(), stats.end(), 0.0f);
@@ -486,7 +619,7 @@ AmcStates runAmcStates(const FusedPlan& plan, SpinPool& pool) {
   const AmcSink sink{out.x.data(), out.deflator.data(), out.exercise.data(), nP, &offsets};
   // Paths are independent: the pool runs them in parallel, each writing its own column.
   pool.parallelFor(nP, 0, [&](std::size_t pb, std::size_t pe) {
-    std::vector<float> stats(nT * nS), expo(nQ), vals(nT);
+    std::vector<float> stats(nT * nS), expo(nQ), vals(2 * nT);
     for (std::size_t p = pb; p < pe; ++p) simulatePath(v, static_cast<std::uint32_t>(p), stats.data(), expo.data(), 1, vals.data(), &sink);
   });
   return out;

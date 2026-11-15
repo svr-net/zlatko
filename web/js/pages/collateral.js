@@ -9,7 +9,9 @@ const page = initPage({
   description: 'The collateral held at t is the amount called on the portfolio value at <i>t − MPR</i>, the last call the defaulting counterparty met. ' +
     'Thresholds and the minimum transfer amount apply. The page compares the CSA you specify with variants. Margin-call dates are simulated as auxiliary grid dates, ' +
     'and exposure is reported only on the primary dates. The spikes on cash-flow dates are the known effect of collateral posted ' +
-    'before a payment still being held during the margin period of risk.',
+    'before a payment still being held during the margin period of risk. ' +
+    'Collateral can be cash or securities: a government bond or the FX / equity asset is delivered in units at the call (the amount over (1 − haircut) times its price) ' +
+    'and is worth its price at close-out, so its value moves over the margin period of risk and can fall just as the exposure rises (wrong-way collateral).',
 });
 specEditor(page, ['market', 'assets', 'simulation', 'portfolio', 'csa'], { open: true });
 
@@ -40,11 +42,11 @@ const button = runButton(page, 'Compare CSAs', async (spec) => {
     series: [{ name: 'EEPE (1y)', values: v.map((x) => x.profile.eepe1y) }, { name: 'peak PFE', values: v.map((x) => x.profile.maxPfe), colorIndex: 1 }],
   });
   const box = card(g, 'Summary', '');
-  table(box, ['CSA', 'H cpty', 'H own', 'MTA', 'MPR (days)', 'EEPE 1y', 'peak PFE', 'EEPE vs no CSA'], v.map((x) => {
+  table(box, ['CSA', 'collateral', 'haircut', 'H cpty', 'H own', 'MTA', 'MPR (days)', 'EEPE 1y', 'peak PFE', 'EEPE vs no CSA'], v.map((x) => {
     const c = x.csa;
-    return [x.name, c.enabled ? fmt.compact(c.thresholdCounterparty) : '–', c.enabled ? (c.oneWay ? '∞' : fmt.compact(c.thresholdOwn)) : '–',
-      c.enabled ? fmt.compact(c.mta) : '–', c.enabled ? fmt.num(c.mprDays) : '–', fmt.compact(x.profile.eepe1y), fmt.compact(x.profile.maxPfe),
-      fmt.pct(x.eepeVsNoCsa, 1)];
+    return [x.name, c.enabled ? c.collateral : '–', c.enabled ? fmt.pct(c.haircut, 0) : '–', c.enabled ? fmt.compact(c.thresholdCounterparty) : '–',
+      c.enabled ? (c.oneWay ? '∞' : fmt.compact(c.thresholdOwn)) : '–', c.enabled ? fmt.compact(c.mta) : '–', c.enabled ? fmt.num(c.mprDays) : '–',
+      fmt.compact(x.profile.eepe1y), fmt.compact(x.profile.maxPfe), fmt.pct(x.eepeVsNoCsa, 1)];
   }));
   return engineNote(runResult, performance.now() - t0);
 });

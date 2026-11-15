@@ -190,12 +190,12 @@ node web/tests/e2e.mjs                   # every page in headless Chromium (Play
 | Pricing on scenarios | `instruments/*` | Swaps (with fixings recovered on the path), FX/equity forwards, European options, CDS (bootstrapping of hazard curves) |
 | American Monte Carlo | `instruments/bermudan_swaption.hpp`, `core/regression.hpp` | Longstaff–Schwartz exercise policy plus regression-based mark-to-market at every grid date. Physical vs cash settlement (exposure carries on, or stops, after exercise) |
 | Netting | `exposure/exposure_engine.hpp` | Netting sets, netted vs gross exposure |
-| Collateral | `exposure/collateral.hpp` | CSA with two-way thresholds, minimum transfer amount, independent amount and margin period of risk. Margin call dates t − MPR are simulated as auxiliary grid dates |
+| Collateral | `exposure/collateral.hpp` | CSA with two-way thresholds, minimum transfer amount, independent amount and margin period of risk. Margin call dates t − MPR are simulated as auxiliary grid dates. Collateral in cash, a zero-coupon bond or an equity/FX asset, with a haircut: units are fixed at the call and revalued at close-out |
 | Exposure allocation | `exposure/allocation.hpp` | Marginal (Euler) contributions that add up to the netting-set EE/CVA, and incremental exposure of a new trade |
 | Pricing counterparty risk | `cva/cva.hpp` | Unilateral CVA, CVA term structure, bilateral CVA/DVA with first-to-default, CVA as a running spread |
 | Wrong-way risk | `cva/cva.hpp` (`pathwiseCva`) | Path-by-path CVA using the simulated survival probabilities, with the intensity correlated to the exposure drivers |
 | GPU exposure | `gpu/fused_exposure.hpp` | The exposure pipeline as fused WGSL kernels: plan compiler, kernel sources, read-back summary, and a CPU reference of the kernels |
-| XVA | `xva/xva.hpp` | FCA, FBA (FVA), MVA from a simulated initial-margin proxy, KVA, the combined total, and exact allocation of CVA, FCA and KVA to trades |
+| XVA | `xva/xva.hpp` | FCA, FBA (FVA), MVA from nested conditional initial margin (inner simulation per path and date in the fused kernels) or the unconditional proxy, KVA, the combined total, and exact allocation of CVA, FCA and KVA to trades |
 | Hedging | `hedging/sensitivities.hpp` | XVA credit (counterparty and own) and funding sensitivities; bucketed CS01 of CVA with re-bootstrapped curves, CDS hedge notionals from the hedge Jacobian, and market-risk deltas by bump-and-revalue with common random numbers |
 
 ## Proposed extension chapters: XVA
@@ -214,8 +214,8 @@ in `xva/xva.hpp`, `hedging/sensitivities.hpp` and [`web/xva.html`](web/xva.html)
 | X5. XVA allocation to trades | Exact Euler allocation of CVA, FCA, KVA; incremental XVA | `allocateExposureXva`, [allocation](web/allocation.html) |
 | X6. XVA sensitivities and hedging | Bucketed CS01, CDS hedge notionals, own-credit paradox, common random numbers | [hedging](web/hedging.html) |
 | X7. Numerical practice | Monte Carlo error, grid, regression, validation checks, engines | [gpu](web/gpu.html) |
-| X8. Nested Monte Carlo in XVA | Inner/outer simulation, bias and the `B^{-2/3}` convergence, bias reduction, regression versus nesting, conditional initial margin, dual bounds, design | not implemented; builds on `core/regression.hpp`, [amc](web/amc.html) |
-| X9. Beyond this implementation | Collateralised funding, SA-CCR capital, stochastic spreads, conditional IM, AAD | open |
+| X8. Nested Monte Carlo in XVA | Inner/outer simulation, bias and the `B^{-2/3}` convergence, bias reduction, regression versus nesting, conditional initial margin, dual bounds, design | nested conditional IM in the fused kernels (`FusedOptions::imInnerPaths`), [xva](web/xva.html); bias corrections and dual bounds open |
+| X9. Beyond this implementation | Collateralised funding, SA-CCR capital, stochastic spreads, AAD | open |
 | X10. Artificial intelligence and XVA | Surrogates, differential ML, generative scenarios, deep hedging, LLM agent skill, model risk, back test | [ai](web/ai.html) · `examples/xva_ai_dataset.cpp` · `web/js/ai/` |
 
 ## Conventions

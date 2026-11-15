@@ -28,7 +28,9 @@ export const STATE_FIELDS = {
 export function stateToSpec(state = {}) {
   const s = {};
   for (const [k, f] of Object.entries(STATE_FIELDS)) s[k] = state[k] ?? f.default;
-  return { ...defaultSpec(), marketState: s };
+  // The unconditional IM proxy, as in examples/xva_ai_dataset.cpp: the agent's engine prices and the
+  // surrogates' ground truth then share one MVA definition (the XVA page defaults to nested IM).
+  return { ...defaultSpec(), imMethod: 'proxy', marketState: s };
 }
 
 // ----------------------------------------------------------------------------- tools

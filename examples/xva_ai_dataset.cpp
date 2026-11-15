@@ -92,6 +92,7 @@ Result price(const State& x) {
   const auto t0 = std::chrono::steady_clock::now();
   gpu::FusedOptions o;
   o.imQuantile = 0.99;  // initial margin: 99% quantile of the value change, scaled to a 10-day MPR
+  // (the unconditional proxy, imInnerPaths = 0; the AI page's agent tools ask for the same)
   const auto plan = gpu::compile(engine, ns, o);
   const auto f = gpu::summarise(plan, gpu::runFusedReference(plan));
   const auto& t = f.profile.times;

@@ -498,10 +498,20 @@ nested estimator, with Richardson correction, against the regression estimate an
 MSE for fixed budget `B` as `N_i` varies, with the minimum at `N_i ∼ B^{1/3}`; and the conditional IM
 profile against the unconditional proxy of X3, with the corresponding MVA.
 
-**Code / page.** Not implemented. The building blocks are present: simulation of the state (`ScenarioGenerator`),
-regression estimation of `V(t)` (`core/regression.hpp`, [`web/amc.html`](../web/amc.html)), the unconditional IM proxy
-(`initialMarginProfile`), and the fused kernels ([`web/gpu.html`](../web/gpu.html)). A nested engine would
-add an inner-simulation step per outer node on top of these.
+**Code / page.** The conditional initial margin is implemented in the fused kernels
+(`FusedOptions::imInnerPaths`, `imMarginPeriod`; WGSL in `src/gpu/fused_kernels.cpp`, its CPU mirror in
+`src/gpu/fused_reference.cpp`). From every outer path at every reporting date `t` the kernel runs
+`N_i` antithetic inner paths of the risk factors to `t + MPOR` (the `t + MPOR` dates are added to the
+grid), revalues the netting set on each with the same pricing terms as the outer simulation, and keeps the
+16 largest `|V(t + MPOR) − V(t)|` by insertion, so the `q`-quantile (0.99 by default) is read from
+order statistics without storing the inner sample. That limits `N_i` to `2..1024` with
+`N_i − 1 − ⌊q(N_i − 1)⌋ < 15`. The result is `IM(t, ω)` per path, its mean and 5/50/95% bands, and
+MVA = Σ spread · E[D(t) IM(t)] Δt. The XVA analysis (`spec.imMethod`, `"nested"` by default with
+`imInnerPaths` = 128, or `"proxy"`) reports the X3 proxy alongside, and [`web/xva.html`](../web/xva.html) plots
+both profiles. The unit test `gpu_nested_initial_margin_matches_the_analytic_conditional_quantile`
+checks an FX forward against the analytic conditional quantile. The low-biased empirical quantile
+(about −4% at 128 inner paths, −1.3% at 512, −0.6% at 1024) is the inner bias discussed above.
+Not implemented: the Richardson or multilevel bias corrections and the nested dual bound.
 
 **Further reading.** Gordy and Juneja (2010) "Nested simulation in portfolio risk measurement",
 *Management Science* 56(10); Broadie, Du and Moallemi (2011) "Efficient risk estimation via nested
