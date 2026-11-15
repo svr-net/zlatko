@@ -1,5 +1,5 @@
-import { run } from '../ccr-client.js';
 import { barChart, fmt, lineChart } from '../charts.js';
+import { engineNote, engineSelector, runAnalysis } from '../gpu/backend.js';
 import { card, grid, initPage, passFail, runButton, specEditor, table, tiles } from '../ui.js';
 
 const page = initPage({
@@ -8,12 +8,15 @@ const page = initPage({
   context: 'ccr/exposure: marginalExposureContributions · incrementalExposure · ccr/xva: allocateExposureXva',
   description: 'Netting makes the netting-set CVA smaller than the sum of the standalone CVAs, so it has to be split among the trades. The marginal (Euler) ' +
     'contribution E[D·V<sub>i</sub>·1{V &gt; 0}] adds up exactly to the total. The incremental CVA is the change from removing a trade, ' +
-    'which is the right price for a new deal but does not add up. Hedging trades get negative contributions.',
+    'which is the right price for a new deal but does not add up. Hedging trades get negative contributions. ' +
+    'On WebGPU (or the CPU kernels) the fused kernel tracks every trade\'s value on each path and accumulates these statistics directly, for up to 16 trades.',
 });
 specEditor(page, ['market', 'assets', 'credit', 'own', 'xva', 'simulation', 'portfolio']);
 
-runButton(page, 'Allocate', async (spec) => {
-  const r = await run('allocation', spec);
+const button = runButton(page, 'Allocate', async (spec) => {
+  const t0 = performance.now();
+  const runResult = await runAnalysis('allocation', spec);
+  const r = runResult.result;
   const sum = (k) => r.trades.reduce((s, t) => s + t[k], 0);
   tiles(page.content, [
     { label: 'Netting-set CVA', value: fmt.num(r.totalCva) },
@@ -38,11 +41,15 @@ runButton(page, 'Allocate', async (spec) => {
   const box = card(g, 'Allocation table', '');
   table(box, ['trade', 'marginal', 'share', 'incremental', 'standalone'], [
     ...r.trades.map((tr) => [tr.id, fmt.num(tr.marginalCva), fmt.pct(tr.marginalCva / r.totalCva, 1), fmt.num(tr.incrementalCva), fmt.num(tr.standaloneCva)]),
-    ['total', fmt.num(sum('marginalCva')), passFail(Math.abs(sum('marginalCva') - r.totalCva) < 1e-6 * Math.abs(r.totalCva), 'adds up'), fmt.num(sum('incrementalCva')), fmt.num(sum('standaloneCva'))],
+    ['total', fmt.num(sum('marginalCva')), passFail(Math.abs(sum('marginalCva') - r.totalCva) < (runResult.fused ? 1e-4 : 1e-6) * Math.abs(r.totalCva), runResult.fused ? 'adds up (f32)' : 'adds up'), fmt.num(sum('incrementalCva')), fmt.num(sum('standaloneCva'))],
   ]);
   const xvaBox = card(g, 'XVA allocation', 'CVA, FCA and KVA are linear in the discounted EE, so the marginal contributions allocate them exactly.');
   table(xvaBox, ['trade', 'CVA', 'FCA', 'KVA'], [
     ...r.trades.map((tr) => [tr.id, fmt.num(tr.marginalCva), fmt.num(tr.marginalFca), fmt.num(tr.marginalKva)]),
     ['netting set', fmt.num(r.totalCva), fmt.num(r.totalFca), fmt.num(r.totalKva)],
   ]);
+  window.__ccrEngineRun = { page: 'allocation', engine: runResult.engine, totalCva: r.totalCva, marginalSum: sum('marginalCva') };
+  return engineNote(runResult, performance.now() - t0);
 });
+
+engineSelector(page, () => button.click());

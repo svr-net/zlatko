@@ -3,6 +3,7 @@ import { barChart, fmt, lineChart } from '../charts.js';
 import data from '../ai/backtest-data.js';
 import { SKILL_MD, STATE_FIELDS, TOOLS, adapters, executeTool, runAgentLoop, runHarness, scriptedLlm } from '../ai/skill.js';
 import { TARGETS, runBacktest } from '../ai/surrogate.js';
+import { engineSelector, runAnalysis } from '../gpu/backend.js';
 import { card, el, grid, initPage, runButton, table, tiles } from '../ui.js';
 
 const page = initPage({
@@ -87,7 +88,16 @@ runButton(page, 'Run surrogate back test', async () => {
 const extra = el('div');
 page.main.append(extra);
 
-const engineRunner = (fn, spec) => run(fn, spec);
+// Tool calls price XVA on the engine chosen by the selector (Auto: the fused kernels on WebGPU,
+// else on the CPU, else WebAssembly); the agent layer only sees the library's result.
+let lastEngine = '';
+const engineRunner = async (fn, spec) => {
+  if (fn !== 'xva') return run(fn, spec);
+  const r = await runAnalysis(fn, spec);
+  lastEngine = r.engine === 'wasm' ? 'WebAssembly' : `${r.label} (${r.result.adapter})`;
+  return r.result;
+};
+engineSelector(page, () => {});
 
 {
   const body = card(extra, 'The agent skill',
@@ -143,7 +153,7 @@ const { answer } = await runAgentLoop({
 
 {
   const body = card(extra, 'Try the tools on the engine',
-    'Paste a tool call, or use the scripted replay (a fixed script standing in for a model: <b>it is not a language model</b>). Each call runs the WebAssembly XVA engine in this tab.');
+    'Paste a tool call, or use the scripted replay (a fixed script standing in for a model: <b>it is not a language model</b>). Each call runs the XVA engine in this tab, on the engine chosen above (Auto: the fused kernels on WebGPU).');
   const name = el('select', {}, TOOLS.map((t) => el('option', { value: t.name, text: t.name })));
   const args = el('textarea', { rows: 4, style: 'width:100%;font-family:monospace;font-size:12px', text: '{"cptySpreadMultiplier": 2, "fxVol": 0.15}' });
   const out = el('pre', { class: 'code', text: '(no call yet)' });
@@ -158,7 +168,7 @@ const { answer } = await runAgentLoop({
     try { parsed = JSON.parse(args.value); } catch (e) { out.textContent = JSON.stringify({ ok: false, error: 'arguments are not valid JSON: ' + e.message }, null, 2); return; }
     const t0 = performance.now();
     const r = await executeTool(name.value, parsed, engineRunner);
-    out.textContent = JSON.stringify(r, null, 2) + `\n// ${fmt.num(performance.now() - t0)} ms`;
+    out.textContent = JSON.stringify(r, null, 2) + `\n// ${fmt.num(performance.now() - t0)} ms · ${lastEngine}`;
   }));
   const replay = el('button', { text: 'Replay a scripted agent session' });
   replay.addEventListener('click', () => guard(replay, async () => {
@@ -197,7 +207,7 @@ const { answer } = await runAgentLoop({
 
 {
   const body = card(extra, 'Live spot check of the stored ground truth',
-    'Re-prices a few days of the back-test path with the WebAssembly engine in this browser and compares with the stored native result. The two use different normal generators (<code>std::normal_distribution</code> is implementation defined), so they agree to Monte Carlo accuracy, not to the last digit.');
+    'Re-prices a few days of the back-test path with the engine in this browser and compares with the stored native result. They use different normal generators (<code>std::normal_distribution</code> is implementation defined; the fused kernels have their own), so they agree to Monte Carlo accuracy, not to the last digit.');
   const status = el('span', { class: 'status' });
   const host = el('div');
   const btn = el('button', { text: 'Spot check 4 days on the engine' });
@@ -213,7 +223,7 @@ const { answer } = await runAgentLoop({
         rows.push([`day ${d}`, fmt.num(truth), fmt.num(r.xva.total), pctS((r.xva.total - truth) / truth)]);
       }
       table(host, ['day', 'stored total XVA', 'engine now', 'difference'], rows);
-      status.textContent = 'Done';
+      status.textContent = `Done · ${lastEngine}`;
     } catch (e) { status.className = 'status error'; status.textContent = 'Error: ' + e.message; } finally { btn.disabled = false; }
   });
   body.append(el('div', { class: 'toolbar' }, btn, status), host);

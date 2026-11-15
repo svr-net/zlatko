@@ -89,17 +89,40 @@ if (valid) {
   const c = valid.checks;
   check(c.t0Diff < 1e-6 && c.eeDiff < c.tol && c.cvaDiff < c.tol && c.survDiff < 0.01, `validation checks ${JSON.stringify(c)}`);
 }
+// XVA and allocation on the fused kernels (per-trade statistics and the margin quantile in the
+// kernel) against the CPU library on the same spec.
+const emuXva = run('gpuEmulate xva', () => ccr.gpuEmulate({ ...pairSpec, analysis: 'xva' }));
+const cpuXva = ccr.xva(pairSpec);
+if (emuXva) {
+  for (const k of ['cva', 'dva', 'fca', 'mva', 'kva', 'total'])
+    near(emuXva.xva[k], cpuXva.xva[k], 2 * pathTol * Math.abs(cpuXva.xva[k]), `emulated kernels ${k.toUpperCase()} vs CPU`);
+  check(emuXva.trades.length === cpuXva.trades.length && emuXva.initialMargin.length === cpuXva.initialMargin.length, 'xva result shape');
+  near(emuXva.trades.reduce((s, t) => s + t.cva, 0), emuXva.xva.cva, 1e-4 * emuXva.xva.cva, 'emulated XVA allocation adds up (f32)');
+}
+const emuAlloc = run('gpuEmulate allocation', () => ccr.gpuEmulate({ ...pairSpec, analysis: 'allocation' }));
+const cpuAlloc = ccr.allocation(pairSpec);
+if (emuAlloc) {
+  near(emuAlloc.totalCva, cpuAlloc.totalCva, pathTol * cpuAlloc.totalCva, 'emulated allocation CVA vs CPU');
+  near(emuAlloc.trades.reduce((s, t) => s + t.marginalCva, 0), emuAlloc.totalCva, 1e-4 * emuAlloc.totalCva, 'emulated Euler allocation adds up (f32)');
+  emuAlloc.trades.forEach((t, i) => {
+    const c = cpuAlloc.trades[i], scale = cpuAlloc.totalCva;
+    near(t.marginalCva, c.marginalCva, pathTol * scale, `${t.id} marginal CVA vs CPU`);
+    near(t.incrementalCva, c.incrementalCva, pathTol * scale, `${t.id} incremental CVA vs CPU`);
+    near(t.standaloneCva, c.standaloneCva, pathTol * Math.max(scale, c.standaloneCva), `${t.id} standalone CVA vs CPU`);
+  });
+}
 // CPU fused-kernel backend: the workgroups split across 3 "workers" must give exactly the
 // single-pass emulation, for a multi-job analysis too.
-for (const analysis of ['cva', 'hedging']) {
-  const base = analysis === 'cva' ? pairSpec : hedgeSpec;
+for (const analysis of ['cva', 'hedging', 'xva']) {
+  const base = analysis === 'hedging' ? hedgeSpec : pairSpec;
   const t0 = performance.now();
   const parts = [0, 1, 2].map((part) => ccr.cpuKernelSlices({ ...base, analysis, part, parts: 3 }));
   const split = run(`cpuKernelAnalyse ${analysis} (3 parts, ${(performance.now() - t0).toFixed(0)} ms kernels)`, () => ccr.cpuKernelAnalyse({ ...base, analysis, parts }));
   const single = ccr.gpuEmulate({ ...base, analysis });
   if (split) {
-    const key = analysis === 'cva' ? 'pathwiseCva' : 'parallelCs01';
-    check(split.cva === single.cva && split[key] === single[key], `${analysis}: split CPU kernels match the single pass exactly (${split.cva} vs ${single.cva})`);
+    const pick = { cva: (r) => [r.cva, r.pathwiseCva], hedging: (r) => [r.cva, r.parallelCs01], xva: (r) => [r.xva.total, r.xva.mva] }[analysis];
+    const [a1, a2] = pick(split), [b1, b2] = pick(single);
+    check(a1 === b1 && a2 === b2, `${analysis}: split CPU kernels match the single pass exactly (${a1} vs ${b1})`);
   }
 }
 check(typeof ccr.cpuKernelSlices({ ...spec, analysis: 'exposure', part: 0, parts: 2, trades: [{ type: 'bermudan', id: 'B', ...defaultBermudan() }] }).unsupported === 'string',

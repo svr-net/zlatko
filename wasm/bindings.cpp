@@ -860,57 +860,6 @@ val xvaToJs(const Xva& x) {
   return o;
 }
 
-// Marginal / incremental / standalone allocation of exposure and CVA.
-val allocation(val spec) {
-  return guarded([&] {
-    const Env env = parseEnv(spec);
-    const ExposureEngine engine(env.generator(), env.sim, env.baseGrid);
-    const ExposureResult r = engine.run(env.nettingSet(false), env.pfeQuantile);
-    const auto& s = r.scenarios;
-    const Matrix deflator = selectColumns(s.deflator, r.reportingIndices);
-    std::vector<Matrix> values;
-    for (const auto& m : r.tradeValues) values.push_back(selectColumns(m, r.reportingIndices));
-    const Matrix net = selectColumns(r.nettedValue, r.reportingIndices);
-    const auto& times = r.profile.times;
-    const CreditCurve& cc = env.cptyCurve();
-    const double rec = env.cptyRecovery();
-
-    const auto marginal = marginalExposureContributions(values, net, &deflator);
-    const auto marginalEe = marginalExposureContributions(values, net);
-    const double total = unilateralCva(r.profile, cc, rec);
-    const XvaParameters xvaParams = parseXva(spec);
-    const auto marginalXva = allocateExposureXva(times, marginal, cc, rec, ownCurveOrRiskless(env), xvaParams);
-    const ExposureXva totalXva = exposureXva(times, r.profile.discountedExpectedExposure, cc, rec, ownCurveOrRiskless(env), xvaParams);
-
-    val out = val::object();
-    out.set("times", arr(times));
-    out.set("totalCva", total);
-    out.set("totalFca", totalXva.fca);
-    out.set("totalKva", totalXva.kva);
-    out.set("totalEe", arr(r.profile.expectedExposure));
-    val trades = val::array();
-    for (std::size_t i = 0; i < values.size(); ++i) {
-      Matrix without(net.rows(), net.cols(), 0.0);
-      for (std::size_t k = 0; k < values.size(); ++k)
-        if (k != i) without += values[k];
-      const auto inc = incrementalExposure(without, values[i], &deflator);
-      const auto standalone = ExposureProfile::compute(values[i], TimeGrid(times), deflator);
-      val o = val::object();
-      o.set("id", env.trades[i].trade->id());
-      o.set("marginalEe", arr(marginalEe[i]));
-      o.set("marginalCva", unilateralCva(times, marginal[i], cc, rec));
-      o.set("marginalFca", marginalXva[i].fca);
-      o.set("marginalKva", marginalXva[i].kva);
-      o.set("incrementalCva", unilateralCva(times, inc, cc, rec));
-      o.set("standaloneCva", unilateralCva(standalone, cc, rec));
-      o.set("standaloneEe", arr(standalone.expectedExposure));
-      trades.call<void>("push", o);
-    }
-    out.set("trades", trades);
-    return out;
-  });
-}
-
 // ------------------------------------------------------------------ Monte Carlo analyses
 //
 // Each Monte Carlo analysis is a list of exposure jobs (one netting set under one model
@@ -937,7 +886,24 @@ struct JobResult {
   double elapsedMs = 0.0;
   std::string error;
   std::optional<ExposureResult> paths;           // CPU only, when requested
+  // XVA and allocation (uncollateralised netted value V and trade values V_i, reporting dates):
+  std::vector<double> meanDeflator;              // E[D]
+  std::vector<double> valueChangeQuantile;       // quantile of |V(t_k) - V(t_{k-1})| (initial margin), 0 at k = 0
+  std::vector<gpu::FusedResult::TradeStats> trades;  // Euler, incremental and standalone statistics per trade
 };
+
+// What an analysis needs beyond the exposure profile.
+struct Aggregates {
+  bool perTrade = false;
+  double imQuantile = 0.0;  // 0: no initial margin
+};
+
+Aggregates aggregatesFor(const val& spec, const std::string& analysis) {
+  Aggregates a;
+  a.perTrade = analysis == "xva" || analysis == "allocation";
+  if (analysis == "xva") a.imQuantile = num(spec, "imQuantile", 0.99);
+  return a;
+}
 
 Job makeJob(std::string label, const Env& env, const std::function<ScenarioGenerator()>& generator,
             const SimulationConfig& sim, const std::optional<CollateralAgreement>& csa) {
@@ -985,8 +951,10 @@ std::vector<Job> analysisJobs(const val& spec, const Env& env, const std::string
   const ScenarioGenerator gen = env.generator();
   auto fixed = [&](const ScenarioGenerator& g) { return [g] { return g; }; };
   std::vector<Job> jobs;
-  if (analysis == "exposure" || analysis == "cva" || analysis == "validation") {
+  if (analysis == "exposure" || analysis == "cva" || analysis == "validation" || analysis == "xva") {
     jobs.push_back(makeJob("base", env, fixed(gen), env.sim, env.csa));
+  } else if (analysis == "allocation") {
+    jobs.push_back(makeJob("base", env, fixed(gen), env.sim, std::nullopt));  // allocation of the uncollateralised set
   } else if (analysis == "collateral") {
     for (const auto& v : csaVariants(spec)) jobs.push_back(makeJob(v.name, env, fixed(gen), env.sim, v.csa));
   } else if (analysis == "wrongWayRisk") {
@@ -1027,7 +995,46 @@ std::vector<Job> analysisJobs(const val& spec, const Env& env, const std::string
   return jobs;
 }
 
-JobResult runOnCpu(const Job& job, const Env& env, bool keepPaths = false) {
+// The XVA / allocation statistics from the engine's paths, as the fused kernels compute them.
+void addAggregates(JobResult& r, const ExposureResult& x, const Aggregates& agg) {
+  const auto& idx = x.reportingIndices;
+  const Matrix net = selectColumns(x.nettedValue, idx), deflator = selectColumns(x.scenarios.deflator, idx);
+  const std::size_t nP = net.rows(), nR = net.cols();
+  r.meanDeflator.assign(nR, 0.0);
+  for (std::size_t k = 0; k < nR; ++k) {
+    for (std::size_t p = 0; p < nP; ++p) r.meanDeflator[k] += deflator(p, k);
+    r.meanDeflator[k] /= static_cast<double>(nP);
+  }
+  if (agg.imQuantile > 0.0) {
+    r.valueChangeQuantile.assign(nR, 0.0);
+    for (std::size_t k = 1; k < nR; ++k) {
+      std::vector<double> change(nP);
+      for (std::size_t p = 0; p < nP; ++p) change[p] = std::fabs(net(p, k) - net(p, k - 1));
+      r.valueChangeQuantile[k] = quantile(std::move(change), agg.imQuantile);
+    }
+  }
+  if (!agg.perTrade) return;
+  std::vector<Matrix> values;
+  for (const auto& m : x.tradeValues) values.push_back(selectColumns(m, idx));
+  const auto marginalD = marginalExposureContributions(values, net, &deflator);
+  const auto marginal = marginalExposureContributions(values, net);
+  const TimeGrid grid(r.profile.times);
+  for (std::size_t i = 0; i < values.size(); ++i) {
+    Matrix without(nP, nR, 0.0);
+    for (std::size_t k = 0; k < values.size(); ++k)
+      if (k != i) without += values[k];
+    const ExposureProfile standalone = ExposureProfile::compute(values[i], grid, deflator);
+    gpu::FusedResult::TradeStats t;
+    t.marginalDiscounted = marginalD[i];
+    t.marginal = marginal[i];
+    t.incrementalDiscounted = incrementalExposure(without, values[i], &deflator);
+    t.standaloneDiscounted = standalone.discountedExpectedExposure;
+    t.standalone = standalone.expectedExposure;
+    r.trades.push_back(std::move(t));
+  }
+}
+
+JobResult runOnCpu(const Job& job, const Env& env, bool keepPaths = false, const Aggregates& agg = {}) {
   JobResult r;
   if (!job.engine) {
     r.error = job.error;
@@ -1060,6 +1067,7 @@ JobResult runOnCpu(const Job& job, const Env& env, bool keepPaths = false) {
       if (den != 0.0) r.conditionalDiscountedEe[k] = num_ / den;
     }
   }
+  if (agg.perTrade || agg.imQuantile > 0.0) addAggregates(r, x, agg);
   if (keepPaths) r.paths = std::move(x);
   return r;
 }
@@ -1075,6 +1083,9 @@ JobResult fromFused(const gpu::FusedPlan& plan, const gpu::FusedOutput& output, 
     r.conditionalDiscountedEe = f.conditionalDiscountedEe;
     r.meanSurvival = f.meanSurvival;
   }
+  r.meanDeflator = f.meanDeflator;
+  r.valueChangeQuantile = f.valueChangeQuantile;
+  r.trades = f.trades;
   return r;
 }
 
@@ -1222,6 +1233,129 @@ val firstError(const std::vector<JobResult>& results) {
   return val::undefined();
 }
 
+// XVA from the exposure statistics of one job (CPU paths or fused kernels alike): the six
+// adjustments, their build-up, the funding and hurdle sweeps, the credit sensitivities and the
+// Euler allocation of CVA, FCA and KVA to trades.
+val xvaResult(const val& spec, const Env& env, const JobResult& r) {
+  const CreditCurve& cc = env.cptyCurve();
+  const CreditCurve& own = ownCurveOrRiskless(env);
+  const double rec = env.cptyRecovery();
+  const XvaParameters params = parseXva(spec);
+  const auto& times = r.profile.times;
+  // Initial margin: the |dV| quantile scaled to the margin period of risk, discounted with E[D].
+  const double mpr = num(spec, "imMprDays", 10.0) / 250.0;
+  std::vector<double> im(times.size(), 0.0);
+  for (std::size_t k = 1; k < times.size() && k < r.valueChangeQuantile.size(); ++k)
+    im[k] = r.valueChangeQuantile[k] * std::sqrt(mpr / (times[k] - times[k - 1])) * r.meanDeflator[k];
+  const Xva total = xva(r.profile, im, cc, rec, own, env.ownRecovery, params);
+
+  val out = val::object();
+  out.set("profile", profileToJs(r.profile));
+  out.set("initialMargin", arr(im));
+  out.set("xva", xvaToJs(total));
+  out.set("numPaths", static_cast<double>(r.numPaths));
+
+  // Cumulative cost of each adjustment up to every date (each is an integral over time).
+  auto part = [&](double Xva::*field) {
+    std::vector<double> c(times.size(), 0.0);
+    for (std::size_t k = 1; k < times.size(); ++k) {
+      ExposureProfile head = r.profile;
+      head.times.resize(k + 1);
+      head.discountedExpectedExposure.resize(k + 1);
+      head.discountedExpectedNegativeExposure.resize(k + 1);
+      const std::vector<double> imHead(im.begin(), im.begin() + static_cast<std::ptrdiff_t>(k + 1));
+      c[k] = xva(head, imHead, cc, rec, own, env.ownRecovery, params).*field;
+    }
+    return c;
+  };
+  out.set("cumulativeCva", arr(part(&Xva::cva)));
+  out.set("cumulativeFca", arr(part(&Xva::fca)));
+  out.set("cumulativeMva", arr(part(&Xva::mva)));
+  out.set("cumulativeKva", arr(part(&Xva::kva)));
+
+  // Funding spread and hurdle rate sweeps: FVA is linear in the spread, KVA in the hurdle rate.
+  std::vector<double> spreads, fvaBySpread, hurdles, kvaByHurdle;
+  for (int i = 0; i <= 10; ++i) {
+    XvaParameters p = params;
+    p.fundingSpreadBorrow = p.fundingSpreadLend = 0.0005 * i;
+    spreads.push_back(p.fundingSpreadBorrow);
+    fvaBySpread.push_back(xva(r.profile, {}, cc, rec, own, env.ownRecovery, p).fva());
+    p = params;
+    p.hurdleRate = 0.02 * i;
+    hurdles.push_back(p.hurdleRate);
+    kvaByHurdle.push_back(xva(r.profile, {}, cc, rec, own, env.ownRecovery, p).kva);
+  }
+  out.set("spreadGrid", arr(spreads));
+  out.set("fvaBySpread", arr(fvaBySpread));
+  out.set("hurdleGrid", arr(hurdles));
+  out.set("kvaByHurdle", arr(kvaByHurdle));
+
+  if (!env.ownQuotes.empty()) {
+    const XvaSensitivities s = xvaSensitivities(r.profile, im, *env.domestic, env.creditQuotes.at(env.counterparty), rec,
+                                                env.ownQuotes, env.ownRecovery, params);
+    std::vector<double> mats;
+    for (const auto& q : env.creditQuotes.at(env.counterparty)) mats.push_back(q.maturity);
+    val sens = val::object();
+    sens.set("maturities", arr(mats));
+    sens.set("counterpartyCs01", arr(s.counterpartyCs01));
+    sens.set("ownCs01", arr(s.ownCs01));
+    sens.set("fundingSpread01", s.fundingSpread01);
+    out.set("sensitivities", sens);
+  }
+
+  // Marginal allocation of the EE-driven adjustments (CVA, FCA, KVA) to trades.
+  std::vector<std::vector<double>> marginal;
+  for (const auto& t : r.trades) marginal.push_back(t.marginalDiscounted);
+  const auto parts = allocateExposureXva(times, marginal, cc, rec, own, params);
+  val trades = val::array();
+  for (std::size_t i = 0; i < parts.size(); ++i) {
+    val o = val::object();
+    o.set("id", env.trades[i].trade->id());
+    o.set("cva", parts[i].cva);
+    o.set("fca", parts[i].fca);
+    o.set("kva", parts[i].kva);
+    trades.call<void>("push", o);
+  }
+  out.set("trades", trades);
+  return out;
+}
+
+// Marginal (Euler), incremental and standalone allocation of exposure and CVA to trades.
+val allocationResult(const val& spec, const Env& env, const JobResult& r) {
+  const auto& times = r.profile.times;
+  const CreditCurve& cc = env.cptyCurve();
+  const double rec = env.cptyRecovery();
+  const XvaParameters xvaParams = parseXva(spec);
+  std::vector<std::vector<double>> marginal;
+  for (const auto& t : r.trades) marginal.push_back(t.marginalDiscounted);
+  const auto marginalXva = allocateExposureXva(times, marginal, cc, rec, ownCurveOrRiskless(env), xvaParams);
+  const ExposureXva totalXva = exposureXva(times, r.profile.discountedExpectedExposure, cc, rec, ownCurveOrRiskless(env), xvaParams);
+
+  val out = val::object();
+  out.set("times", arr(times));
+  out.set("totalCva", unilateralCva(r.profile, cc, rec));
+  out.set("totalFca", totalXva.fca);
+  out.set("totalKva", totalXva.kva);
+  out.set("totalEe", arr(r.profile.expectedExposure));
+  out.set("numPaths", static_cast<double>(r.numPaths));
+  val trades = val::array();
+  for (std::size_t i = 0; i < r.trades.size(); ++i) {
+    const auto& t = r.trades[i];
+    val o = val::object();
+    o.set("id", env.trades[i].trade->id());
+    o.set("marginalEe", arr(t.marginal));
+    o.set("marginalCva", unilateralCva(times, t.marginalDiscounted, cc, rec));
+    o.set("marginalFca", marginalXva[i].fca);
+    o.set("marginalKva", marginalXva[i].kva);
+    o.set("incrementalCva", unilateralCva(times, t.incrementalDiscounted, cc, rec));
+    o.set("standaloneCva", unilateralCva(times, t.standaloneDiscounted, cc, rec));
+    o.set("standaloneEe", arr(t.standalone));
+    trades.call<void>("push", o);
+  }
+  out.set("trades", trades);
+  return out;
+}
+
 // The combine step of every analysis: identical for CPU and GPU job results.
 val combine(const val& spec, const Env& env, const std::string& analysis, const std::vector<Job>& jobs,
             const std::vector<JobResult>& results) {
@@ -1307,6 +1441,14 @@ val combine(const val& spec, const Env& env, const std::string& analysis, const 
     }
     out.set("assetDeltas", deltas);
     out.set("cvaDv01", 0.5 * (cvaAt(i) - cvaAt(i + 1)));
+  } else if (analysis == "xva") {
+    const JobResult& r = results.at(0);
+    if (!r.error.empty()) throw std::invalid_argument(r.error);
+    out = xvaResult(spec, env, r);
+  } else if (analysis == "allocation") {
+    const JobResult& r = results.at(0);
+    if (!r.error.empty()) throw std::invalid_argument(r.error);
+    out = allocationResult(spec, env, r);
   } else {
     throw std::invalid_argument("unknown analysis '" + analysis + "'");
   }
@@ -1318,7 +1460,8 @@ val runAnalysisOnCpu(const val& spec, const std::string& analysis) {
   const Env env = parseEnv(spec);
   const auto jobs = analysisJobs(spec, env, analysis);
   std::vector<JobResult> results;
-  for (const auto& job : jobs) results.push_back(runOnCpu(job, env));
+  const Aggregates agg = aggregatesFor(spec, analysis);
+  for (const auto& job : jobs) results.push_back(runOnCpu(job, env, false, agg));
   return combine(spec, env, analysis, jobs, results);
 }
 
@@ -1328,97 +1471,15 @@ val cva(val spec) {
   return guarded([&] { return runAnalysisOnCpu(spec, "cva"); });
 }
 
-// All XVA adjustments of the netting set on the CPU engine (the margin profile needs the paths):
-// CVA, DVA, FCA, FBA, MVA and KVA, their sensitivities and the allocation to trades.
+// All XVA adjustments of the netting set: CVA, DVA, FCA, FBA, MVA and KVA, their
+// sensitivities and the allocation to trades (see combine "xva").
 val xvaAnalysis(val spec) {
-  return guarded([&] {
-    const Env env = parseEnv(spec);
-    const auto jobs = analysisJobs(spec, env, "cva");
-    const JobResult r = runOnCpu(jobs.at(0), env, true);
-    if (!r.error.empty()) throw std::invalid_argument(r.error);
-    const ExposureResult& x = *r.paths;
-    const CreditCurve& cc = env.cptyCurve();
-    const CreditCurve& own = ownCurveOrRiskless(env);
-    const double rec = env.cptyRecovery();
-    const XvaParameters params = parseXva(spec);
-    const auto& times = r.profile.times;
+  return guarded([&] { return runAnalysisOnCpu(spec, "xva"); });
+}
 
-    const Matrix net = selectColumns(x.nettedValue, x.reportingIndices);
-    const Matrix deflator = selectColumns(x.scenarios.deflator, x.reportingIndices);
-    const auto im = initialMarginProfile(net, TimeGrid(times), deflator, num(spec, "imQuantile", 0.99),
-                                         num(spec, "imMprDays", 10.0) / 250.0);
-    const Xva total = xva(r.profile, im, cc, rec, own, env.ownRecovery, params);
-
-    val out = val::object();
-    out.set("profile", profileToJs(r.profile));
-    out.set("initialMargin", arr(im));
-    out.set("xva", xvaToJs(total));
-
-    // Cumulative cost of each adjustment up to every date (each is an integral over time).
-    auto part = [&](double Xva::*field) {
-      std::vector<double> c(times.size(), 0.0);
-      for (std::size_t k = 1; k < times.size(); ++k) {
-        ExposureProfile head = r.profile;
-        head.times.resize(k + 1);
-        head.discountedExpectedExposure.resize(k + 1);
-        head.discountedExpectedNegativeExposure.resize(k + 1);
-        const std::vector<double> imHead(im.begin(), im.begin() + static_cast<std::ptrdiff_t>(k + 1));
-        c[k] = xva(head, imHead, cc, rec, own, env.ownRecovery, params).*field;
-      }
-      return c;
-    };
-    out.set("cumulativeCva", arr(part(&Xva::cva)));
-    out.set("cumulativeFca", arr(part(&Xva::fca)));
-    out.set("cumulativeMva", arr(part(&Xva::mva)));
-    out.set("cumulativeKva", arr(part(&Xva::kva)));
-
-    // Funding spread and hurdle rate sweeps: FVA is linear in the spread, KVA in the hurdle rate.
-    std::vector<double> spreads, fvaBySpread, hurdles, kvaByHurdle;
-    for (int i = 0; i <= 10; ++i) {
-      XvaParameters p = params;
-      p.fundingSpreadBorrow = p.fundingSpreadLend = 0.0005 * i;
-      spreads.push_back(p.fundingSpreadBorrow);
-      fvaBySpread.push_back(xva(r.profile, {}, cc, rec, own, env.ownRecovery, p).fva());
-      p = params;
-      p.hurdleRate = 0.02 * i;
-      hurdles.push_back(p.hurdleRate);
-      kvaByHurdle.push_back(xva(r.profile, {}, cc, rec, own, env.ownRecovery, p).kva);
-    }
-    out.set("spreadGrid", arr(spreads));
-    out.set("fvaBySpread", arr(fvaBySpread));
-    out.set("hurdleGrid", arr(hurdles));
-    out.set("kvaByHurdle", arr(kvaByHurdle));
-
-    if (!env.ownQuotes.empty()) {
-      const XvaSensitivities s = xvaSensitivities(r.profile, im, *env.domestic, env.creditQuotes.at(env.counterparty), rec,
-                                                  env.ownQuotes, env.ownRecovery, params);
-      std::vector<double> mats;
-      for (const auto& q : env.creditQuotes.at(env.counterparty)) mats.push_back(q.maturity);
-      val sens = val::object();
-      sens.set("maturities", arr(mats));
-      sens.set("counterpartyCs01", arr(s.counterpartyCs01));
-      sens.set("ownCs01", arr(s.ownCs01));
-      sens.set("fundingSpread01", s.fundingSpread01);
-      out.set("sensitivities", sens);
-    }
-
-    // Marginal allocation of the EE-driven adjustments (CVA, FCA, KVA) to trades.
-    std::vector<Matrix> values;
-    for (const auto& m : x.tradeValues) values.push_back(selectColumns(m, x.reportingIndices));
-    const auto marginal = marginalExposureContributions(values, net, &deflator);
-    const auto parts = allocateExposureXva(times, marginal, cc, rec, own, params);
-    val trades = val::array();
-    for (std::size_t i = 0; i < parts.size(); ++i) {
-      val o = val::object();
-      o.set("id", env.trades[i].trade->id());
-      o.set("cva", parts[i].cva);
-      o.set("fca", parts[i].fca);
-      o.set("kva", parts[i].kva);
-      trades.call<void>("push", o);
-    }
-    out.set("trades", trades);
-    return out;
-  });
+// Marginal / incremental / standalone allocation of exposure and CVA (see combine "allocation").
+val allocation(val spec) {
+  return guarded([&] { return runAnalysisOnCpu(spec, "allocation"); });
 }
 
 val wrongWayRisk(val spec) {
@@ -1455,7 +1516,8 @@ val collateral(val spec) {
 
 val gpuKernels(val) {
   val o = val::object();
-  o.set("fusedExposure", gpu::fusedExposureKernel());
+  o.set("fusedExposure", gpu::fusedExposureKernel(false));
+  o.set("fusedExposureTrades", gpu::fusedExposureKernel(true));
   o.set("reducePartials", gpu::reducePartialsKernel());
   o.set("pfeQuantile", gpu::pfeQuantileKernel());
   return o;
@@ -1467,6 +1529,7 @@ val planToJs(const gpu::FusedPlan& p, const std::string& label) {
   o.set("numPaths", static_cast<double>(p.numPaths));
   o.set("numDates", static_cast<double>(p.numDates()));
   o.set("numTerms", static_cast<double>(p.numTerms()));
+  o.set("perTrade", p.perTrade());  // needs the per-trade variant of the fused kernel
   o.set("header", typedArray(p.header));
   o.set("indices", typedArray(p.indices));
   o.set("params", typedArray(p.params));
@@ -1479,6 +1542,8 @@ val planToJs(const gpu::FusedPlan& p, const std::string& label) {
   o.set("dispatch", dispatch);
   val bytes = val::object();
   bytes.set("cube", static_cast<double>(p.cubeBytes()));
+  bytes.set("vals", static_cast<double>(p.valsBytes()));
+  bytes.set("expo", static_cast<double>(p.expoBytes()));
   bytes.set("partials", static_cast<double>(p.partialsBytes()));
   bytes.set("sums", static_cast<double>(p.sumsBytes()));
   bytes.set("pfe", static_cast<double>(p.pfeBytes()));
@@ -1503,11 +1568,17 @@ GpuJobs compileJobs(const val& spec, const Env& env) {
       g.plans.emplace_back();
       continue;
     }
-    if (const std::string why = gpu::limitation(*job.engine, job.nettingSet); !why.empty()) {
+    const Aggregates agg = aggregatesFor(spec, analysisOf(spec));
+    if (const std::string why = gpu::limitation(*job.engine, job.nettingSet, agg.perTrade); !why.empty()) {
       g.unsupported = why;
       return g;
     }
-    g.plans.emplace_back(gpu::compile(*job.engine, job.nettingSet, env.pfeQuantile, env.counterparty));
+    gpu::FusedOptions o;
+    o.pfeQuantile = env.pfeQuantile;
+    o.counterparty = env.counterparty;
+    o.perTrade = agg.perTrade;
+    o.imQuantile = agg.imQuantile;
+    g.plans.emplace_back(gpu::compile(*job.engine, job.nettingSet, o));
   }
   return g;
 }
