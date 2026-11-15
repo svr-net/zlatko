@@ -44,7 +44,7 @@ const gpuSpec = { sim: { numPaths: 8000, seed: 11, antithetic: true } };
 const pairSpec = { sim: { numPaths: 4000, seed: 11, antithetic: true } };
 // Pages with the engine selector. With no stored choice they run on Auto, which must pick the
 // WebGPU kernels on desktop too; each also runs once forced onto WebAssembly.
-const enginePages = ['index', 'exposure', 'collateral', 'cva', 'wwr', 'hedging'];
+const enginePages = ['index', 'exposure', 'collateral', 'allocation', 'cva', 'xva', 'wwr', 'hedging'];
 const cases = [
   ...['index', 'core', 'market', 'models', 'instruments', 'amc', 'exposure', 'collateral', 'allocation', 'cva', 'xva', 'ai', 'wwr', 'hedging']
     .map((name) => ({ name, file: name, spec: testSpec, ...(enginePages.includes(name) ? { engine: 'auto', expectEngine: 'WebGPU' } : {}) })),
@@ -57,7 +57,7 @@ const cases = [
   // Collateralised netting set: exercises the margin-call look-back inside the fused kernel.
   { name: 'gpu-csa', file: 'gpu', spec: { ...gpuSpec, csa: { enabled: true, thresholdCounterparty: 250e3, thresholdOwn: 250e3, mta: 50e3, independentAmount: 0, mpr: 10 / 250 } } },
   // WASM/GPU pairs on the same spec whose headline numbers must agree within Monte Carlo error.
-  ...['exposure', 'cva', 'hedging'].flatMap((name) => [
+  ...['exposure', 'cva', 'xva', 'allocation', 'hedging'].flatMap((name) => [
     { name: `${name}-wasm-pair`, file: name, spec: pairSpec, engine: 'wasm', expectEngine: 'WebAssembly', pair: name },
     { name: `${name}-gpu-pair`, file: name, spec: pairSpec, engine: 'gpu', expectEngine: 'WebGPU', pair: name },
     { name: `${name}-cpu-pair`, file: name, spec: pairSpec, engine: 'cpu', expectEngine: 'CPU fused kernels', pair: name },
@@ -169,6 +169,8 @@ for (const { name, file, spec, engine, expectEngine, pair, device, gpuStub, expe
 const metrics = {
   exposure: [['EEPE 1y', (r) => r.eepe1y]],
   cva: [['CVA', (r) => r.cva]],
+  xva: [['total XVA', (r) => r.total], ['CVA', (r) => r.cva], ['MVA', (r) => r.mva], ['KVA', (r) => r.kva]],
+  allocation: [['CVA', (r) => r.totalCva], ['Σ marginal CVA', (r) => r.marginalSum]],
   hedging: [['CVA', (r) => r.cva], ['parallel CS01', (r) => r.parallelCs01], ['CVA DV01', (r) => r.cvaDv01],
     ['delta (CRN, h=0.005)', (r) => r.deltaCrn[0][3]]],
 };

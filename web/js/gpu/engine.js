@@ -123,6 +123,9 @@ export class GpuEngine {
       make(kernels.reducePartials, 'reduce-partials'),
       make(kernels.pfeQuantile, 'pfe-quantile'),
     ]);
+    // The per-trade variant (XVA and allocation plans) is compiled on first use.
+    this.fusedTrades = null;
+    this.makeTrades = () => (this.fusedTrades ??= make(kernels.fusedExposureTrades, 'fused-exposure-trades'));
   }
 
   upload(data, usage, label) {
@@ -161,13 +164,14 @@ export class GpuEngine {
       entries: entries.map((buffer, binding) => ({ binding, resource: { buffer } })),
     });
 
+    const fused = plan.perTrade ? await this.makeTrades() : this.fused;
     d.pushErrorScope('validation');
     d.pushErrorScope('out-of-memory');
     const t0 = performance.now();
     const enc = d.createCommandEncoder();
     const pass = enc.beginComputePass();
-    pass.setPipeline(this.fused);
-    pass.setBindGroup(0, group(this.fused, [bufs.header, bufs.indices, bufs.params, bufs.steps, bufs.terms, bufs.vals, bufs.expo, bufs.partials]));
+    pass.setPipeline(fused);
+    pass.setBindGroup(0, group(fused, [bufs.header, bufs.indices, bufs.params, bufs.steps, bufs.terms, bufs.vals, bufs.expo, bufs.partials]));
     pass.dispatchWorkgroups(dispatch.fused);
     pass.setPipeline(this.reduce);
     pass.setBindGroup(0, group(this.reduce, [bufs.header, bufs.partials, bufs.sums]));

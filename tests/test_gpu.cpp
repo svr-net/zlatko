@@ -4,6 +4,8 @@
 
 #include "ccr/core/math.hpp"
 #include "ccr/cva/cva.hpp"
+#include "ccr/exposure/allocation.hpp"
+#include "ccr/xva/xva.hpp"
 #include "ccr/exposure/exposure_engine.hpp"
 #include "ccr/gpu/fused_exposure.hpp"
 #include "ccr/instruments/asset_forward.hpp"
@@ -200,4 +202,58 @@ TEST(gpu_pfe_kernel_is_the_interpolated_empirical_quantile) {
         CHECK_NEAR(out.pfe[r], exact, 1e-6 * std::max(mx, 1.0));
       }
     }
+}
+
+TEST(gpu_per_trade_statistics_and_initial_margin) {
+  // Per-trade mode and the margin quantile against the double-precision engine's paths: the
+  // Euler contributions add up to the netting-set EE*, and every statistic agrees with
+  // marginalExposureContributions / incrementalExposure / initialMarginProfile within MC error.
+  const auto s = gpuSetup(8000, false);
+  gpu::FusedOptions o;
+  o.perTrade = true;
+  o.imQuantile = 0.99;
+  const auto plan = gpu::compile(s.engine, s.nettingSet, o);
+  CHECK(plan.perTrade() && plan.hasInitialMargin());
+  CHECK(plan.statsPerDate == 24);  // 8 + 5 x 3 trades, padded to a multiple of 4
+  CHECK(gpu::fusedExposureKernel(true).find("MAX_TRADES : u32 = 16u") != std::string::npos);
+  const auto f = gpu::summarise(plan, gpu::runFusedReference(plan));
+  CHECK(f.trades.size() == 3);
+  // The default plan prices the same netting set: the profiles agree to f32 rounding at t = 0.
+  const auto plain = gpu::summarise(gpu::compile(s.engine, s.nettingSet), gpu::runFusedReference(gpu::compile(s.engine, s.nettingSet)));
+  CHECK_NEAR(f.profile.expectedValue[0], plain.profile.expectedValue[0], 1e-6 * 1e6);
+
+  const ExposureResult cpu = s.engine.run(s.nettingSet, 0.95);
+  const auto& idx = cpu.reportingIndices;
+  const Matrix net = selectColumns(cpu.nettedValue, idx), deflator = selectColumns(cpu.scenarios.deflator, idx);
+  std::vector<Matrix> values;
+  for (const auto& m : cpu.tradeValues) values.push_back(selectColumns(m, idx));
+  const auto marginal = marginalExposureContributions(values, net, &deflator);
+  const double scale = *std::max_element(cpu.profile.discountedExpectedExposure.begin(), cpu.profile.discountedExpectedExposure.end());
+  const double tol = 6.0 / std::sqrt(8000.0) * scale;
+  for (std::size_t k = 0; k < f.profile.times.size(); ++k) {
+    double sum = 0.0;
+    for (const auto& t : f.trades) sum += t.marginalDiscounted[k];
+    CHECK_NEAR(sum, f.profile.discountedExpectedExposure[k], 1e-5 * scale);  // Euler allocation adds up
+    for (std::size_t i = 0; i < 3; ++i) {
+      CHECK_NEAR(f.trades[i].marginalDiscounted[k], marginal[i][k], tol);
+      Matrix without(net.rows(), net.cols(), 0.0);
+      for (std::size_t m = 0; m < 3; ++m)
+        if (m != i) without += values[m];
+      CHECK_NEAR(f.trades[i].incrementalDiscounted[k], incrementalExposure(without, values[i], &deflator)[k], tol);
+    }
+  }
+  const auto im = initialMarginProfile(net, TimeGrid(cpu.profile.times), deflator, 0.99, 10.0 / 250.0);
+  CHECK(f.valueChangeQuantile.size() == im.size() && f.valueChangeQuantile[0] == 0.0);
+  double imScale = *std::max_element(im.begin(), im.end()), worst = 0.0;
+  for (std::size_t k = 1; k < im.size(); ++k) {
+    const double dt = cpu.profile.times[k] - cpu.profile.times[k - 1];
+    const double gpuIm = f.valueChangeQuantile[k] * std::sqrt(10.0 / 250.0 / dt) * f.meanDeflator[k];
+    worst = std::max(worst, std::fabs(gpuIm - im[k]));
+  }
+  CHECK(worst < 0.1 * imScale);  // a 99% quantile of independent samples: a few % noise
+  // At most 16 trades get their own statistics.
+  NettingSet many = s.nettingSet;
+  while (many.trades.size() <= gpu::kMaxTradeGroups) many.trades.push_back(s.nettingSet.trades[0]);
+  CHECK(!gpu::limitation(s.engine, many, true).empty() && gpu::limitation(s.engine, many, false).empty());
+  CHECK_THROWS(gpu::compile(s.engine, many, o));
 }

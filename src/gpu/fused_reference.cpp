@@ -54,9 +54,9 @@ namespace {
 
 struct PlanView {
   const FusedPlan& plan;
-  std::uint32_t nP, nT, nA, nC, substeps, nNormals, seed, cpty, nCorr, offCall, offReporting, numWG;
-  bool antithetic, hasCsa;
-  float quantileLevel;
+  std::uint32_t nP, nT, nA, nC, substeps, nNormals, seed, cpty, nCorr, offCall, offReporting, numWG, nS, nR, nTr;
+  bool antithetic, hasCsa, hasIm;
+  float quantileLevel, imLevel;
 
   explicit PlanView(const FusedPlan& p) : plan(p) {
     const auto& H = p.header;
@@ -65,12 +65,26 @@ struct PlanView {
     antithetic = H[7] == 1u, hasCsa = H[8] == 1u;
     cpty = H[9], nCorr = H[11], offCall = H[12], offReporting = H[13], numWG = H[15];
     std::memcpy(&quantileLevel, &H[14], sizeof quantileLevel);
+    nS = H[16], nR = H[17], nTr = H[18], hasIm = H[19] == 1u;
+    std::memcpy(&imLevel, &H[20], sizeof imLevel);
     if (nP == 0 || nT == 0) throw std::invalid_argument("fused kernels: empty plan");
   }
 };
 
+// Per-trade statistic m of trade value vi in netting-set value v, as tradeStat in the kernel.
+float tradeStat(std::uint32_t m, float vi, float v, float D) {
+  const float pos = v > 0.0f ? 1.0f : 0.0f;
+  switch (m) {
+    case 0: return D * vi * pos;
+    case 1: return vi * pos;
+    case 2: return D * (std::max(v, 0.0f) - std::max(v - vi, 0.0f));
+    case 3: return D * std::max(vi, 0.0f);
+    default: return std::max(vi, 0.0f);
+  }
+}
+
 // fused-exposure for one path (invocation p): the per-date statistics into `stats`
-// ([nT][kStatsPerDate]) and the positive exposure of reporting date r into expo[r * stride].
+// ([nT][nS]) and quantile row r (positive exposure, then margin |dV|) into expo[r * stride].
 void simulatePath(const PlanView& v, std::uint32_t p, float* stats, float* expo, std::size_t stride, float* vals) {
   const auto& IDX = v.plan.indices;
   const auto& FP = v.plan.params;
@@ -88,7 +102,7 @@ void simulatePath(const PlanView& v, std::uint32_t p, float* stats, float* expo,
   float S[kMaxAssets], lnS[kMaxAssets] = {}, y[kMaxCredits], Y[kMaxCredits], fix[kMaxSwapSlots] = {}, z[kMaxNormals] = {}, w[kCholeskyStride];
   for (std::uint32_t a = 0; a < kMaxAssets; ++a) S[a] = FP[12 + a];
   for (std::uint32_t c = 0; c < kMaxCredits; ++c) y[c] = FP[4 * c + 3], Y[c] = 0.0f;
-  float held = 0.0f, prevDE = 0.0f, prevQ = 1.0f;
+  float held = 0.0f, prevDE = 0.0f, prevQ = 1.0f, prevRV = 0.0f;
   const float ia = FP[11], mta = FP[10];
 
   for (std::uint32_t j = 0; j < nT; ++j) {
@@ -137,23 +151,29 @@ void simulatePath(const PlanView& v, std::uint32_t p, float* stats, float* expo,
     }
 
     float value = 0.0f;
+    float vt[kMaxTradeGroups] = {};
+    const std::uint32_t nTr = std::min<std::uint32_t>(v.nTr, kMaxTradeGroups);
     for (std::uint32_t t = IDX[j]; t < IDX[j + 1]; ++t) {
       const std::size_t r = std::size_t(t) * kTermStride;
-      const auto kind = static_cast<std::uint32_t>(TERMS[r]);
+      const auto code = static_cast<std::uint32_t>(TERMS[r]);  // kind + 8 * trade
       const auto slot = static_cast<std::uint32_t>(TERMS[r + 1]);
       const float c = TERMS[r + 2];
       const float bond = TERMS[r + 3] * std::exp(-TERMS[r + 4] * x);
-      switch (kind) {
-        case kBond: value += c * bond; break;
-        case kFixedFloat: value += (c * fix[slot] + TERMS[r + 5]) * bond; break;
-        case kAsset: value += c * S[slot] * TERMS[r + 3]; break;
+      float term = 0.0f;
+      switch (code & 7u) {
+        case kBond: term = c * bond; break;
+        case kFixedFloat: term = (c * fix[slot] + TERMS[r + 5]) * bond; break;
+        case kAsset: term = c * S[slot] * TERMS[r + 3]; break;
         case kSetFixing: fix[slot] = (bond - 1.0f) / c; break;
         default: {
           const float p3 = TERMS[r + 7];
-          value += c * black(S[slot] * TERMS[r + 5] / bond, TERMS[r + 6], std::fabs(p3), bond, p3 > 0.0f);
+          term = c * black(S[slot] * TERMS[r + 5] / bond, TERMS[r + 6], std::fabs(p3), bond, p3 > 0.0f);
         }
       }
+      if (v.nTr > 0) vt[std::min<std::uint32_t>(code >> 3u, kMaxTradeGroups - 1)] += term;
+      else value += term;
     }
+    for (std::uint32_t i = 0; i < nTr; ++i) value += vt[i];
 
     // Collateral called on this path's value at t - MPR.
     float collateral = 0.0f;
@@ -170,17 +190,25 @@ void simulatePath(const PlanView& v, std::uint32_t p, float* stats, float* expo,
     }
     const float e = value - collateral, ep = std::max(e, 0.0f), en = std::min(e, 0.0f);
     const std::uint32_t rs = IDX[v.offReporting + j];
-    if (rs > 0) expo[std::size_t(rs - 1) * stride] = ep;
+    if (rs > 0) {
+      expo[std::size_t(rs - 1) * stride] = ep;
+      if (v.hasIm) expo[std::size_t(v.nR + rs - 1) * stride] = rs == 1 ? 0.0f : std::fabs(value - prevRV);
+    }
 
     float cvaInc = 0.0f;
     if (rs > 0) {
+      prevRV = value;
       const float de = D * ep;
       if (j > 0) cvaInc = 0.5f * (prevDE + de) * (prevQ - Q);
       prevDE = de;
       prevQ = Q;
     }
-    float* st = &stats[std::size_t(j) * kStatsPerDate];
-    st[0] = e, st[1] = ep, st[2] = en, st[3] = D * ep, st[4] = D * en, st[5] = cvaInc, st[6] = Q;
+    float* st = &stats[std::size_t(j) * v.nS];
+    st[0] = e, st[1] = ep, st[2] = en, st[3] = D * ep, st[4] = D * en, st[5] = cvaInc, st[6] = Q, st[7] = D;
+    for (std::uint32_t k = kStatsPerDate; k < v.nS; ++k) {
+      const std::uint32_t i = (k - kStatsPerDate) / kTradeStats;
+      st[k] = i < nTr ? tradeStat((k - kStatsPerDate) % kTradeStats, vt[i], value, D) : 0.0f;
+    }
   }
 }
 
@@ -195,28 +223,28 @@ FusedSlice runFusedWorkgroups(const FusedPlan& plan, std::size_t wgBegin, std::s
   slice.wgEnd = wgEnd;
   slice.pathBegin = std::min<std::size_t>(wgBegin * kWorkgroupSize, v.nP);
   slice.pathEnd = std::min<std::size_t>(wgEnd * kWorkgroupSize, v.nP);
-  const std::size_t count = slice.pathEnd - slice.pathBegin, nT = v.nT, nR = plan.reporting.size();
-  slice.partials.assign((wgEnd - wgBegin) * nT * kStatsPerDate, 0.0f);
-  slice.exposure.assign(nR * count, 0.0f);
+  const std::size_t count = slice.pathEnd - slice.pathBegin, nT = v.nT, nQ = plan.quantileRows(), nS = v.nS;
+  slice.partials.assign((wgEnd - wgBegin) * nT * nS, 0.0f);
+  slice.exposure.assign(nQ * count, 0.0f);
 
-  std::vector<float> stats(kWorkgroupSize * nT * kStatsPerDate), vals(nT), red(kWorkgroupSize * kStatsPerDate);
+  std::vector<float> stats(kWorkgroupSize * nT * nS), vals(nT), red(kWorkgroupSize * nS);
   for (std::size_t g = wgBegin; g < wgEnd; ++g) {
     // The 64 invocations of the workgroup; inactive ones (past the last path) contribute zeros.
     std::fill(stats.begin(), stats.end(), 0.0f);
     for (std::uint32_t l = 0; l < kWorkgroupSize; ++l) {
       const std::size_t p = g * kWorkgroupSize + l;
       if (p >= v.nP) break;
-      simulatePath(v, static_cast<std::uint32_t>(p), &stats[l * nT * kStatsPerDate], &slice.exposure[p - slice.pathBegin], count,
+      simulatePath(v, static_cast<std::uint32_t>(p), &stats[l * nT * nS], &slice.exposure[p - slice.pathBegin], count,
                    vals.data());
     }
     // Workgroup tree reduction, as in the kernel.
     for (std::size_t j = 0; j < nT; ++j) {
       for (std::uint32_t l = 0; l < kWorkgroupSize; ++l)
-        for (std::size_t f = 0; f < kStatsPerDate; ++f) red[l * kStatsPerDate + f] = stats[(l * nT + j) * kStatsPerDate + f];
+        for (std::size_t f = 0; f < nS; ++f) red[l * nS + f] = stats[(l * nT + j) * nS + f];
       for (std::uint32_t s = kWorkgroupSize / 2; s > 0; s >>= 1)
         for (std::uint32_t l = 0; l < s; ++l)
-          for (std::size_t f = 0; f < kStatsPerDate; ++f) red[l * kStatsPerDate + f] += red[(l + s) * kStatsPerDate + f];
-      for (std::size_t f = 0; f < kStatsPerDate; ++f) slice.partials[((g - wgBegin) * nT + j) * kStatsPerDate + f] = red[f];
+          for (std::size_t f = 0; f < nS; ++f) red[l * nS + f] += red[(l + s) * nS + f];
+      for (std::size_t f = 0; f < nS; ++f) slice.partials[((g - wgBegin) * nT + j) * nS + f] = red[f];
     }
   }
   return slice;
@@ -224,11 +252,11 @@ FusedSlice runFusedWorkgroups(const FusedPlan& plan, std::size_t wgBegin, std::s
 
 FusedOutput finishFused(const FusedPlan& plan, const std::vector<FusedSlice>& slices) {
   const PlanView v(plan);
-  const std::size_t nT = v.nT, n = nT * kStatsPerDate, nR = plan.reporting.size();
+  const std::size_t nT = v.nT, n = nT * v.nS, nQ = plan.quantileRows();
   std::size_t next = 0;
   for (const auto& s : slices) {
     if (s.wgBegin != next || s.partials.size() != (s.wgEnd - s.wgBegin) * n ||
-        s.exposure.size() != nR * (s.pathEnd - s.pathBegin))
+        s.exposure.size() != nQ * (s.pathEnd - s.pathBegin))
       throw std::invalid_argument("finishFused: slices must cover the workgroups in order");
     next = s.wgEnd;
   }
@@ -251,7 +279,7 @@ FusedOutput finishFused(const FusedPlan& plan, const std::vector<FusedSlice>& sl
 
   // pfe-quantile, as the kernel: the order statistics k = floor(rank) and k + 1 from a coarse
   // and a fine histogram and the extremes of k's fine bin, interpolated as ccr::quantile.
-  out.pfe.resize(nR);
+  out.pfe.resize(nQ);
   std::vector<std::uint32_t> hist(kPfeBins);
   const float bins = static_cast<float>(kPfeBins), big = std::numeric_limits<float>::max();
   const std::uint32_t last = kPfeBins - 1;
@@ -261,10 +289,11 @@ FusedOutput finishFused(const FusedPlan& plan, const std::vector<FusedSlice>& sl
       for (std::size_t k = 0; k < count; ++k) f(s.exposure[r * count + k]);
     }
   };
-  const float rank = v.quantileLevel * static_cast<float>(v.nP - 1);
-  const std::uint32_t k = std::min(static_cast<std::uint32_t>(std::floor(rank)), v.nP - 1);
-  const float frac = rank - static_cast<float>(k);
-  for (std::size_t r = 0; r < nR; ++r) {
+  for (std::size_t r = 0; r < nQ; ++r) {
+    const float level = r >= v.nR ? v.imLevel : v.quantileLevel;  // PFE rows, then margin rows
+    const float rank = level * static_cast<float>(v.nP - 1);
+    const std::uint32_t k = std::min(static_cast<std::uint32_t>(std::floor(rank)), v.nP - 1);
+    const float frac = rank - static_cast<float>(k);
     float mx = 0.0f, mn = big;
     forEach(r, [&](float e) {
       mx = std::max(mx, e);

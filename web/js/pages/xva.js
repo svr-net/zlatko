@@ -1,5 +1,5 @@
-import { run } from '../ccr-client.js';
 import { barChart, fmt, lineChart } from '../charts.js';
+import { engineNote, engineSelector, runAnalysis } from '../gpu/backend.js';
 import { card, grid, initPage, runButton, specEditor, table, tiles } from '../ui.js';
 
 const page = initPage({
@@ -10,13 +10,15 @@ const page = initPage({
     'FCA = s<sub>b</sub> ∫ EE* Q<sub>c</sub> Q<sub>o</sub> dt and FBA = s<sub>l</sub> ∫ |ENE*| Q<sub>c</sub> Q<sub>o</sub> dt give FVA = FCA − FBA. ' +
     'MVA = s<sub>m</sub> ∫ IM* Q<sub>c</sub> Q<sub>o</sub> dt funds the initial margin, here a simulated 10-day quantile proxy. ' +
     'KVA = hurdle · capital ratio · RW · α ∫ EE* Q<sub>c</sub> Q<sub>o</sub> dt. The total cost is CVA − DVA + FCA − FBA + MVA + KVA. ' +
-    'The initial margin needs the simulated paths, so this page runs on the WebAssembly engine. CVA, FCA and KVA are linear in EE*, so they allocate to trades like CVA does (<a href="allocation.html">allocation</a>), ' +
+    'The fused kernels compute everything here in one pass on WebGPU (or the CPU kernels): the exposure profile, the initial-margin quantile of the value change between dates and the per-trade Euler contributions. CVA, FCA and KVA are linear in EE*, so they allocate to trades like CVA does (<a href="allocation.html">allocation</a>), ' +
     'and <a href="hedging.html">hedging</a> shows their credit and funding sensitivities.',
 });
 specEditor(page, ['market', 'assets', 'credit', 'own', 'xva', 'simulation', 'portfolio', 'csa']);
 
-runButton(page, 'Price XVA', async (spec) => {
-  const r = await run('xva', spec);
+const button = runButton(page, 'Price XVA', async (spec) => {
+  const t0 = performance.now();
+  const runResult = await runAnalysis('xva', spec);
+  const r = runResult.result;
   const x = r.xva;
   const t = Array.from(r.profile.times);
   tiles(page.content, [
@@ -73,4 +75,8 @@ runButton(page, 'Price XVA', async (spec) => {
     });
     table(card(g, 'Funding sensitivity', ''), ['quantity', 'value'], [['FVA01: all funding spreads +1bp', fmt.num(s.fundingSpread01, 1)]]);
   }
+  window.__ccrEngineRun = { page: 'xva', engine: runResult.engine, total: x.total, cva: x.cva, mva: x.mva, kva: x.kva };
+  return engineNote(runResult, performance.now() - t0);
 });
+
+engineSelector(page, () => button.click());

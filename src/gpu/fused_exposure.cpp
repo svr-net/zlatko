@@ -87,8 +87,10 @@ std::vector<TermRecord> mergeTerms(const std::vector<TermRecord>& in) {
 
 }  // namespace
 
-std::string limitation(const ExposureEngine& engine, const NettingSet& nettingSet) {
+std::string limitation(const ExposureEngine& engine, const NettingSet& nettingSet, bool perTrade) {
   const ScenarioGenerator& gen = engine.generator();
+  if (perTrade && nettingSet.trades.size() > kMaxTradeGroups)
+    return "per-trade statistics on the GPU support at most 16 trades";
   for (const auto& t : nettingSet.trades)
     if (!dynamic_cast<const InterestRateSwap*>(t.get()) && !dynamic_cast<const AssetForward*>(t.get()) &&
         !dynamic_cast<const EuropeanOption*>(t.get()))
@@ -108,6 +110,18 @@ std::string limitation(const ExposureEngine& engine, const NettingSet& nettingSe
 
 FusedPlan compile(const ExposureEngine& engine, const NettingSet& nettingSet, double pfeQuantile,
                   std::size_t counterparty) {
+  FusedOptions o;
+  o.pfeQuantile = pfeQuantile;
+  o.counterparty = counterparty;
+  return compile(engine, nettingSet, o);
+}
+
+FusedPlan compile(const ExposureEngine& engine, const NettingSet& nettingSet, const FusedOptions& options) {
+  const double pfeQuantile = options.pfeQuantile;
+  const std::size_t counterparty = options.counterparty;
+  if (options.perTrade && nettingSet.trades.size() > kMaxTradeGroups)
+    throw std::invalid_argument("per-trade statistics on the GPU support at most 16 trades");
+  if (options.imQuantile < 0.0 || options.imQuantile > 1.0) throw std::invalid_argument("imQuantile must be in [0, 1]");
   const ScenarioGenerator& gen = engine.generator();
   const auto& assets = gen.assets();
   const auto& credits = gen.credits();
@@ -135,6 +149,9 @@ FusedPlan compile(const ExposureEngine& engine, const NettingSet& nettingSet, do
   plan.antithetic = engine.config().antithetic;
   plan.hasCsa = nettingSet.collateral.has_value();
   plan.pfeQuantile = pfeQuantile;
+  plan.imQuantile = options.imQuantile;
+  plan.numTradeGroups = options.perTrade ? nettingSet.trades.size() : 0;
+  plan.statsPerDate = (kStatsPerDate + kTradeStats * plan.numTradeGroups + 3) / 4 * 4;
 
   // Per-step deterministic coefficients (the exact transitions of ScenarioGenerator).
   plan.steps.assign(nT * kStepStride, 0.0f);
@@ -165,14 +182,18 @@ FusedPlan compile(const ExposureEngine& engine, const NettingSet& nettingSet, do
     for (std::size_t c = 0; c < credits.size(); ++c) row[20 + c] = static_cast<float>(credits[c]->integratedShift(t1));
   }
 
-  // Valuation terms per date: [kind, slot, c, A, B, p1, p2, p3].
-  std::vector<std::vector<std::vector<double>>> termsAt(nT);
+  // Valuation terms per date: [kind, slot, c, A, B, p1, p2, p3] and the index of the trade.
+  std::vector<std::vector<TermRecord>> termsAt(nT);
+  std::size_t tradeIndex = 0;
   auto addTerm = [&](std::size_t j, TermKind kind, double slot, double c, double A, double B, double p1 = 0,
-                     double p2 = 0, double p3 = 0) { termsAt[j].push_back({double(kind), slot, c, A, B, p1, p2, p3}); };
+                     double p2 = 0, double p3 = 0) {
+    termsAt[j].push_back({double(kind), slot, c, A, B, p1, p2, p3, double(tradeIndex)});
+  };
   auto bondA = [&](double t, double T) { return hw.zeroBond(t, T, 0.0); };
   auto bondB = [&](double t, double T) { return T <= t ? 0.0 : hw.B(t, T); };
   std::size_t slots = 0;
-  for (const auto& trade : nettingSet.trades) {
+  for (; tradeIndex < nettingSet.trades.size(); ++tradeIndex) {
+    const auto& trade = nettingSet.trades[tradeIndex];
     if (const auto* sw = dynamic_cast<const InterestRateSwap*>(trade.get())) {
       const double sign = sw->direction() == InterestRateSwap::Direction::PayFixed ? 1.0 : -1.0;
       const double n = sw->notional(), k = sw->fixedRate();
@@ -230,8 +251,24 @@ FusedPlan compile(const ExposureEngine& engine, const NettingSet& nettingSet, do
   plan.indices.assign(offReporting + nT, 0u);
   for (std::size_t j = 0; j < nT; ++j) {
     plan.indices[j] = static_cast<std::uint32_t>(plan.terms.size() / kTermStride);
-    for (const auto& rec : mergeTerms(termsAt[j]))
-      for (double v : rec) plan.terms.push_back(static_cast<float>(v));
+    // Kind and trade share the first word: kind + 8 * trade (small integers, exact in f32).
+    auto emit = [&](const std::vector<TermRecord>& recs, std::size_t group) {
+      for (const auto& rec : mergeTerms(recs)) {
+        plan.terms.push_back(static_cast<float>(rec[0] + 8.0 * static_cast<double>(group)));
+        for (std::size_t k = 1; k < kTermStride; ++k) plan.terms.push_back(static_cast<float>(rec[k]));
+      }
+    };
+    if (!plan.perTrade()) {
+      emit(termsAt[j], 0);
+    } else {
+      // Terms are merged within each trade only, so every term belongs to one trade.
+      for (std::size_t g = 0; g < plan.numTradeGroups; ++g) {
+        std::vector<TermRecord> group;
+        for (const auto& rec : termsAt[j])
+          if (static_cast<std::size_t>(rec[8]) == g) group.push_back(rec);
+        emit(group, g);
+      }
+    }
   }
   plan.indices[nT] = static_cast<std::uint32_t>(plan.terms.size() / kTermStride);
   const double mpr = plan.hasCsa ? nettingSet.collateral->marginPeriodOfRisk : 0.0;
@@ -275,18 +312,23 @@ FusedPlan compile(const ExposureEngine& engine, const NettingSet& nettingSet, do
                  plan.antithetic ? 1u : 0u, plan.hasCsa ? 1u : 0u, static_cast<std::uint32_t>(counterparty),
                  static_cast<std::uint32_t>(kStepStride / 4), static_cast<std::uint32_t>(plan.numCorrelated),
                  static_cast<std::uint32_t>(offCall), static_cast<std::uint32_t>(offReporting),
-                 floatBits(static_cast<float>(pfeQuantile)), static_cast<std::uint32_t>(plan.numWorkgroups())};
+                 floatBits(static_cast<float>(pfeQuantile)), static_cast<std::uint32_t>(plan.numWorkgroups()),
+                 static_cast<std::uint32_t>(plan.statsPerDate), static_cast<std::uint32_t>(plan.reporting.size()),
+                 static_cast<std::uint32_t>(plan.numTradeGroups), plan.hasInitialMargin() ? 1u : 0u,
+                 floatBits(static_cast<float>(plan.imQuantile)), 0u, 0u, 0u};
   return plan;
 }
 
 FusedResult summarise(const FusedPlan& plan, const FusedOutput& output) {
   const std::size_t nT = plan.numDates();
-  if (output.sums.size() != nT * kStatsPerDate || output.pfe.size() != plan.reporting.size())
+  const std::size_t nS = plan.statsPerDate, nR = plan.reporting.size();
+  if (output.sums.size() != nT * nS || output.pfe.size() != plan.quantileRows())
     throw std::invalid_argument("gpu::summarise: read-back does not match the plan");
   FusedResult r;
   ExposureProfile& p = r.profile;
   p.pfeQuantile = plan.pfeQuantile;
-  auto stat = [&](std::size_t j, std::size_t f) { return static_cast<double>(output.sums[j * kStatsPerDate + f]); };
+  auto stat = [&](std::size_t j, std::size_t f) { return static_cast<double>(output.sums[j * nS + f]); };
+  r.trades.resize(plan.numTradeGroups);
   for (std::size_t k = 0; k < plan.reporting.size(); ++k) {
     const std::size_t j = plan.reporting[k];
     p.times.push_back(plan.times[j]);
@@ -299,6 +341,17 @@ FusedResult summarise(const FusedPlan& plan, const FusedOutput& output) {
     r.cvaIncrements.push_back(stat(j, 5));
     r.meanSurvival.push_back(stat(j, 6));
     r.marketSurvival.push_back(plan.marketSurvival[j]);
+    r.meanDeflator.push_back(stat(j, 7));
+    if (plan.hasInitialMargin()) r.valueChangeQuantile.push_back(k ? output.pfe[nR + k] : 0.0);
+    for (std::size_t i = 0; i < plan.numTradeGroups; ++i) {
+      const std::size_t o = kStatsPerDate + kTradeStats * i;
+      auto& t = r.trades[i];
+      t.marginalDiscounted.push_back(stat(j, o));
+      t.marginal.push_back(stat(j, o + 1));
+      t.incrementalDiscounted.push_back(stat(j, o + 2));
+      t.standaloneDiscounted.push_back(stat(j, o + 3));
+      t.standalone.push_back(stat(j, o + 4));
+    }
   }
   for (std::size_t k = 0; k < r.cvaIncrements.size(); ++k) {
     const double pd = k ? r.meanSurvival[k - 1] - r.meanSurvival[k] : 0.0;

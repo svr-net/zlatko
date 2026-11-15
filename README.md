@@ -125,7 +125,7 @@ python3 -m http.server -d web 8000      # any static server; file:// will not lo
 | `allocation.html` | Marginal (Euler), incremental and standalone CVA | `allocation` |
 | `cva.html` | Unilateral/bilateral CVA, term structure, running spread | `cva` |
 | `wwr.html` | Pathwise CVA against exposure–intensity correlation | `wrongWayRisk` |
-| `xva.html` | CVA, DVA, FVA, MVA and KVA with cumulative profiles, sweeps, allocation and sensitivities (WebAssembly engine) | `xva` |
+| `xva.html` | CVA, DVA, FVA, MVA and KVA with cumulative profiles, sweeps, allocation and sensitivities | `xva` |
 | `hedging.html` | CS01 buckets, CDS hedge, CRN vs independent-seed deltas, XVA credit and funding sensitivities | `hedging` |
 | `ai.html` | Surrogate XVA (ridge, MLP) back tested against the native engine, and a provider-neutral LLM agent skill (OpenAI, Anthropic, Gemini, MCP) with a tool harness | `xva` (spot-check) · dataset from `xva_ai_dataset` |
 | `gpu.html` | Fused WebGPU kernels validated against WASM, with a benchmark | `gpuJobs` · `gpuAnalyse` (`validation`) |
@@ -133,14 +133,14 @@ python3 -m http.server -d web 8000      # any static server; file:// will not lo
 The pages share one specification: market, models, correlation, portfolio, CSA and simulation settings. You edit it on any
 page, and the browser's local storage keeps it. The WASM module runs in a module worker, so long Monte Carlo runs don't block the page.
 
-**Compute engine.** The Overview, Exposure, Collateral, CVA/DVA, Wrong-way risk and CVA hedging pages have an *Engine* selector:
+**Compute engine.** The Overview, Exposure, Collateral, Allocation, CVA/DVA, XVA, Wrong-way risk, CVA hedging and AI (agent tools) pages have an *Engine* selector:
 - **Auto** (the default) uses the fused **WebGPU** kernels wherever the browser offers a WebGPU adapter, on desktop and mobile alike. On Android it also tries a WebGPU compatibility-mode adapter.
 - Where there is no adapter, for example where Chrome blocks WebGPU for the GPU or driver, Auto runs the **same fused kernels on the CPU**. The workgroups are split across Web Workers, one per core and at most 8, and reduced exactly as the GPU's reduce and PFE kernels do. The result is identical however many workers run, and agrees with WebGPU to about 0.004%.
 - Portfolios the kernels cannot price (Bermudans need AMC) and failures fall back to **WebAssembly** (the library's `ExposureEngine`).
 - **WebGPU**, **CPU fused kernels** or **WebAssembly** forces one engine. The status line names the engine that ran and why. Views that need individual paths (sample paths, the netting benefit, per-trade profiles, the exposure histogram) are WebAssembly-only.
 - On the WebGPU page, a device without WebGPU validates the CPU fused kernels against WebAssembly instead.
 
-**All numerics are in C++.** Each Monte Carlo analysis (`exposure`, `collateral`, `cva`, `wrongWayRisk`, `hedging`) is defined once in `wasm/bindings.cpp` as a list of exposure jobs (for example the base run, every bumped run and the rate shifts of the hedging analysis) and a combine step. On WebAssembly each job runs on `ExposureEngine`. On WebGPU:
+**All numerics are in C++.** Each Monte Carlo analysis (`exposure`, `collateral`, `allocation`, `cva`, `xva`, `wrongWayRisk`, `hedging`) is defined once in `wasm/bindings.cpp` as a list of exposure jobs (for example the base run, every bumped run and the rate shifts of the hedging analysis) and a combine step. On WebAssembly each job runs on `ExposureEngine`. On WebGPU:
 
 1. `gpuJobs(spec)` compiles each job with `ccr::gpu::compile` into a plan of ready-made GPU buffers, dispatch sizes and buffer sizes.
 2. `web/js/gpu/engine.js` uploads each plan, dispatches the three kernels and reads back two arrays. The kernel sources come from the library (`gpuKernels`).
@@ -160,6 +160,7 @@ Three WGSL compute kernels (`src/gpu/fused_kernels.cpp`) then run on these table
    - *Vector unrolling:* normals come in Box–Muller pairs packed four to a `vec4` (one hash pair, one `log` and one `sqrt` per two normals). Each Cholesky row is two `vec4` dot products. The four FX/equity factors step as one `vec4`, and the statistics reduce as two `vec4`s per invocation.
    - *Matrix tiling:* inputs that every path reads are staged once per workgroup in shared memory instead of being fetched by each of the 64 invocations. That covers the Cholesky factor, each date's step row and the valuation-term table. The term table of a date (terms × 8) streams through in tiles of 64 terms, loaded cooperatively as `vec4`s, and each invocation applies the tile to its own path state.
 2. **reduce-partials** sums the workgroup results.
+   - *XVA and allocation:* the `xva` and `allocation` plans also ask for the quantile of the value change between reporting dates (the initial-margin proxy behind MVA) and for per-trade statistics. Each term then carries its trade (terms are merged within a trade only), a per-trade build of the kernel tracks every trade's value on the path, and five statistics per trade are reduced with the netting set's: the Euler contributions to EE* and EE, the incremental EE* and the standalone EE* and EE, for up to 16 trades. MVA, the allocation of CVA, FCA and KVA, and the incremental and standalone CVAs therefore run on WebGPU too, and so do the AI page's agent tools.
 3. **pfe-quantile** finds the empirical quantile per reporting date without sorting. A coarse histogram over [0, max] locates the order statistic, a fine histogram splits that bin 3,072 ways, and a last pass reads the neighbouring order statistics, which are interpolated as `ccr::quantile` does. PFE matches the library's quantile of the same exposures to f32 rounding (about 5e-8, previously about 1e-3 from the bin width).
 
 `runFusedReference()` (`src/gpu/fused_reference.cpp`) executes the same three kernels on the CPU in single precision, so the unit tests check the kernel algorithm natively against `ExposureEngine`. It is split into `runFusedWorkgroups()` (any range of workgroups) and `finishFused()` (the reduce and PFE kernels). That split is the CPU backend: the WASM entry points `cpuKernelSlices` and `cpuKernelAnalyse` run it across Web Workers. The GPU works in f32 with its own random number generator, so it agrees with the double-precision engine within Monte Carlo error.
