@@ -78,6 +78,8 @@ jobs:
           cmake --build build-wasm -j"$(nproc)"
       - name: Check every entry point (Node)
         run: node web/tests/wasm.test.mjs
+      - name: AI chapter tests (Node)
+        run: node web/tests/ai.test.mjs
       - name: Committed web/wasm matches the sources
         run: |
           git config --global --add safe.directory "$GITHUB_WORKSPACE"

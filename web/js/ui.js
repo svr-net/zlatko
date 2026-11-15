@@ -38,6 +38,7 @@ export const PAGES = [
     ],
   },
   { group: 'Acceleration', items: [{ id: 'gpu', href: 'gpu.html', title: 'WebGPU fused kernels' }] },
+  { group: 'AI', items: [{ id: 'ai', href: 'ai.html', title: 'AI surrogates & LLM agent skill' }] },
 ];
 
 export function el(tag, attrs = {}, ...children) {

@@ -547,6 +547,208 @@ simplifications made above.
 
 ---
 
+## X10. Artificial intelligence and XVA
+
+XVA is expensive for one reason: it is a high-dimensional conditional expectation that must be
+re-evaluated for every market move, every trade and every sensitivity. Most uses of AI in XVA attack
+that cost, or the human work around it. This chapter classifies the uses, derives the surrogate
+approach that is implemented and back tested here, and states the limits honestly.
+
+### X10.1 Where AI touches XVA
+
+| Area | Problem | Typical method | Main risk |
+|---|---|---|---|
+| Fast revaluation | `XVA(state)` costs seconds to hours | Surrogate: polynomial, neural net, Gaussian process | Extrapolation outside the training domain |
+| Exposure simulation | Conditional `V(t)` on each path | Regression (Longstaff–Schwartz), deep regression | Basis bias, see X7 and X8 |
+| Sensitivities | Bump-and-revalue is noisy and slow | Differential machine learning, AAD (X9) | Needs pathwise derivatives |
+| Scenario generation | Realistic joint risk-factor paths | Generative models (VAE, GAN, diffusion), neural SDEs | Tail fidelity, arbitrage-free conditions |
+| Counterparty credit | Default intensity and spread proxies | Gradient boosting, mapping of illiquid names | Data scarcity, bias, fairness |
+| Hedging | Optimal CS01 and funding hedges with costs | Deep hedging, reinforcement learning | Reward design, model dependence |
+| Calibration | Fit model to market quotes | Neural calibration networks | Stability, regime change |
+| Operations | Explain, reconcile, query XVA | LLM agents with tool use | Hallucination, access control |
+| Governance | Validation and monitoring | Challenger models, drift detection | Model risk of the AI itself |
+
+### X10.2 Surrogate XVA
+
+Fix the engine of X1–X7 with common random numbers (X6) and a fixed seed. Then the adjustments are
+a deterministic, smooth function of the market state `x` (here five inputs: the counterparty and own
+spread multipliers, a parallel rate shift, the FX volatility and the funding spread):
+
+```
+XVA_k(x) = F_k(x),   k in {CVA, DVA, FCA, FBA, MVA, KVA},   total = CVA - DVA + FCA - FBA + MVA + KVA
+```
+
+Without common random numbers `F_k` carries Monte Carlo noise of order `N^{-1/2}`, which a surrogate
+would learn as noise; the fixed seed removes it. A surrogate `F̂_k(x; θ)` is trained on `n` engine
+runs at states `x_i` chosen by Latin hypercube sampling over a box `B`:
+
+```
+θ* = argmin  (1/n) sum_i || F(x_i) - F̂(x_i; θ) ||²  +  λ ||θ||²
+```
+
+Three model classes are implemented in `web/js/ai/surrogate.js`:
+
+1. **Linear ridge**: `F̂ = b + w·x`. The first-order Taylor model; it equals the bucketed
+   sensitivities of X6 applied to the market move.
+2. **Quadratic ridge**: all monomials of degree at most 2. It captures the convexity that matters for
+   `V⁺`-type payoffs. Closed-form solution via the normal equations.
+3. **MLP**: a 5-16-16-6 network with `tanh` units, standardised inputs and outputs, trained by Adam
+   on the full batch, with warm-started refits (walk-forward, below).
+
+Evaluation is a handful of multiply-adds, so the cost ratio to the engine is of order `10^5` or more
+(measured below). The price is a bias that must be monitored, not assumed away.
+
+### X10.3 Back-test design
+
+A surrogate is a model and is validated like one. The back test in this repository is
+deliberately strict about what it claims:
+
+- **Data**: `examples/xva_ai_dataset.cpp` runs the native engine (2,000 paths, seed 2024) on 160 Latin
+  hypercube training states and on a 250-day *synthetic* market path with a stress episode on days
+  150–200. The data are synthetic, so the numbers measure surrogate error against the engine, not
+  against the market.
+- **Metrics**: mean absolute error as basis points of the 25m gross notional (MAE), MAPE, maximum
+  error, and the split between days inside the training box and *stress days outside it*.
+- **Static versus walk-forward**: static fits once on the training set; walk-forward refits every 21
+  business days using only data observed up to that day, so no look-ahead.
+- **Baselines**: (a) yesterday's engine value carried forward, (b) a weekly engine run carried
+  forward. A surrogate that cannot beat these is not worth running.
+- **P&L explain**: for the daily change `ΔXVA`, effectiveness `1 - Var(ΔXVA - ΔF̂)/Var(ΔXVA)`;
+  a negative value means the explanation is worse than none. The sign hit rate is the share of days
+  on which `ΔF̂` has the sign of `ΔXVA`.
+
+### X10.4 Measured results
+
+Run by `web/js/pages/ai.js` (and by `web/tests/ai.test.mjs` with fewer epochs). MAE in bp of gross
+notional; 20 of the 250 days are outside the training box.
+
+| Model | All days | Inside box | Stress days |
+|---|---|---|---|
+| Yesterday's value | 1.92 | 1.89 | 2.27 |
+| Weekly engine run | 2.37 | 2.33 | 2.80 |
+| Linear, static | 4.57 | 3.22 | 20.1 |
+| Linear, walk-forward | 3.15 | 2.04 | 15.95 |
+| Quadratic, static | 0.76 | 0.23 | 6.9 |
+| Quadratic, walk-forward | 0.66 | 0.22 | 5.73 |
+| MLP, static | 0.35 | 0.32 | 0.60 |
+| MLP, walk-forward | 0.14 | 0.11 | 0.45 |
+
+Reading the table:
+
+- The MLP is the most accurate and its error on stress days is not much worse than inside the box. In
+  this experiment it extrapolated mildly beyond the box; there is no guarantee that this holds for
+  other portfolios or larger excursions.
+- The linear and quadratic models degrade sharply outside the box, as the Taylor remainder grows.
+- Yesterday's value is a strong baseline in level terms (about 1.9 bp), yet it explains none of
+  the daily P&L (effectiveness -115%), because it by construction predicts no change. The surrogates
+  earn their place on *changes*, which is what sensitivities and P&L explain need.
+- Cost: MLP inference takes about 1.3 µs against about 199.5 ms for one native engine run, a ratio
+  above `10^5`, and the one-off training cost amortises after a few hundred evaluations.
+
+### X10.5 Differential machine learning
+
+If the engine can also return pathwise derivatives `∂F/∂x` (adjoints, X9 item 7), train on value *and*
+slope: `min Σ ||F - F̂||² + μ ||∇F - ∇F̂||²`. The derivative labels act as many extra equations per
+sample, which cuts the number of engine runs needed (Huge and Savine 2020). With CRN bump-and-revalue
+(X6) the derivative labels are available approximately, at the price of the bump size error.
+
+### X10.6 Regression and deep learning inside the simulation
+
+The conditional exposure `E[V⁺(t) | X_t]` of X7 is itself a regression; replacing the polynomial basis
+by a neural network removes the manual basis choice and scales to many risk factors. The same
+bias–variance trade-off as in X8 applies: a network is a flexible basis, but over-fit labels are
+biased in the direction that flatters `V⁺`. Use out-of-sample paths for the exposure estimate (the
+low/high estimator pairing of X8).
+
+### X10.7 Generative scenarios and deep hedging
+
+Generative models (VAE, GAN, diffusion, neural SDEs) learn the joint distribution of risk factors from
+history. Used for XVA they must be checked against the properties the pricing model assumes:
+martingale (no-arbitrage) drift under the pricing measure, correct tails and correlation under stress,
+and positive-definite dependence. The real-world to risk-neutral link is not provided by the network
+and has to be imposed. Deep hedging (Buehler et al. 2019) trains a policy minimising a convex risk
+measure of terminal hedging P&L with transaction costs; for XVA the policy hedges the CS01 and funding
+sensitivities of X6 with liquid CDS, and the cost of rebalancing is explicit. Results depend on the
+simulator that the policy is trained on.
+
+### X10.8 LLM agents and tool use
+
+Large language models cannot be trusted to *compute* XVA, but they can drive the engine. The agent
+skill in this repository follows one rule: **the model proposes, the engine computes**. The model sees
+four provider-neutral JSON-Schema tools:
+
+| Tool | Engine call | Returns |
+|---|---|---|
+| `price_xva` | `xva` | CVA, DVA, FCA, FBA, MVA, KVA, total |
+| `xva_sensitivities` | `xva` | bucketed counterparty CS01, own CS01, funding spread 01 |
+| `allocate_xva` | `xva` | per-trade CVA, FCA, KVA (Euler allocation of X5) |
+| `compare_scenarios` | `xva` x 2 | base versus scenario, differences per adjustment |
+
+`web/js/ai/skill.js` validates every argument (type, range, unknown keys) before the engine runs, and
+returns errors as data so that the model can correct itself; adapters emit the same tools in OpenAI,
+Anthropic, Gemini and MCP formats; `SKILL_MD` is a ready-to-use skill file in the Agent Skills
+format; `runAgentLoop` is a model-agnostic loop with an injected `llm(messages, tools)` callback and
+an injected runner. A deterministic harness of 11 cases (valid calls, out-of-range inputs, unknown
+tools, scenario comparison, error recovery) runs without any network and passes 11/11; it tests the
+*tool layer*. **No accuracy of any real LLM is measured in this repository**; measuring it needs the
+user's own model and the harness as a fixture.
+
+Controls that matter in production: read-only tools by default; schema validation as above; a
+numeric answer must come from a tool result and be quoted with its inputs; log prompts, tool calls
+and results for audit; never let the model set limits, approve trades or edit market data.
+
+### X10.9 Model risk and governance
+
+An AI component is a model under SR 11-7 / the PRA SS1/23 principles. For a surrogate:
+
+1. **Domain of validity**: record the box `B` and flag states outside it (`outsideBox` in the code);
+   fall back to the engine there.
+2. **Challenger and benchmark**: compare with the engine on a rolling sample, and with the baselines
+   above.
+3. **Monitoring**: error in bp of notional and P&L-explain effectiveness, with thresholds that trigger a
+   refit or a fallback.
+4. **Explainability**: for the polynomial models, the coefficients; for a network, local sensitivities
+   `∂F̂/∂x` compared with the bucketed CS01 of X6 (a sanity check, not a proof).
+5. **Reproducibility**: fixed seeds, versioned datasets, recorded training configuration.
+6. **Regulation**: EU AI Act and supervisory guidance on model use; fair-lending style concerns apply
+   to learned credit proxies.
+
+### X10.10 Limitations
+
+- Synthetic data: results show the method, not the performance on a live book.
+- One portfolio, five factors, one seed: a large book with many factors suffers from the curse of
+  dimensionality, so the training set must grow, or the surrogate must be applied to factor-reduced
+  states.
+- Common random numbers are essential; with changing seeds the labels are noisy.
+- Wrong-way risk, collateral thresholds and close-out kinks make `F` less smooth; networks cope, low
+  degree polynomials do not.
+- The WASM and native engines use different normal generators and agree only to Monte Carlo accuracy,
+  so the dataset is generated natively and the page does not mix the two.
+
+### X10.11 Code and page
+
+| Item | Location |
+|---|---|
+| Dataset generator | `examples/xva_ai_dataset.cpp`, target `xva_ai_dataset`; `./build/xva_ai_dataset > web/js/ai/backtest-data.js` |
+| Surrogates and back test | `web/js/ai/surrogate.js` |
+| Agent skill, tools, harness | `web/js/ai/skill.js` |
+| Page | [`web/ai.html`](../web/ai.html), entry `web/js/pages/ai.js` |
+| Node tests | `web/tests/ai.test.mjs` |
+
+**Citations** below are given from memory and have not been checked against the sources.
+
+AI references: Huge and Savine (2020) "Differential machine learning", *Risk*, October (arXiv:2005.02347);
+Buehler, Gonon, Teichmann and Wood (2019) "Deep hedging", *Quantitative Finance* 19(8); Ferguson and
+Green (2018) "Deeply learning derivatives", SSRN; Hernandez (2016) "Model calibration with neural
+networks", *Risk*; Sirignano and Spiliopoulos (2018) "DGM: a deep learning algorithm for solving
+partial differential equations", *J. Comput. Phys.* 375; Han, Jentzen and E (2018) "Solving
+high-dimensional PDEs using deep learning", *PNAS* 115(34); Henry-Labordère (2017) "Deep primal-dual
+algorithm for BSDEs: applications of machine learning to CVA and IM", SSRN; Kondratyev and Schwarz
+(2019) "The market generator", SSRN; Federal Reserve SR 11-7 (2011) *Guidance on model risk
+management*; Bank of England PRA SS1/23 (2023) *Model risk management principles for banks*.
+
+---
+
 ## References
 
 - Andersen, L., Duffie, D., Song, Y. (2019). Funding value adjustments. *Journal of Finance* 74(1).

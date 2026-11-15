@@ -63,7 +63,7 @@ npm --prefix tools/standalone ci && node tools/standalone/build.mjs
 
 ```
 dist/standalone/
-  index.html, core.html, ... gpu.html      13 pages
+  index.html, core.html, ... gpu.html      14 pages
   assets/app.<hash>.js                     all pages (classic script, ~85 KiB)
   assets/ccr-runtime.<hash>.js             WASM worker with embedded library (~360 KiB)
   assets/style.<hash>.css
@@ -127,6 +127,7 @@ python3 -m http.server -d web 8000      # any static server; file:// will not lo
 | `wwr.html` | Pathwise CVA against exposure–intensity correlation | `wrongWayRisk` |
 | `xva.html` | CVA, DVA, FVA, MVA and KVA with cumulative profiles, sweeps, allocation and sensitivities (WebAssembly engine) | `xva` |
 | `hedging.html` | CS01 buckets, CDS hedge, CRN vs independent-seed deltas, XVA credit and funding sensitivities | `hedging` |
+| `ai.html` | Surrogate XVA (ridge, MLP) back tested against the native engine, and a provider-neutral LLM agent skill (OpenAI, Anthropic, Gemini, MCP) with a tool harness | `xva` (spot-check) · dataset from `xva_ai_dataset` |
 | `gpu.html` | Fused WebGPU kernels validated against WASM, with a benchmark | `gpuJobs` · `gpuAnalyse` (`validation`) |
 
 The pages share one specification: market, models, correlation, portfolio, CSA and simulation settings. You edit it on any
@@ -195,7 +196,7 @@ node web/tests/e2e.mjs                   # every page in headless Chromium (Play
 ## Proposed extension chapters: XVA
 
 The book stops at CVA/DVA, wrong-way risk and hedging. [`docs/xva_chapters.md`](docs/xva_chapters.md)
-proposes nine chapters that extend it, in the same style (definition, formula, discretisation on the
+proposes ten chapters that extend it, in the same style (definition, formula, discretisation on the
 exposure grid, Monte Carlo estimator, worked example, code and page), to cover everything implemented
 in `xva/xva.hpp`, `hedging/sensitivities.hpp` and [`web/xva.html`](web/xva.html):
 
@@ -210,6 +211,7 @@ in `xva/xva.hpp`, `hedging/sensitivities.hpp` and [`web/xva.html`](web/xva.html)
 | X7. Numerical practice | Monte Carlo error, grid, regression, validation checks, engines | [gpu](web/gpu.html) |
 | X8. Nested Monte Carlo in XVA | Inner/outer simulation, bias and the `B^{-2/3}` convergence, bias reduction, regression versus nesting, conditional initial margin, dual bounds, design | not implemented; builds on `core/regression.hpp`, [amc](web/amc.html) |
 | X9. Beyond this implementation | Collateralised funding, SA-CCR capital, stochastic spreads, conditional IM, AAD | open |
+| X10. Artificial intelligence and XVA | Surrogates, differential ML, generative scenarios, deep hedging, LLM agent skill, model risk, back test | [ai](web/ai.html) · `examples/xva_ai_dataset.cpp` · `web/js/ai/` |
 
 ## Conventions
 

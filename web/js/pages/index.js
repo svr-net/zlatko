@@ -25,6 +25,7 @@ const DESCRIPTIONS = {
   wwr: 'Pathwise CVA with a stochastic intensity correlated with the exposure drivers.',
   xva: 'CVA, DVA, FVA (FCA/FBA), MVA and KVA with funding, margin and capital inputs, sensitivities and trade allocation.',
   hedging: 'Bucketed CS01, CDS hedge notionals, XVA credit and funding sensitivities, delta with and without common random numbers.',
+  ai: 'Neural and polynomial XVA surrogates back tested against the Monte Carlo engine, plus a tool-use skill that lets any LLM price XVA.',
   gpu: 'The whole exposure pipeline fused into one WebGPU kernel, validated against WASM and benchmarked.',
 };
 
