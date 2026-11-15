@@ -4,6 +4,7 @@
 // settings) and returns a Value of numbers and typed arrays. Errors are returned as
 // { error: "message" } rather than thrown. The WebAssembly binding only converts Values.
 
+#include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <functional>
@@ -1502,11 +1503,480 @@ GpuJobs compileJobs(const val& spec, const Env& env) {
   return g;
 }
 
+// ------------------------------------------------------------------ portfolio book
+//
+// spec.scope = "book" runs an analysis on every netting set of spec.book = { name, nettingSets:
+// [{ id, counterparty (credit name or index), csa, trades }] } and aggregates. All netting sets
+// draw the same scenarios: they share the reporting dates (the union of all their event dates),
+// the simulation dates (gpu::FusedOptions::extraDates: the union of every job's grid) and the
+// seed, and each simulates only its own counterparty's intensity, last in the factor order, so
+// the rates, FX / equity and discount paths are pathwise identical across the book (the kernel
+// keys its normals by path, date and factor index). Exposures, CVA, DVA, FVA, MVA and KVA of
+// different netting sets then add up exactly; quantiles (PFE) do not and are given per set.
+
+struct BookPart {
+  std::string id, counterparty;
+  std::size_t trades = 0;
+  bool collateralised = false;
+  Value spec;
+};
+
+bool isBook(const val& spec) { return str(spec, "scope", "") == "book"; }
+
+const std::vector<std::string>& bookAnalyses() {
+  static const std::vector<std::string> a = {"exposure", "collateral", "allocation", "cva", "xva", "wrongWayRisk", "hedging", "instruments"};
+  return a;
+}
+
+std::size_t creditOf(const val& spec, const val& ns, const std::string& id) {
+  const val credits = spec["credits"];
+  if (credits.size() == 0) return 0;
+  const val c = ns["counterparty"];
+  if (c.type() == Value::Type::String) {
+    for (std::size_t i = 0; i < credits.size(); ++i)
+      if (str(credits[i], "name", "") == c.stringData()) return i;
+    throw std::invalid_argument("netting set '" + id + "': unknown counterparty '" + c.stringData() + "'");
+  }
+  const auto i = static_cast<std::size_t>(num(ns, "counterparty", 0));
+  if (i >= credits.size()) throw std::invalid_argument("netting set '" + id + "': counterparty index out of range");
+  return i;
+}
+
+// spec with only credit c simulated (the last factor) and the matching correlation block.
+Value singleCredit(const Value& spec, std::size_t c) {
+  const val credits = spec["credits"];
+  if (credits.size() == 0) return spec;
+  Value s = Value::object();
+  for (const auto& [k, v] : spec.items()) s.set(k, v);
+  Value one = Value::array();
+  one.push(credits[c]);
+  s.set("credits", one);
+  s.set("counterparty", 0.0);
+  if (has(spec, "correlation")) {
+    const std::size_t nA = spec["assets"].size();
+    std::vector<std::size_t> keep;
+    for (std::size_t i = 0; i <= nA; ++i) keep.push_back(i);
+    keep.push_back(1 + nA + c);
+    const val corr = spec["correlation"];
+    if (corr.size() != 1 + nA + credits.size()) throw std::invalid_argument("correlation matrix has wrong dimension");
+    Value m = Value::array();
+    for (std::size_t i : keep) {
+      Value row = Value::array();
+      for (std::size_t j : keep) row.push(corr[i][j].as<double>());
+      m.push(row);
+    }
+    s.set("correlation", m);
+  }
+  return s;
+}
+
+std::vector<BookPart> bookParts(const val& spec) {
+  const val nets = spec["book"]["nettingSets"];
+  if (nets.size() == 0) throw std::invalid_argument("the portfolio has no netting sets");
+  std::vector<BookPart> parts;
+  for (std::size_t i = 0; i < nets.size(); ++i) {
+    const val ns = nets[i];
+    BookPart p;
+    p.id = str(ns, "id", "netting set " + std::to_string(i + 1));
+    p.trades = ns["trades"].size();
+    if (p.trades == 0) throw std::invalid_argument("netting set '" + p.id + "' has no trades");
+    Value s = Value::object();
+    for (const auto& [k, v] : spec.items())
+      if (k != "book" && k != "scope" && k != "trades" && k != "csa" && k != "counterparty" && k != "gpuOutputs") s.set(k, v);
+    s.set("trades", ns["trades"]);
+    Value csa = has(ns, "csa") ? ns["csa"] : Value::object();
+    if (!has(ns, "csa")) csa.set("enabled", false);
+    p.collateralised = !(has(csa, "enabled") && !csa["enabled"].as<bool>());
+    s.set("csa", csa);
+    const std::size_t c = creditOf(spec, ns, p.id);
+    p.counterparty = spec["credits"].size() ? str(spec["credits"][c], "name", "CPTY") : "";
+    p.spec = singleCredit(s, c);
+    parts.push_back(std::move(p));
+  }
+  // Common reporting dates: the base grid and the event dates of every netting set.
+  std::vector<double> dates;
+  for (const auto& p : parts) {
+    const Env env = parseEnv(p.spec);
+    const ExposureEngine engine(env.generator(), env.sim, env.baseGrid);
+    const std::vector<double> t = engine.reportingGrid(env.nettingSet(false)).times();
+    dates.insert(dates.end(), t.begin(), t.end());
+  }
+  std::sort(dates.begin(), dates.end());
+  std::vector<double> unique;
+  for (double t : dates)
+    if (unique.empty() || t > unique.back() + 1e-9) unique.push_back(t);
+  Value grid = Value::object();
+  grid.set("times", Value::f64(unique));
+  for (auto& p : parts) p.spec.set("grid", grid);
+  return parts;
+}
+
+gpu::FusedOptions jobOptions(const Job& job, const Env& env) {
+  gpu::FusedOptions o = job.options;
+  o.pfeQuantile = env.pfeQuantile;
+  o.counterparty = env.counterparty;
+  return o;
+}
+
+std::string jobLimitation(const Job& job, const gpu::FusedOptions& o) {
+  return gpu::limitation(*job.engine, job.nettingSet, o.perTrade || o.gross || o.tradeViews);
+}
+
+struct BookJobs {
+  std::vector<BookPart> parts;
+  std::vector<Env> envs;
+  std::vector<GpuJobs> sets;  // per netting set
+  std::string unsupported;
+};
+
+BookJobs compileBook(const val& spec) {
+  const std::string analysis = analysisOf(spec);
+  const auto& ok = bookAnalyses();
+  if (std::find(ok.begin(), ok.end(), analysis) == ok.end())
+    throw std::invalid_argument("the " + analysis + " analysis does not run on a portfolio");
+  BookJobs b;
+  b.parts = bookParts(spec);
+  std::vector<double> dates;
+  for (const auto& p : b.parts) {
+    b.envs.push_back(parseEnv(p.spec));
+    GpuJobs g;
+    g.jobs = analysisJobs(p.spec, b.envs.back(), analysis);
+    for (const auto& job : g.jobs) {
+      if (!job.engine) continue;
+      const auto o = jobOptions(job, b.envs.back());
+      if (const std::string why = jobLimitation(job, o); !why.empty()) {
+        b.unsupported = "netting set '" + p.id + "': " + why;
+        return b;
+      }
+      const std::vector<double> t = gpu::simulationGrid(*job.engine, job.nettingSet, o).times();
+      dates.insert(dates.end(), t.begin(), t.end());
+    }
+    b.sets.push_back(std::move(g));
+  }
+  // Every job simulates the union of all simulation dates: the same scenarios for the whole book.
+  for (std::size_t i = 0; i < b.sets.size(); ++i)
+    for (const auto& job : b.sets[i].jobs) {
+      if (!job.engine) {
+        b.sets[i].plans.emplace_back();
+        continue;
+      }
+      auto o = jobOptions(job, b.envs[i]);
+      o.extraDates = dates;
+      b.sets[i].plans.emplace_back(gpu::compile(*job.engine, job.nettingSet, o));
+    }
+  return b;
+}
+
+// Sums of additive profile quantities (no PFE: quantiles do not add across netting sets).
+ExposureProfile sumProfiles(const std::vector<const ExposureProfile*>& ps) {
+  ExposureProfile s;
+  s.times = ps.at(0)->times;
+  auto add = [](std::vector<double>& a, const std::vector<double>& b) {
+    if (a.empty()) a.assign(b.size(), 0.0);
+    for (std::size_t i = 0; i < a.size() && i < b.size(); ++i) a[i] += b[i];
+  };
+  for (const auto* p : ps) {
+    add(s.expectedValue, p->expectedValue);
+    add(s.expectedExposure, p->expectedExposure);
+    add(s.expectedNegativeExposure, p->expectedNegativeExposure);
+    add(s.discountedExpectedExposure, p->discountedExpectedExposure);
+    add(s.discountedExpectedNegativeExposure, p->discountedExpectedNegativeExposure);
+  }
+  return s;
+}
+
+val totalProfileToJs(const ExposureProfile& p) {
+  val o = val::object();
+  o.set("times", arr(p.times));
+  o.set("expectedValue", arr(p.expectedValue));
+  o.set("ee", arr(p.expectedExposure));
+  o.set("ene", arr(p.expectedNegativeExposure));
+  o.set("discountedEe", arr(p.discountedExpectedExposure));
+  o.set("discountedEne", arr(p.discountedExpectedNegativeExposure));
+  o.set("effectiveEe", arr(p.effectiveExpectedExposure()));
+  o.set("epe1y", p.expectedPositiveExposure(1.0));
+  o.set("eepe1y", p.effectiveExpectedPositiveExposure(1.0));
+  o.set("epeLife", p.expectedPositiveExposure(p.times.empty() ? 0.0 : p.times.back()));
+  return o;
+}
+
+double numAt(const val& o, const char* a, const char* b = nullptr) {
+  const val& v = b ? o[a][b] : o[a];
+  return v.isUndefined() || v.isNull() ? 0.0 : v.as<double>();
+}
+
+std::vector<double> sumArrays(const std::vector<val>& rs, const char* key) {
+  std::vector<double> s;
+  for (const auto& r : rs) {
+    if (r[key].isUndefined()) continue;
+    const auto v = r[key].numbers();
+    if (s.empty()) s.assign(v.size(), 0.0);
+    for (std::size_t i = 0; i < s.size() && i < v.size(); ++i) s[i] += v[i];
+  }
+  return s;
+}
+
+val bookResult(const val& spec, const std::string& analysis, const BookJobs& b, const std::vector<std::vector<JobResult>>& results) {
+  const std::size_t n = b.parts.size();
+  std::vector<val> rs;
+  for (std::size_t i = 0; i < n; ++i) {
+    try {
+      rs.push_back(combine(b.parts[i].spec, b.envs[i], analysis, b.sets[i].jobs, results[i]));
+    } catch (const std::exception& e) {
+      throw std::invalid_argument("netting set '" + b.parts[i].id + "': " + e.what());
+    }
+  }
+  std::vector<const ExposureProfile*> first;
+  for (const auto& r : results) first.push_back(&r.at(0).profile);
+  const ExposureProfile total = sumProfiles(first);
+
+  // Counterparties in order of first appearance.
+  std::vector<std::string> cps;
+  for (const auto& p : b.parts)
+    if (std::find(cps.begin(), cps.end(), p.counterparty) == cps.end()) cps.push_back(p.counterparty);
+  auto byCounterparty = [&](const std::function<void(val&, const val&, bool)>& add) {
+    val list = val::array();
+    for (const auto& c : cps) {
+      val o = val::object();
+      o.set("name", c);
+      val ids = val::array();
+      bool firstOne = true;
+      for (std::size_t i = 0; i < n; ++i)
+        if (b.parts[i].counterparty == c) {
+          ids.push(b.parts[i].id);
+          add(o, rs[i], firstOne);
+          firstOne = false;
+        }
+      o.set("nettingSets", ids);
+      list.push(o);
+    }
+    return list;
+  };
+  auto accumulate = [](val& o, const char* key, double v, bool reset) { o.set(key, (reset ? 0.0 : numAt(o, key)) + v); };
+
+  val sets = val::array();
+  val tot = val::object();
+  tot.set("profile", totalProfileToJs(total));
+  for (std::size_t i = 0; i < n; ++i) {
+    const val& r = rs[i];
+    val s = val::object();
+    const ExposureProfile& pr = results[i].at(0).profile;
+    if (analysis == "exposure" || analysis == "collateral" || analysis == "instruments") {
+      s.set("value0", pr.expectedValue.at(0));
+      s.set("eepe1y", pr.effectiveExpectedPositiveExposure(1.0));
+      s.set("epeLife", pr.expectedPositiveExposure(pr.times.back()));
+      s.set("maxPfe", pr.maxPotentialFutureExposure());
+    }
+    if (analysis == "cva") {
+      s.set("cva", numAt(r, "cva"));
+      s.set("dva", numAt(r, "bilateral", "dva"));
+      s.set("bilateral", numAt(r, "bilateral", "total"));
+      s.set("pathwiseCva", numAt(r, "pathwiseCva"));
+    } else if (analysis == "xva") {
+      for (const char* k : {"cva", "dva", "fca", "fba", "fva", "mva", "kva", "total"}) s.set(k, numAt(r["xva"], k));
+    } else if (analysis == "allocation") {
+      for (const char* k : {"totalCva", "standaloneCvaSum", "incrementalCvaSum", "nettingSaving"}) s.set(k, numAt(r, k));
+    } else if (analysis == "collateral") {
+      const val v = r["variants"];
+      s.set("eepeNoCsa", numAt(v[0]["profile"], "eepe1y"));
+      s.set("eepeCsa", numAt(v[1]["profile"], "eepe1y"));
+    } else if (analysis == "wrongWayRisk") {
+      const val v = r["results"];
+      s.set("independentCva", numAt(v[0], "independentCva"));
+      s.set("pathwiseCvaLow", numAt(v[0], "pathwiseCva"));
+      s.set("pathwiseCvaHigh", numAt(v[v.size() - 1], "pathwiseCva"));
+    } else if (analysis == "hedging") {
+      s.set("cva", numAt(r, "cva"));
+      s.set("cvaDv01", numAt(r, "cvaDv01"));
+      s.set("parallelCs01", numAt(r, "parallelCs01"));
+    }
+    val o = val::object();
+    o.set("id", b.parts[i].id);
+    o.set("counterparty", b.parts[i].counterparty);
+    o.set("trades", static_cast<double>(b.parts[i].trades));
+    o.set("collateralised", b.parts[i].collateralised);
+    o.set("summary", s);
+    o.set("result", r);
+    sets.push(o);
+  }
+
+  auto concatTrades = [&](const char* key, const std::vector<const char*>& fields) {
+    val list = val::array();
+    for (std::size_t i = 0; i < n; ++i) {
+      const val t = key ? rs[i][key]["trades"] : rs[i]["trades"];
+      for (std::size_t k = 0; k < t.size(); ++k) {
+        val o = val::object();
+        o.set("id", t[k]["id"]);
+        o.set("nettingSet", b.parts[i].id);
+        o.set("counterparty", b.parts[i].counterparty);
+        for (const char* f : fields)
+          if (!t[k][f].isUndefined()) o.set(f, t[k][f]);
+        list.push(o);
+      }
+    }
+    return list;
+  };
+
+  if (analysis == "cva") {
+    double cva = 0, dva = 0, bil = 0, pw = 0;
+    for (const auto& r : rs) cva += numAt(r, "cva"), dva += numAt(r, "bilateral", "dva"), bil += numAt(r, "bilateral", "total"), pw += numAt(r, "pathwiseCva");
+    tot.set("cva", cva);
+    tot.set("dva", dva);
+    tot.set("bilateral", bil);
+    tot.set("pathwiseCva", pw);
+    tot.set("cumulativeCva", arr(sumArrays(rs, "cumulativeCva")));
+    tot.set("termStructure", arr(sumArrays(rs, "termStructure")));
+    tot.set("byCounterparty", byCounterparty([&](val& o, const val& r, bool reset) {
+      accumulate(o, "cva", numAt(r, "cva"), reset);
+      accumulate(o, "dva", numAt(r, "bilateral", "dva"), reset);
+      accumulate(o, "pathwiseCva", numAt(r, "pathwiseCva"), reset);
+    }));
+  } else if (analysis == "xva") {
+    val x = val::object();
+    for (const char* k : {"cva", "dva", "fca", "fba", "fva", "mva", "kva", "total"}) {
+      double v = 0;
+      for (const auto& r : rs) v += numAt(r["xva"], k);
+      x.set(k, v);
+    }
+    tot.set("xva", x);
+    for (const char* k : {"cumulativeCva", "cumulativeFca", "cumulativeMva", "cumulativeKva", "initialMargin"}) tot.set(k, arr(sumArrays(rs, k)));
+    tot.set("byCounterparty", byCounterparty([&](val& o, const val& r, bool reset) {
+      for (const char* k : {"cva", "dva", "fca", "fba", "mva", "kva", "total"}) accumulate(o, k, numAt(r["xva"], k), reset);
+    }));
+    tot.set("trades", concatTrades(nullptr, {"cva", "fca", "kva"}));
+  } else if (analysis == "allocation") {
+    double totalCva = 0, standalone = 0, marginal = 0;
+    for (const auto& r : rs) totalCva += numAt(r, "totalCva"), standalone += numAt(r, "standaloneCvaSum"), marginal += numAt(r, "marginalCvaSum");
+    tot.set("totalCva", totalCva);
+    tot.set("standaloneCvaSum", standalone);
+    tot.set("marginalCvaSum", marginal);
+    tot.set("nettingSaving", standalone != 0.0 ? 1.0 - totalCva / standalone : kNaN);
+    tot.set("totalEe", arr(sumArrays(rs, "totalEe")));
+    tot.set("trades", concatTrades(nullptr, {"marginalCva", "marginalFca", "marginalKva", "incrementalCva", "standaloneCva"}));
+  } else if (analysis == "collateral") {
+    val list = val::array();
+    const std::size_t nv = rs[0]["variants"].size();
+    std::vector<const ExposureProfile*> none;
+    for (const auto& r : results) none.push_back(&r.at(0).profile);
+    const double eepe0 = sumProfiles(none).effectiveExpectedPositiveExposure(1.0);
+    for (std::size_t v = 0; v < nv; ++v) {
+      std::vector<const ExposureProfile*> ps;
+      for (const auto& r : results) ps.push_back(&r.at(v).profile);
+      const ExposureProfile p = sumProfiles(ps);
+      val o = val::object();
+      o.set("name", rs[0]["variants"][v]["name"]);
+      o.set("profile", totalProfileToJs(p));
+      o.set("eepeVsNoCsa", eepe0 > 0.0 ? p.effectiveExpectedPositiveExposure(1.0) / eepe0 : kNaN);
+      list.push(o);
+    }
+    tot.set("variants", list);
+  } else if (analysis == "wrongWayRisk") {
+    val list = val::array();
+    const val first0 = rs[0]["results"];
+    for (std::size_t k = 0; k < first0.size(); ++k) {
+      double pw = 0, ind = 0;
+      for (const auto& r : rs) pw += numAt(r["results"][k], "pathwiseCva"), ind += numAt(r["results"][k], "independentCva");
+      val o = val::object();
+      o.set("rho", first0[k]["rho"]);
+      o.set("pathwiseCva", pw);
+      o.set("independentCva", ind);
+      o.set("multiplier", ind != 0.0 ? pw / ind : kNaN);
+      list.push(o);
+    }
+    tot.set("results", list);
+  } else if (analysis == "hedging") {
+    double cva = 0, dv01 = 0;
+    for (const auto& r : rs) cva += numAt(r, "cva"), dv01 += numAt(r, "cvaDv01");
+    tot.set("cva", cva);
+    tot.set("cvaDv01", dv01);
+    val deltas = val::array();
+    const val d0 = rs[0]["assetDeltas"];
+    for (std::size_t a = 0; a < d0.size(); ++a) {
+      double delta = 0, units = 0;
+      for (const auto& r : rs) delta += numAt(r["assetDeltas"][a], "hedgeDelta"), units += numAt(r["assetDeltas"][a], "hedgeUnits");
+      val o = val::object();
+      o.set("name", d0[a]["name"]);
+      o.set("hedgeDelta", delta);
+      o.set("hedgeUnits", units);
+      deltas.push(o);
+    }
+    tot.set("assetDeltas", deltas);
+    tot.set("byCounterparty", byCounterparty([&](val& o, const val& r, bool reset) {
+      accumulate(o, "cva", numAt(r, "cva"), reset);
+      accumulate(o, "parallelCs01", numAt(r, "parallelCs01"), reset);
+    }));
+  } else if (analysis == "instruments") {
+    tot.set("trades", concatTrades(nullptr, {"type", "maturity", "value0", "benchmark", "benchmarkLabel", "pass", "eePeak"}));
+  }
+
+  val out = val::object();
+  out.set("scope", "book");
+  out.set("analysis", analysis);
+  out.set("name", str(spec["book"], "name", "portfolio"));
+  out.set("times", arr(total.times));
+  out.set("numPaths", static_cast<double>(results.at(0).at(0).numPaths));
+  out.set("simulationDates", static_cast<double>(results.at(0).at(0).simulationDates));
+  val names = val::array();
+  for (const auto& c : cps) names.push(c);
+  out.set("counterparties", names);
+  out.set("nettingSets", sets);
+  out.set("total", tot);
+  return out;
+}
+
+val analyseBook(const val& spec, const std::function<std::optional<gpu::FusedOutput>(std::size_t, const gpu::FusedPlan&)>& output) {
+  const BookJobs b = compileBook(spec);
+  if (!b.unsupported.empty()) {
+    val out = val::object();
+    out.set("unsupported", b.unsupported);
+    return out;
+  }
+  std::vector<std::vector<JobResult>> results(b.sets.size());
+  std::size_t k = 0;
+  for (std::size_t i = 0; i < b.sets.size(); ++i)
+    for (std::size_t j = 0; j < b.sets[i].jobs.size(); ++j, ++k) {
+      const auto& plan = b.sets[i].plans[j];
+      if (!plan) {
+        JobResult r;
+        r.error = b.sets[i].jobs[j].error;
+        results[i].push_back(r);
+        continue;
+      }
+      const auto o = output(k, *plan);
+      if (!o) throw std::invalid_argument("missing GPU output for job " + std::to_string(k));
+      results[i].push_back(fromFused(*plan, *o, b.envs[i]));
+    }
+  return bookResult(spec, analysisOf(spec), b, results);
+}
+
+// A netting-set analysis simulates only its counterparty's intensity (as every netting set of a
+// book does), so any number of counterparties can be defined; the models page shows them all.
+Value forAnalysis(const Value& spec) {
+  const auto c = static_cast<std::size_t>(num(spec, "counterparty", 0));
+  if (isBook(spec) || str(spec, "analysis", "exposure") == "models" || spec["credits"].size() <= 1 || c >= spec["credits"].size()) return spec;
+  return singleCredit(spec, c);
+}
+
 val gpuJobs(val input) {
-  const val spec = withMarketState(input);
+  const val spec = forAnalysis(withMarketState(input));
   return guarded([&] {
-    const Env env = parseEnv(spec);
     const double t0 = nowMs();
+    if (isBook(spec)) {  // every job of every netting set, in order
+      const BookJobs b = compileBook(spec);
+      val out = val::object();
+      out.set("compileMs", nowMs() - t0);
+      if (!b.unsupported.empty()) {
+        out.set("unsupported", b.unsupported);
+        return out;
+      }
+      val plans = val::array();
+      for (std::size_t i = 0; i < b.sets.size(); ++i)
+        for (std::size_t j = 0; j < b.sets[i].jobs.size(); ++j)
+          plans.push(b.sets[i].plans[j] ? planToJs(*b.sets[i].plans[j], b.parts[i].id + " · " + b.sets[i].jobs[j].label) : val::null());
+      out.set("plans", plans);
+      return out;
+    }
+    const Env env = parseEnv(spec);
     const GpuJobs g = compileJobs(spec, env);
     val out = val::object();
     out.set("compileMs", nowMs() - t0);
@@ -1578,6 +2048,7 @@ val validation(const val& spec, const Env& env, const JobResult& g, const JobRes
 }
 
 val analyseFused(const val& spec, const std::function<std::optional<gpu::FusedOutput>(std::size_t, const gpu::FusedPlan&)>& output) {
+  if (isBook(spec)) return analyseBook(spec, output);
   const Env env = parseEnv(spec);
   const GpuJobs g = compileJobs(spec, env);
   if (!g.unsupported.empty()) {  // e.g. a Bermudan: the caller falls back to ExposureEngine
@@ -1608,7 +2079,7 @@ val analyseFused(const val& spec, const std::function<std::optional<gpu::FusedOu
 }
 
 val gpuAnalyse(val input) {
-  const val spec = withMarketState(input);
+  const val spec = forAnalysis(withMarketState(input));
   return guarded([&] {
     const val outputs = spec["gpuOutputs"];
     return analyseFused(spec, [&](std::size_t i, const gpu::FusedPlan&) -> std::optional<gpu::FusedOutput> {
@@ -1625,7 +2096,7 @@ val gpuAnalyse(val input) {
 // on the lock-free SpinPool where the build has threads (natively; one thread in this
 // single-threaded WebAssembly build). One call per analysis, the same result shape as gpuAnalyse.
 val cpuKernels(val input) {
-  const val spec = withMarketState(input);
+  const val spec = forAnalysis(withMarketState(input));
   return guarded([&] {
     double kernelMs = 0.0;  // the kernels only (validation also runs ExposureEngine in this call)
     val out = analyseFused(spec, [&](std::size_t, const gpu::FusedPlan& plan) -> std::optional<gpu::FusedOutput> {

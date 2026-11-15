@@ -1,10 +1,10 @@
 // Shared page scaffolding: navigation, environment status, cards, tiles, tables,
 // run buttons and the specification editor used by every page.
-import { factorNames, loadSpec, resetSpec, resizeCorrelation, saveSpec } from './spec.js';
+import { addCounterparty, factorNames, loadSpec, resetSpec, resizeCorrelation, saveSpec, switchNettingSet } from './spec.js';
 import { fmt } from './charts.js';
 
 export const PAGES = [
-  { group: 'Overview', items: [{ id: 'index', href: 'index.html', title: 'Overview' }] },
+  { group: 'Overview', items: [{ id: 'index', href: 'index.html', title: 'Overview' }, { id: 'portfolio', href: 'portfolio.html', title: 'Portfolio (all netting sets)' }] },
   {
     group: 'Foundations',
     items: [
@@ -253,6 +253,33 @@ export function specEditor(page, sections, { open = false, tradeTypes = ['swap',
     if (sections.includes('credit')) {
       const c = spec.credits[spec.counterparty || 0];
       const s = sec(`Counterparty credit (${c ? c.name : 'none'})`);
+      if (spec.credits.length) {
+        s.append(field('counterparty of this netting set', selectInput(spec.credits.map((x) => x.name), () => c?.name, (v) => {
+          spec.counterparty = Math.max(0, spec.credits.findIndex((x) => x.name === v)); rerender();
+        })));
+        s.append(field('name', textInput(() => c.name, (v) => {
+          const prev = factorNames(spec), old = c.name;
+          if (!v || spec.credits.some((x) => x !== c && x.name === v)) return rerender();
+          c.name = v;
+          for (const ns of spec.book?.nettingSets || []) if (ns.counterparty === old) ns.counterparty = v;
+          resizeCorrelation(spec, prev.map((n) => (n === old ? v : n)));
+          rerender();
+        })));
+      }
+      s.append(el('div', { class: 'spec-actions' },
+        el('button', { text: '+ counterparty', onclick: () => {
+          let k = spec.credits.length + 1;
+          while (spec.credits.some((x) => x.name === `CPTY ${k}`)) k++;
+          spec.counterparty = addCounterparty(spec, `CPTY ${k}`, 0.015);
+          rerender();
+        } }),
+        spec.credits.length > 1 ? el('button', { text: 'remove this counterparty', onclick: () => {
+          const prev = factorNames(spec);
+          spec.credits.splice(spec.counterparty || 0, 1);
+          spec.counterparty = 0;
+          resizeCorrelation(spec, prev);
+          rerender();
+        } }) : null));
       if (c) {
         const t = el('table', { class: 'edit' }, el('tr', {}, ['CDS tenor', 'spread bp', ''].map((h) => el('th', { text: h }))));
         c.quotes.forEach((q, i) => t.append(el('tr', {},
@@ -315,8 +342,19 @@ export function specEditor(page, sections, { open = false, tradeTypes = ['swap',
       s.append(field('margin period of risk (days)', numInput(() => spec.csa.mpr, (v) => { spec.csa.mpr = v; changed(); }, { scale: 250 })));
     }
     if (sections.includes('portfolio')) {
-      const s = sec('Netting set (portfolio)');
+      const s = sec(spec.book ? `Netting set of the portfolio “${spec.book.name}”` : 'Netting set (portfolio)');
       s.style.gridColumn = '1 / -1';
+      if (spec.book?.nettingSets?.length) {
+        const ns = spec.book.nettingSets[spec.book.active ?? 0];
+        s.append(el('div', { class: 'spec-actions' },
+          field('netting set', selectInput(spec.book.nettingSets.map((x) => x.id), () => ns.id, (v) => {
+            page.spec = switchNettingSet(spec, spec.book.nettingSets.findIndex((x) => x.id === v)); rerender();
+          })),
+          field('id', textInput(() => ns.id, (v) => { if (v && !spec.book.nettingSets.some((x) => x !== ns && x.id === v)) ns.id = v; rerender(); })),
+          el('span', { class: 'status', html: `This page analyses one netting set; the <a href="portfolio.html">portfolio page</a> runs the analyses on all ${spec.book.nettingSets.length}.` })));
+      } else {
+        s.append(el('p', { class: 'note', html: 'Build a portfolio of several netting sets (each with its counterparty and CSA) on the <a href="portfolio.html">portfolio page</a>.' }));
+      }
       spec.trades.forEach((tr, i) => {
         const row = el('div', { style: 'display:flex;flex-wrap:wrap;gap:6px;align-items:end;margin-bottom:8px;padding-bottom:8px;border-bottom:1px solid var(--grid)' });
         const lab = (text, input) => el('label', { style: 'display:grid;font-size:11px;color:var(--text-secondary);min-width:90px' }, text, input);

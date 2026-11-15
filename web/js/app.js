@@ -2,6 +2,7 @@
 // page to run is chosen by <body data-page="...">. Each page module only runs when loaded.
 const pages = {
   index: () => import('./pages/index.js'),
+  portfolio: () => import('./pages/portfolio.js'),
   core: () => import('./pages/core.js'),
   market: () => import('./pages/market.js'),
   models: () => import('./pages/models.js'),

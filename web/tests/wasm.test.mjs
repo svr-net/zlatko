@@ -68,6 +68,28 @@ if (xva && xvaProxy) {
   near(x.total, x.cva - x.dva + x.fca - x.fba + x.mva + x.kva, 1e-6 * Math.abs(x.total), 'XVA identity');
   near(sum(xva.trades.map((t) => t.cva)), x.cva, 1e-4 * x.cva, 'XVA allocation adds up (f32)');
 }
+// A book: two netting sets with two counterparties on common scenarios. The second holds the trades
+// of the first and one more, so its expected value is the first's plus that trade's on every date.
+{
+  const cr = spec.credits[0];
+  const credits = [cr, { ...cr, name: 'CPTY B', quotes: cr.quotes.map((q) => ({ ...q, spread: 2 * q.spread })) }];
+  const n = spec.correlation.length;
+  const correlation = [...spec.correlation.map((r) => [...r, 0]), [...Array(n).fill(0), 1]];
+  const [first, ...rest] = spec.trades;
+  const book = { name: 'test', nettingSets: [
+    { id: 'A', counterparty: cr.name, trades: [first] },
+    { id: 'B', counterparty: 'CPTY B', trades: spec.trades },
+    { id: 'C', counterparty: cr.name, trades: rest }] };
+  const b = run('cpuKernels book cva', () => call('cpuKernels', { ...spec, sim: { ...spec.sim, numPaths: 1000 }, credits, correlation, book, scope: 'book', analysis: 'cva' }));
+  if (b) {
+    check(b.scope === 'book' && b.nettingSets.length === 3 && b.counterparties.length === 2, 'book of three netting sets, two counterparties');
+    near(b.total.cva, sum(b.nettingSets.map((x) => x.summary.cva)), 1e-9 * b.total.cva, 'book CVA is the sum of the netting sets');
+    const ev = (i) => Array.from(b.nettingSets[i].result.profile.expectedValue);
+    const evA = ev(0), evC = ev(2), gross = sum(spec.trades.map((t) => Math.abs(t.notional)));
+    check(ev(1).every((v, j) => Math.abs(v - evA[j] - evC[j]) < 2e-6 * gross), 'netting sets share their scenarios (E[V] adds up pathwise)');
+    near(b.total.byCounterparty[0].cva + b.total.byCounterparty[1].cva, b.total.cva, 1e-9 * b.total.cva, 'CVA by counterparty adds up');
+  }
+}
 const wwr = fused('wrongWayRisk', { rhos: [-0.5, 0, 0.5] });
 if (wwr) check(wwr.results[2].pathwiseCva > wwr.results[0].pathwiseCva, 'WWR increases CVA');
 const hedge = fused('hedging', { sim: { ...spec.sim, numPaths: 1000 }, bumps: [0.02, 0.01] });

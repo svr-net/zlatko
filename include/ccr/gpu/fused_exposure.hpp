@@ -295,6 +295,10 @@ struct FusedOptions {
   /// and IM(t, path) is the imQuantile of |V(t + MPR) - V(t)| over them (at most kMaxInnerPaths).
   std::size_t imInnerPaths = 0;
   double imMarginPeriod = 10.0 / 250.0;
+  /// Simulation-only dates merged into the grid (not reporting dates). A book gives every netting
+  /// set the union of all their simulation dates, so that all draw the same scenarios: the
+  /// normals of the kernel are keyed by path and date index.
+  std::vector<double> extraDates;
   // Path views (each adds rows to the exposure buffer and requests to the row-statistics kernel):
   std::size_t samples = 0;           ///< sample paths of V - C, V and C (at most kMaxSamples)
   double histogramTime = -1.0;       ///< >= 0: histogram of V - C on the reporting date on or before it
@@ -319,6 +323,10 @@ struct FusedOptions {
 FusedPlan compile(const ExposureEngine& engine, const NettingSet& nettingSet, const FusedOptions& options);
 FusedPlan compile(const ExposureEngine& engine, const NettingSet& nettingSet, double pfeQuantile = 0.95,
                   std::size_t counterparty = 0);
+
+/// The simulation dates `compile` uses: the engine's simulation grid (reporting dates and margin
+/// call dates), the t + MPR dates of the nested initial margin and options.extraDates.
+TimeGrid simulationGrid(const ExposureEngine& engine, const NettingSet& nettingSet, const FusedOptions& options);
 
 /// Why `compile` cannot run this setup on the GPU, or an empty string if it can.
 std::string limitation(const ExposureEngine& engine, const NettingSet& nettingSet, bool perTrade = false);
