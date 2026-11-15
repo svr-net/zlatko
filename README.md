@@ -192,6 +192,24 @@ node web/tests/e2e.mjs                   # every page in headless Chromium (Play
 | XVA | `xva/xva.hpp` | FCA, FBA (FVA), MVA from a simulated initial-margin proxy, KVA, the combined total, and exact allocation of CVA, FCA and KVA to trades |
 | Hedging | `hedging/sensitivities.hpp` | XVA credit (counterparty and own) and funding sensitivities; bucketed CS01 of CVA with re-bootstrapped curves, CDS hedge notionals from the hedge Jacobian, and market-risk deltas by bump-and-revalue with common random numbers |
 
+## Proposed extension chapters: XVA
+
+The book stops at CVA/DVA, wrong-way risk and hedging. These chapters would extend it, in the same
+style (definition, discrete formula on the exposure grid, Monte Carlo estimator, worked example),
+to cover everything implemented in `xva/xva.hpp`, `hedging/sensitivities.hpp` and
+[`web/xva.html`](web/xva.html). Each maps to a page of the web front end.
+
+| Proposed chapter | Content | Code / page |
+|---|---|---|
+| X1. From CVA to XVA | Why a derivative has a cost beyond credit: funding, margin and capital. The total adjustment CVA − DVA + FCA − FBA + MVA + KVA, sign conventions, and the discounted exposures EE\* and ENE\* with the joint survival Q<sub>c</sub>Q<sub>o</sub> as common building blocks | `exposureXva`, [xva](web/xva.html) |
+| X2. Funding valuation adjustment | FCA = s<sub>b</sub>∫EE\* Q<sub>c</sub>Q<sub>o</sub> dt and FBA = s<sub>l</sub>∫\|ENE\*\| Q<sub>c</sub>Q<sub>o</sub> dt, FVA = FCA − FBA. Borrow and lend spreads, the overlap with DVA, and the asymmetry debate | `fundingBenefit` |
+| X3. Margin valuation adjustment | Initial margin as a quantile of the 10-day change in the netting-set value, simulated on the paths. MVA = s<sub>m</sub>∫IM\* Q<sub>c</sub>Q<sub>o</sub> dt. Link to the margin period of risk of the collateral chapter | `initialMarginProfile`, `marginValuationAdjustment` |
+| X4. Capital valuation adjustment | KVA = hurdle · capital ratio · RW · α ∫EE\* Q<sub>c</sub>Q<sub>o</sub> dt, with α and effective EPE from the Basel exposure measures | `xva` |
+| X5. XVA allocation to trades | CVA, FCA and KVA are linear in EE\*, so Euler allocation is exact and adds up to the netting-set figure. MVA and the non-linear terms are not allocated this way. Incremental XVA of a new trade | `allocateExposureXva`, [allocation](web/allocation.html) |
+| X6. XVA sensitivities and hedging | Credit (counterparty and own) and funding sensitivities, bucketed CS01 with re-bootstrapped curves, CDS hedge notionals from the hedge Jacobian, delta by bump-and-revalue with common random numbers | [hedging](web/hedging.html) |
+| X7. Numerical practice | Paths, grid and seed effects on XVA noise, regression-based initial margin, running the pipeline on WebAssembly and WebGPU, validation checks (martingale tests, additivity of allocations) | [gpu](web/gpu.html) |
+| X8. Beyond this implementation (outlook) | Collateralised funding (CSA discounting), KVA with SA-CCR/CVA capital, stochastic funding spreads, wrong-way funding, XVA as a portfolio-level optimisation | open |
+
 ## Conventions
 
 - Times are year fractions from today (t = 0). Values are in the domestic currency, from our
