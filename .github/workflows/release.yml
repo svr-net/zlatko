@@ -73,7 +73,7 @@ jobs:
             ### Standalone site: `zlatko-ccr-standalone-${{ steps.tag.outputs.tag }}.zip`
             Unzip it anywhere and open `index.html`. It needs no server and no install, because the WebAssembly library is embedded in the bundle.
             The same folder can be uploaded unchanged to any static host (S3, GitHub Pages, nginx, IIS).
-            It has 14 pages, one per library context: market data, risk-factor models, instruments, American Monte Carlo, exposure and netting, collateral, allocation, CVA/DVA, wrong-way risk, hedging, the WebGPU fused kernels, and AI surrogates with an LLM agent skill.
+            It has 15 pages, one per library context: market data, risk-factor models, instruments, American Monte Carlo, exposure and netting, collateral, allocation, CVA/DVA, XVA (FVA, MVA, KVA), wrong-way risk, hedging, the WebGPU fused kernels, and AI surrogates with an LLM agent skill.
             The Monte Carlo pages run on the fused WebGPU kernels whenever the browser supports WebGPU (the *Auto* engine), and on WebAssembly otherwise.
             Verify the download with the attached `.sha256` file.
 

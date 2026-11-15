@@ -63,7 +63,7 @@ npm --prefix tools/standalone ci && node tools/standalone/build.mjs
 
 ```
 dist/standalone/
-  index.html, core.html, ... gpu.html      14 pages
+  index.html, core.html, ... xva.html      15 pages
   assets/app.<hash>.js                     all pages (classic script, ~85 KiB)
   assets/ccr-runtime.<hash>.js             WASM worker with embedded library (~360 KiB)
   assets/style.<hash>.css
