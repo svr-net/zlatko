@@ -1,4 +1,4 @@
-import { run } from '../ccr-client.js';
+import { engineNote, engineSelector, runAnalysis } from '../gpu/backend.js';
 import { barChart, fmt, lineChart } from '../charts.js';
 import { defaultBermudan, saveSpec } from '../spec.js';
 import { card, el, grid, initPage, runButton, specEditor, table, tiles, toArrays } from '../ui.js';
@@ -31,15 +31,17 @@ fields.append(el('div', {},
 form.append(fields);
 page.main.insertBefore(form, page.toolbar);
 
-runButton(page, 'Value by AMC', async (spec) => {
-  const r = await run('amc', { ...spec, grid: { ...spec.grid, horizon: Math.max(spec.grid.horizon, b.start + b.tenor) }, samplePaths: 20 });
+const button = runButton(page, 'Value by AMC', async (spec) => {
+  const t0 = performance.now();
+  // The page's horizon covers the Bermudan (a setting, not a calculation).
+  const runResult = await runAnalysis('amc', { ...spec, bermudan: b, grid: { ...spec.grid, horizon: Math.max(spec.grid.horizon, b.start + b.tenor) }, samplePaths: 20 });
+  const r = runResult.result;
   const t = Array.from(r.times);
-  const maxEur = Math.max(...r.european);
   tiles(page.content, [
     { label: 'Bermudan price (AMC)', value: fmt.num(r.price), hint: `strike ${fmt.pct(r.fixedRate, 3)} vs par ${fmt.pct(r.parRate, 3)}` },
-    { label: 'Best European (Jamshidian)', value: fmt.num(maxEur), hint: 'lower bound' },
-    { label: 'Switch option value', value: fmt.num(r.price - maxEur), hint: fmt.pct(r.price / maxEur - 1, 1) + ' over best European' },
-    { label: 'Never exercised', value: fmt.pct(r.exerciseDistribution[r.exerciseDistribution.length - 1], 1), hint: `${fmt.num(r.elapsedMs)} ms for value cube` },
+    { label: 'Best European (Jamshidian)', value: fmt.num(r.bestEuropean), hint: 'lower bound' },
+    { label: 'Switch option value', value: fmt.num(r.switchValue), hint: fmt.pct(r.switchPremium, 1) + ' over best European' },
+    { label: 'Never exercised', value: fmt.pct(r.neverExercised, 1), hint: `Longstaff–Schwartz inside the fused kernels (${runResult.label})` },
   ]);
   const g = grid(page.content);
   const pp = r.physicalProfile, cp = r.cashProfile;
@@ -65,6 +67,8 @@ runButton(page, 'Value by AMC', async (spec) => {
     labels: Array.from(r.exercises).map((e) => fmt.years(e)),
     series: [{ name: 'European', values: Array.from(r.european) }, { name: 'Bermudan', values: r.european.map(() => r.price), colorIndex: 1 }],
   });
-  const box = card(g, 'Regression basis sensitivity', 'Price against the degree of the polynomial in x(t). It should be stable from degree 2 or 3.');
-  table(box, ['degree', 'price', 'vs degree 3'], r.degreeSensitivity.map((d) => [d.degree, fmt.num(d.price), fmt.pct(d.price / r.degreeSensitivity[2].price - 1, 2)]));
+  const box = card(g, 'Regression basis sensitivity', 'Price against the degree of the polynomial in x(t) (the kernels regress with degree 1–3). It should be stable from degree 2.');
+  table(box, ['degree', 'price', 'vs degree 3'], r.degreeSensitivity.map((d) => [d.degree, fmt.num(d.price), fmt.pct(d.vsHighest, 2)]));
+  return engineNote(runResult, performance.now() - t0);
 });
+engineSelector(page, () => button.click());

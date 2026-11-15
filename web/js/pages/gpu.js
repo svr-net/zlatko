@@ -12,12 +12,12 @@ const page = initPage({
     'The C++ library compiles the netting set into flat tables. These hold the exact Hull–White step coefficients, ' +
     'the bond terms <code>A·e<sup>−Bx</sup></code> for each date, fixing records, option terms and the margin-call look-back. A single WebGPU compute kernel, also part of the library, then ' +
     '<b>simulates, prices, nets, collateralises and aggregates</b> every path in one pass, without ever storing a scenario cube. ' +
-    'The browser only uploads the tables, dispatches the kernels and hands the read-back to the library, which builds the profile, CVA and the checks below against its own CPU Monte Carlo run. ' +
+    'The browser only uploads the tables, dispatches the kernels and hands the read-back to the library, which builds the profile, CVA and the checks below against the same kernels run in C++ on the CPU. ' +
     'The GPU works in 32-bit floats with a different random number generator, so the two agree within Monte Carlo error, not to the last digit. Bermudan swaptions are priced by American Monte Carlo inside the kernel: its regressions are fitted on a first pass of the same kernel.',
 });
 specEditor(page, ['market', 'assets', 'credit', 'correlation', 'simulation', 'csa', 'portfolio']);
 
-runButton(page, 'Run on GPU and validate against WASM', async (spec) => {
+runButton(page, 'Run on GPU and validate', async (spec) => {
   // Without a WebGPU adapter (e.g. Chrome blocks WebGPU for the GPU), validate the same fused
   // kernels running on the CPU (C++) instead.
   let g, onCpu = false;
@@ -28,43 +28,42 @@ runButton(page, 'Run on GPU and validate against WASM', async (spec) => {
     g = await runOnCpuKernels('validation', spec);
     onCpu = true;
     page.content.append(el('p', { class: 'note engine-note' }, el('b', { text: 'No WebGPU on this device. ' }),
-      `${e.message.replace('no WebGPU adapter: ', '')}. The same fused kernels ran on the CPU (C++, ${g.result.threads} thread${g.result.threads === 1 ? '' : 's'}) and are validated below.`));
+      `${e.message.replace('no WebGPU adapter: ', '')}. The same fused kernels ran on the CPU (C++, ${g.result.threads} thread${g.result.threads === 1 ? '' : 's'}) and are checked below.`));
   }
   if (g.unsupported) throw new Error('not on GPU: ' + g.unsupported);
   const r = g.result;
-  const gp = r.gpu.profile, wp = r.wasm.profile, c = r.checks;
+  const gp = r.gpu.profile, cp = r.reference.profile, c = r.checks;
   const engineName = onCpu ? 'CPU fused kernels' : 'GPU fused pipeline';
 
   tiles(page.content, [
     { label: engineName, value: fmt.num(r.gpuMs, 1) + ' ms', hint: `${fmt.num(r.numPaths)} paths × ${r.numDates ?? r.gpu.simulationDates} dates` },
-    { label: 'WASM (CPU, 1 thread)', value: fmt.num(r.wasm.elapsedMs, 0) + ' ms', hint: 'scenarios + pricing' },
-    { label: 'Speed-up', value: (r.wasm.elapsedMs / r.gpuMs).toFixed(1) + '×', hint: onCpu ? 'fused f32 kernels vs ExposureEngine' : 'includes upload & read-back' },
+    { label: 'CPU fused kernels (C++)', value: fmt.num(r.reference.elapsedMs, 0) + ' ms', hint: 'the same plans, single-threaded WebAssembly' },
     onCpu
       ? { label: 'Threads', value: String(r.threads), hint: 'lock-free C++ pool (one thread in WebAssembly)' }
       : { label: 'Plan compile (C++)', value: fmt.num(r.compileMs, 1) + ' ms', hint: `${fmt.num(r.numTerms)} valuation terms` },
-    { label: 'CVA (GPU / WASM)', value: `${fmt.compact(r.gpu.cva)} / ${fmt.compact(r.wasm.cva)}`, hint: 'independence, market survival' },
-    { label: 'Pathwise CVA (GPU / WASM)', value: `${fmt.compact(r.gpu.pathwiseCva)} / ${fmt.compact(r.wasm.pathwiseCva)}`, hint: 'stochastic CIR++ intensity' },
+    { label: 'CVA (GPU / CPU kernels)', value: `${fmt.compact(r.gpu.cva)} / ${fmt.compact(r.reference.cva)}`, hint: 'independence, market survival' },
+    { label: 'Pathwise CVA (GPU / CPU kernels)', value: `${fmt.compact(r.gpu.pathwiseCva)} / ${fmt.compact(r.reference.pathwiseCva)}`, hint: 'stochastic CIR++ intensity' },
   ]);
 
   const gr = grid(page.content);
   const t = Array.from(gp.times);
   const q = fmt.pct(gp.pfeQuantile, 0);
-  lineChart(card(gr, 'Expected exposure: GPU vs WASM', 'Solid lines are the fused GPU kernel and dashed lines the WASM library. They use independent random numbers.'), {
+  lineChart(card(gr, 'Expected exposure: GPU vs CPU kernels', 'Solid lines are the WGSL kernels on the GPU and dashed lines the same kernels in C++ on the CPU: the same algorithm and random numbers, so they agree to f32 rounding.'), {
     x: t, xLabel: 't (years)', yLabel: 'exposure',
     series: [
       { name: 'EE GPU', y: Array.from(gp.ee), colorIndex: 0 },
-      { name: 'EE WASM', y: Array.from(wp.ee), colorIndex: 0, dash: true },
+      { name: 'EE CPU kernels', y: Array.from(cp.ee), colorIndex: 0, dash: true },
       { name: `PFE${q} GPU`, y: Array.from(gp.pfe), colorIndex: 1 },
-      { name: `PFE${q} WASM`, y: Array.from(wp.pfe), colorIndex: 1, dash: true },
+      { name: `PFE${q} CPU kernels`, y: Array.from(cp.pfe), colorIndex: 1, dash: true },
     ],
   });
   lineChart(card(gr, 'Negative exposure & expected value', 'ENE drives DVA. E[V] is the mean mark-to-market net of collateral.'), {
     x: t, xLabel: 't (years)', zero: true,
     series: [
       { name: 'ENE GPU', y: Array.from(gp.ene), colorIndex: 2 },
-      { name: 'ENE WASM', y: Array.from(wp.ene), colorIndex: 2, dash: true },
+      { name: 'ENE CPU kernels', y: Array.from(cp.ene), colorIndex: 2, dash: true },
       { name: 'E[V] GPU', y: Array.from(gp.expectedValue), colorIndex: 6 },
-      { name: 'E[V] WASM', y: Array.from(wp.expectedValue), colorIndex: 6, dash: true },
+      { name: 'E[V] CPU kernels', y: Array.from(cp.expectedValue), colorIndex: 6, dash: true },
     ],
   });
   if (r.gpu.meanSurvival.length)
@@ -76,18 +75,16 @@ runButton(page, 'Run on GPU and validate against WASM', async (spec) => {
       ],
     });
 
-  const checks = card(gr, 'Agreement checks', 'Computed by the library. Tolerances allow for Monte Carlo noise at the chosen path count.');
+  const checks = card(gr, 'Agreement checks', 'Computed by the library: the GPU against the same kernels on the CPU, and exact values.');
   table(checks, ['check', 'value', 'tolerance', 'result'], [
-    ['t = 0 value: |Δ| per unit gross notional (f32)', c.t0Diff.toExponential(1), '1e-6', passFail(c.t0Diff < 1e-6)],
-    ['max |ΔEE| / max EE', fmt.pct(c.eeDiff, 2), fmt.pct(c.tol, 1), passFail(c.eeDiff < c.tol)],
-    ['|ΔCVA| / CVA', fmt.pct(c.cvaDiff, 2), fmt.pct(c.tol, 1), passFail(c.cvaDiff < c.tol)],
-    ['CIR++ fit: max |E[Q] − Q| / Q', fmt.pct(c.survDiff, 3), '1%', passFail(c.survDiff < 0.01)],
-    ['EEPE (1y) GPU / WASM', `${fmt.compact(gp.eepe1y)} / ${fmt.compact(wp.eepe1y)}`, '', ''],
+    ['t = 0 value vs analytic: |Δ| per unit gross notional (f32)', c.t0Diff.toExponential(1), '1e-5', passFail(c.t0Pass)],
+    ['max |ΔEE| / max EE (GPU vs CPU kernels)', fmt.pct(c.eeDiff, 4), fmt.pct(c.tol, 1), passFail(c.eePass)],
+    ['|ΔCVA| / CVA (GPU vs CPU kernels)', fmt.pct(c.cvaDiff, 4), fmt.pct(c.tol, 1), passFail(c.cvaPass)],
+    ['CIR++ fit: max |E[Q] − Q| / Q', fmt.pct(c.survDiff, 3), '1%', passFail(c.survPass)],
+    ['EEPE (1y) GPU / CPU kernels', `${fmt.compact(gp.eepe1y)} / ${fmt.compact(cp.eepe1y)}`, '', ''],
   ]);
   window.__ccrLastRun = { checks: c };
-  return onCpu
-    ? `Done · CPU fused kernels ${fmt.num(r.gpuMs, 1)} ms · WASM ${fmt.num(r.wasm.elapsedMs)} ms · ${r.adapter}`
-    : `GPU ${fmt.num(r.gpuMs, 1)} ms · WASM ${fmt.num(r.wasm.elapsedMs)} ms · adapter: ${r.adapter}`;
+  return `${onCpu ? 'Done · CPU fused kernels' : 'GPU'} ${fmt.num(r.gpuMs, 1)} ms · CPU kernels ${fmt.num(r.reference.elapsedMs)} ms · ${r.adapter}`;
 });
 
 const bench = el('button', { text: 'Benchmark path scaling' });
@@ -102,19 +99,15 @@ bench.addEventListener('click', async () => {
       const spec = { ...page.spec, sim: { ...page.spec.sim, numPaths: n } };
       const g = await runOnGpu('exposure', spec);
       if (g.unsupported) throw new Error('not on GPU: ' + g.unsupported);
-      // The CPU cost is linear in the path count: measured up to 4,000 paths, extrapolated above.
-      const wasmMs = n <= 4000 ? (await run('exposure', spec)).elapsedMs : rows[rows.length - 1].wasmMs * (n / rows[rows.length - 1].n);
-      rows.push({ n, gpuMs: g.result.gpuMs, wasmMs });
+      const c = await runOnCpuKernels('exposure', spec);
+      rows.push({ n, gpuMs: g.result.gpuMs, cpuMs: c.result.gpuMs });
     }
-    const box = card(page.content, 'Throughput (paths per second)', 'WASM figures above 4,000 paths are extrapolated linearly, because CPU cost is linear in the path count.');
+    const box = card(page.content, 'Run time by path count', 'The same fused kernels on the GPU and in C++ on the CPU (single-threaded WebAssembly).');
     barChart(box, {
       labels: rows.map((x) => fmt.num(x.n) + ' paths'),
-      series: [
-        { name: 'GPU fused kernel', values: rows.map((x) => (1000 * x.n) / x.gpuMs) },
-        { name: 'WASM library', values: rows.map((x) => (1000 * x.n) / x.wasmMs) },
-      ],
+      series: [{ name: 'GPU ms', values: rows.map((x) => x.gpuMs) }, { name: 'CPU kernels ms', values: rows.map((x) => x.cpuMs) }],
     });
-    table(box, ['paths', 'GPU ms', 'WASM ms', 'speed-up'], rows.map((x) => [fmt.num(x.n), fmt.num(x.gpuMs, 1), fmt.num(x.wasmMs) + (x.n > 4000 ? ' (extrap.)' : ''), (x.wasmMs / x.gpuMs).toFixed(1) + '×']));
+    table(box, ['paths', 'GPU ms', 'CPU kernels ms'], rows.map((x) => [fmt.num(x.n), fmt.num(x.gpuMs, 1), fmt.num(x.cpuMs, 1)]));
     page.status.textContent = 'Benchmark done';
   } catch (e) {
     page.status.className = 'status error';
@@ -127,7 +120,7 @@ bench.addEventListener('click', async () => {
 run('gpuKernels', {}).then((k) => page.main.append(el('details', { class: 'spec' }, el('summary', { text: 'WGSL source of the kernels (from the C++ library)' }),
   el('h3', { text: 'fused-exposure' }), el('pre', { class: 'code', text: k.fusedExposure }),
   el('h3', { text: 'reduce-partials' }), el('pre', { class: 'code', text: k.reducePartials }),
-  el('h3', { text: 'pfe-quantile' }), el('pre', { class: 'code', text: k.pfeQuantile }))));
+  el('h3', { text: 'row statistics' }), el('pre', { class: 'code', text: k.pfeQuantile }))));
 
 // What this browser and device offer: useful when Auto falls back to WebAssembly.
 const diag = el('details', { class: 'spec', id: 'webgpu-diagnostics' }, el('summary', { text: 'WebGPU diagnostics for this device' }));

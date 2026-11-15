@@ -1,20 +1,18 @@
-// Runs a Monte Carlo analysis of the library on one of three engines:
+// Runs a Monte Carlo analysis of the library on the fused kernels, on one of two engines:
 //   WebGPU       the fused kernels on the GPU;
-//   CPU kernels  the same fused kernels on the CPU, in C++ (one call);
-//   WebAssembly  the library's ExposureEngine (path-level views).
-// Auto tries them in that order: WebGPU where the browser offers an adapter, the CPU kernels
-// where it does not, WebAssembly for what the kernels cannot run.
+//   CPU kernels  the same fused kernels in C++ on the CPU (one call).
+// Auto uses WebGPU where the browser offers an adapter and the CPU kernels where it does not.
 //
 // GPU path: gpuJobs (C++ compiles the plans) -> GpuEngine.run per plan (upload, dispatch,
-// read back) -> gpuAnalyse. CPU kernel path: cpuKernels. Both end in the same C++ analysis;
-// this file only routes calls.
+// read back) -> gpuAnalyse. CPU path: cpuKernels. Both end in the same C++ analysis; this file
+// only routes calls.
 import { run } from '../ccr-client.js';
 import { el } from '../ui.js';
 import { GpuEngine } from './engine.js';
 
 const STORAGE_KEY = 'ccr-engine';
-const MODES = { auto: 'Auto', gpu: 'WebGPU', cpu: 'CPU fused kernels', wasm: 'WebAssembly' };
-const LABELS = { gpu: 'WebGPU', cpu: 'CPU fused kernels', wasm: 'WebAssembly' };
+const MODES = { auto: 'Auto', gpu: 'WebGPU', cpu: 'CPU fused kernels' };
+const LABELS = { gpu: 'WebGPU', cpu: 'CPU fused kernels' };
 
 export function getEngineMode() {
   try { return MODES[localStorage.getItem(STORAGE_KEY)] ? localStorage.getItem(STORAGE_KEY) : 'auto'; } catch (_) { return 'auto'; }
@@ -57,31 +55,25 @@ export async function runOnCpuKernels(analysis, spec) {
   return { result: { ...result, gpuMs: result.kernelMs, adapter: `${n} thread${n === 1 ? '' : 's'}` } };
 }
 
-const outcome = (engine, result, reason) => ({ result, engine, fused: engine !== 'wasm', label: LABELS[engine], reason });
+const outcome = (engine, result, reason) => ({ result, engine, fused: true, label: LABELS[engine], reason });
 
 /**
- * Runs `analysis` (a library entry point: exposure, collateral, cva, wrongWayRisk, hedging)
- * on the engine chosen by the selector. Resolves to { result, engine, fused, label, reason }.
+ * Runs `analysis` (exposure, collateral, allocation, cva, xva, wrongWayRisk, hedging,
+ * instruments, models, amc, validation) on the engine chosen by the selector.
+ * Resolves to { result, engine, fused, label, reason }.
  */
 export async function runAnalysis(analysis, spec) {
   const mode = getEngineMode();
-  const wasm = async (reason) => outcome('wasm', await run(analysis, spec), reason);
   const cpu = async (why) => {
-    try {
-      const c = await runOnCpuKernels(analysis, spec);
-      if (c.unsupported) return wasm(c.unsupported);
-      return outcome('cpu', c.result, why);
-    } catch (e) {
-      console.warn('CPU kernels failed, falling back to WebAssembly:', e);
-      return wasm(`CPU kernels failed (${e.message}); used WebAssembly`);
-    }
+    const c = await runOnCpuKernels(analysis, spec);
+    if (c.unsupported) throw new Error(c.unsupported);
+    return outcome('cpu', c.result, why);
   };
-  if (mode === 'wasm') return wasm('WebAssembly selected');
   if (mode === 'cpu') return cpu('CPU fused kernels selected');
   if (!('gpu' in navigator)) return cpu('WebGPU is not available in this browser');
   try {
     const g = await runOnGpu(analysis, spec);
-    if (g.unsupported) return wasm(g.unsupported);
+    if (g.unsupported) throw new Error(g.unsupported);
     return outcome('gpu', g.result, mode === 'auto' ? 'Auto: WebGPU available' : 'WebGPU selected');
   } catch (e) {
     console.warn('WebGPU run failed, falling back to the CPU kernels:', e);
@@ -91,7 +83,7 @@ export async function runAnalysis(analysis, spec) {
   }
 }
 
-/** Toolbar control: Engine [Auto | WebGPU | WebAssembly]. Changing it re-runs via `onChange`. */
+/** Toolbar control: Engine [Auto | WebGPU | CPU fused kernels]. Changing it re-runs via `onChange`. */
 export function engineSelector(page, onChange) {
   const select = el('select', { 'aria-label': 'Compute engine' },
     Object.entries(MODES).map(([value, label]) => el('option', {
@@ -105,13 +97,5 @@ export function engineSelector(page, onChange) {
 
 /** One-line note for the status bar: which engine ran and why. */
 export function engineNote(r, ms) {
-  const name = r.engine === 'wasm' ? 'WebAssembly' : `${r.label} (${r.result.adapter})`;
-  return `Done in ${Math.round(ms).toLocaleString('en-US')} ms · ${name} · ${r.reason}`;
-}
-
-/** Card shown for the fused kernels listing what needs path-level data from the WASM engine. */
-export function gpuScopeNote(parent, items, label = 'WebGPU') {
-  parent.append(el('p', { class: 'note engine-note' },
-    el('b', { text: `Computed with the ${label}. ` }),
-    `The fused kernels aggregate per workgroup and never return individual paths, so ${items} are only available with the WebAssembly engine.`));
+  return `Done in ${Math.round(ms).toLocaleString('en-US')} ms · ${r.label} (${r.result.adapter}) · ${r.reason}`;
 }

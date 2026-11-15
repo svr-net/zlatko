@@ -39,13 +39,12 @@ runButton(page, 'Run', async (spec) => {
     ],
   });
 
-  const std = Array.from(r.standardGrid), lag = Array.from(r.laggedGrid);
-  const steps = (t) => t.slice(1).map((v, i) => v - t[i]);
-  lineChart(card(g, 'Exposure time grids', `Step size along the standard grid (${std.length} dates) and with the margin-call dates for a ${fmt.num(spec.csa.mpr * 250)}-day MPR added (${lag.length} dates).`), {
-    x: std.slice(1), xLabel: 't (years)', yLabel: 'Δt (years)', yFormat: (v) => v.toFixed(3),
+  const std = r.standardGrid, lag = r.laggedGrid;
+  lineChart(card(g, 'Exposure time grids', `Step size along the standard grid (${std.dates} dates) and with the margin-call dates for a ${fmt.num(r.mprDays)}-day MPR added (${lag.dates} dates).`), {
+    x: Array.from(std.times), xLabel: 't (years)', yLabel: 'Δt (years)', yFormat: (v) => v.toFixed(3),
     series: [
-      { name: 'standard grid', y: steps(std), step: true },
-      { name: 'with t − MPR dates', x: lag.slice(1), y: steps(lag), step: true, colorIndex: 1 },
+      { name: 'standard grid', y: Array.from(std.steps), step: true },
+      { name: 'with t − MPR dates', x: Array.from(lag.times), y: Array.from(lag.steps), step: true, colorIndex: 1 },
     ],
   });
 
@@ -61,7 +60,7 @@ runButton(page, 'Run', async (spec) => {
     ['true volatility', fmt.pct(b.trueVol, 4)],
     ['implied volatility', fmt.pct(b.impliedVol, 8)],
     ['function evaluations', b.evaluations],
-    ['recovered', passFail(Math.abs(b.impliedVol - b.trueVol) < 1e-10)],
+    ['recovered', passFail(b.recovered)],
   ]);
   table(misc, ['p', 'empirical quantile', 'Φ⁻¹(p)'], r.quantiles.map((q) => [q.p, q.empirical.toFixed(4), q.exact.toFixed(4)]));
 });

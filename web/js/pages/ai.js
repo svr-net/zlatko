@@ -89,12 +89,12 @@ const extra = el('div');
 page.main.append(extra);
 
 // Tool calls price XVA on the engine chosen by the selector (Auto: the fused kernels on WebGPU,
-// else on the CPU, else WebAssembly); the agent layer only sees the library's result.
+// else on the CPU); the agent layer only sees the library's result.
 let lastEngine = '';
 const engineRunner = async (fn, spec) => {
   if (fn !== 'xva') return run(fn, spec);
   const r = await runAnalysis(fn, spec);
-  lastEngine = r.engine === 'wasm' ? 'WebAssembly' : `${r.label} (${r.result.adapter})`;
+  lastEngine = `${r.label} (${r.result.adapter})`;
   return r.result;
 };
 engineSelector(page, () => {});
