@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.16)
 
 project(zlatko_ccr
-  VERSION 0.3.0
+  VERSION 0.4.0
   DESCRIPTION "Modelling, pricing and hedging counterparty credit exposure"
   LANGUAGES CXX)
 
