@@ -68,6 +68,10 @@ CVA, DVA, FCA, FBA, MVA and KVA for the default specification of the XVA page, s
 as cumulative costs over time.
 
 **Code / page.** `exposureXva`, `xva`, `Xva`, `XvaParameters`; [`web/xva.html`](../web/xva.html).
+Every adjustment is computed per netting set; [`web/portfolio.html`](../web/portfolio.html) runs the XVA (and the
+other analyses) on a book of netting sets with several counterparties on common scenarios, and adds them up by
+counterparty and for the book: CVA, DVA, FCA, FBA, MVA and KVA are all sums over netting sets, since each is an
+integral of a netting-set exposure (or initial margin) against that set's counterparty curve.
 
 **Further reading.** Burgard and Kjaer (2011, 2013); Gregory (2020, *The xVA Challenge*); Green (2015,
 *XVA: Credit, Funding and Capital Valuation Adjustments*); Brigo, Morini and Pallavicini (2013).

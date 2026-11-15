@@ -196,6 +196,21 @@ FusedPlan compile(const ExposureEngine& engine, const NettingSet& nettingSet, do
   return compile(engine, nettingSet, o);
 }
 
+TimeGrid simulationGrid(const ExposureEngine& engine, const NettingSet& nettingSet, const FusedOptions& options) {
+  TimeGrid grid = engine.simulationGrid(nettingSet);
+  // Nested initial margin: the inner paths run from every reporting date t to t + MPR, so t + MPR
+  // joins the simulation grid (its terms, step coefficients and fixings are then in the plan).
+  if (options.imInnerPaths > 0) {
+    const TimeGrid reporting = engine.reportingGrid(nettingSet);
+    std::vector<double> ahead;
+    for (double t : reporting.times())
+      if (t + options.imMarginPeriod <= grid.horizon() + 1e-10) ahead.push_back(t + options.imMarginPeriod);
+    grid = grid.merged(ahead);
+  }
+  if (!options.extraDates.empty()) grid = grid.merged(options.extraDates);
+  return grid;
+}
+
 FusedPlan compile(const ExposureEngine& engine, const NettingSet& nettingSet, const FusedOptions& options) {
   const double pfeQuantile = options.pfeQuantile;
   const std::size_t counterparty = options.counterparty;
@@ -215,20 +230,14 @@ FusedPlan compile(const ExposureEngine& engine, const NettingSet& nettingSet, co
   if (!credits.empty() && counterparty >= credits.size()) throw std::invalid_argument("counterparty index out of range");
 
   const TimeGrid reporting = engine.reportingGrid(nettingSet);
-  TimeGrid grid = engine.simulationGrid(nettingSet);
-  // Nested initial margin: the inner paths run from every reporting date t to t + MPR, so t + MPR
-  // joins the simulation grid (its terms, step coefficients and fixings are then in the plan).
   if (options.imInnerPaths > 0) {
     if (options.imInnerPaths > kMaxInnerPaths || options.imInnerPaths < 2)
       throw std::invalid_argument("nested initial margin: 2 to 1024 inner paths");
     const double rank = options.imQuantile * static_cast<double>(options.imInnerPaths - 1);
     if (static_cast<double>(options.imInnerPaths - 1) - std::floor(rank) >= static_cast<double>(kInnerTop - 1))
       throw std::invalid_argument("nested initial margin: the quantile needs more inner paths (keeps the 16 largest)");
-    std::vector<double> ahead;
-    for (double t : reporting.times())
-      if (t + options.imMarginPeriod <= grid.horizon() + 1e-10) ahead.push_back(t + options.imMarginPeriod);
-    grid = grid.merged(ahead);
   }
+  const TimeGrid grid = simulationGrid(engine, nettingSet, options);
   const std::size_t nT = grid.size();
   const HullWhite1F& hw = *gen.rateModel();
   const double a = hw.meanReversion(), sigma = hw.volatility();

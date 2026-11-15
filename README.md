@@ -63,7 +63,7 @@ npm --prefix tools/standalone ci && node tools/standalone/build.mjs
 
 ```
 dist/standalone/
-  index.html, core.html, ... xva.html      15 pages
+  index.html, core.html, ... xva.html      16 pages
   assets/app.<hash>.js                     all pages (classic script, ~85 KiB)
   assets/ccr-runtime.<hash>.js             WASM worker with embedded library (~360 KiB)
   assets/style.<hash>.css
@@ -117,6 +117,7 @@ Every Monte Carlo page runs one analysis of the library (`spec.analysis`) on the
 
 | Page | Context | Analysis / entry point |
 |---|---|---|
+| `portfolio.html` | A book of netting sets (each with its counterparty, CSA and trades on the spec's assets): build, save, load, import and export it, and run any analysis below on the whole book, by netting set and by counterparty | any of the analyses below with `scope: "book"` |
 | `core.html` | Cholesky correlation, regression, time grids, Brent, quantiles | `coreDemo` |
 | `market.html` | Yield curve, CDS pricing, hazard bootstrapping | `marketDemo` |
 | `models.html` | Hull–White, FX/equity, CIR++ fan charts and martingale tests (probe rows of the kernel) | `models` |
@@ -133,7 +134,19 @@ Every Monte Carlo page runs one analysis of the library (`spec.analysis`) on the
 | `gpu.html` | Fused WebGPU kernels validated against the same kernels in C++, with a benchmark | `validation` |
 
 The pages share one specification: market, models, correlation, portfolio, CSA and simulation settings. You edit it on any
-page, and the browser's local storage keeps it. The WASM module runs in a module worker, so long Monte Carlo runs don't block the page.
+page, and the browser's local storage keeps it.
+
+**Portfolio (book).** `spec.book = { name, nettingSets: [{ id, counterparty, csa, trades }] }` holds several netting sets; the
+active one is mirrored in `spec.trades` / `csa` / `counterparty`, so every page analyses it, and the portfolio page switches it.
+With `scope: "book"` an analysis (exposure, collateral, allocation, CVA, XVA, wrong-way risk, hedging, instruments) runs every job
+of every netting set in the fused kernels, on WebGPU as one list of plans, and aggregates in C++: per netting set, per
+counterparty and for the book. The netting sets draw **the same scenarios**: they share the reporting dates (the union of their
+event dates), the simulation dates (`gpu::FusedOptions::extraDates`, the union of every job's grid) and the seed, and each
+simulates only its own counterparty's intensity, as the last factor, so the rates, FX / equity and discount paths are pathwise
+identical across the book (the kernel keys its normals by path, date and factor index). Exposures, CVA, DVA, FVA, MVA and KVA
+add up exactly; PFE does not add and is given per netting set. A netting-set page also simulates only its counterparty, so any
+number of counterparties can be defined. The intensities of different counterparties share one driver in this set-up, which
+affects no reported quantity (CVA is unilateral per counterparty; joint defaults are not modelled). The WASM module runs in a module worker, so long Monte Carlo runs don't block the page.
 
 **Compute engine.** Every Monte Carlo page has an *Engine* selector:
 - **Auto** (the default) uses the fused **WebGPU** kernels wherever the browser offers a WebGPU adapter, on desktop and mobile alike. On Android it also tries a WebGPU compatibility-mode adapter.

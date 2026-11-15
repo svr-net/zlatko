@@ -45,13 +45,37 @@ const testSpec = { sim: { numPaths: 1000, seed: 11, antithetic: true }, imInnerP
 const gpuSpec = { sim: { numPaths: 8000, seed: 11, antithetic: true } };
 const pairSpec = { sim: { numPaths: 4000, seed: 11, antithetic: true }, imInnerPaths: 16 };
 const bermudanTrade = { type: 'bermudan', id: 'Berm 1y×4y', notional: 1e6, fixedRate: 0.035, start: 1, tenor: 4, freq: 1, direction: 'receiver', degree: 2 };
+// A book of three netting sets with two counterparties (one collateralised in a bond, one with a
+// Bermudan): the portfolio page runs an analysis on all of them on common scenarios.
+const credit = (name, s) => ({ name, recovery: 0.4, quotes: [{ maturity: 1, spread: s }, { maturity: 5, spread: 1.6 * s }, { maturity: 10, spread: 2 * s }],
+  cir: { kappa: 0.4, theta: 0.02, xi: 0.1, y0: 1.5 * s, substeps: 4 } });
+const csaOn = { enabled: true, thresholdCounterparty: 250e3, thresholdOwn: 250e3, mta: 50e3, independentAmount: 0, mpr: 10 / 250 };
+const bookSpec = (analysisSpec) => ({
+  ...analysisSpec,
+  credits: [credit('CPTY', 0.007), credit('CPTY B', 0.015)],
+  correlation: [[1, 0.2, 0, 0], [0.2, 1, 0, 0.2], [0, 0, 1, 0], [0, 0.2, 0, 1]],
+  book: { name: 'e2e book', active: 0, nettingSets: [
+    { id: 'Rates', counterparty: 'CPTY', csa: { ...csaOn, enabled: false }, trades: [
+      { type: 'swap', id: 'IRS 10y payer', notional: 10e6, fixedRate: 0.0355, start: 0, tenor: 10, freq: 2, direction: 'payer' },
+      { type: 'swap', id: 'IRS 5y receiver', notional: 6e6, fixedRate: 0.034, start: 0, tenor: 5, freq: 2, direction: 'receiver' }] },
+    { id: 'FX', counterparty: 'CPTY B', csa: { ...csaOn, collateral: 'bond', haircut: 0.02, bondMaturity: 10 }, trades: [
+      { type: 'forward', id: 'EURUSD fwd 3y', asset: 'EURUSD', notional: 5e6, strike: 1.12, maturity: 3 },
+      { type: 'option', id: 'EURUSD call 2y', asset: 'EURUSD', optionType: 'call', notional: -4e6, strike: 1.15, expiry: 2 }] },
+    { id: 'Structured', counterparty: 'CPTY B', csa: csaOn, trades: [{ ...bermudanTrade, id: 'Berm' }] }] },
+});
 // Pages with the engine selector. With no stored choice they run on Auto, which must pick the
 // WebGPU kernels on desktop too; some also run once forced onto the CPU fused kernels.
-const enginePages = ['index', 'instruments', 'amc', 'models', 'exposure', 'collateral', 'allocation', 'cva', 'xva', 'wwr', 'hedging'];
+const enginePages = ['index', 'portfolio', 'instruments', 'amc', 'models', 'exposure', 'collateral', 'allocation', 'cva', 'xva', 'wwr', 'hedging'];
 const cases = [
   ...['index', 'core', 'market', 'models', 'instruments', 'amc', 'exposure', 'collateral', 'allocation', 'cva', 'xva', 'ai', 'wwr', 'hedging']
     .map((name) => ({ name, file: name, spec: testSpec, ...(enginePages.includes(name) ? { engine: 'auto', expectEngine: 'WebGPU' } : {}) })),
   ...['index', 'collateral', 'wwr', 'models', 'amc'].map((name) => ({ name: `${name}-cpu`, file: name, spec: testSpec, engine: 'cpu', expectEngine: 'CPU fused kernels' })),
+  // The portfolio page: XVA of the book on Auto (WebGPU) and exposure on the CPU kernels; the
+  // book XVA on both engines must agree (the same kernels and random numbers in f32).
+  { name: 'portfolio', file: 'portfolio', spec: bookSpec(testSpec), engine: 'auto', expectEngine: 'WebGPU', analysis: 'xva' },
+  { name: 'portfolio-exposure-cpu', file: 'portfolio', spec: bookSpec(testSpec), engine: 'cpu', expectEngine: 'CPU fused kernels', analysis: 'exposure' },
+  ...[['gpu', 'WebGPU'], ['cpu', 'CPU fused kernels']].map(([engine, expectEngine]) => (
+    { name: `portfolio-${engine}-pair`, file: 'portfolio', spec: bookSpec(testSpec), engine, expectEngine, analysis: 'xva', pair: 'portfolio' })),
   // A first visit (nothing stored): the default is Auto, which must dispatch the fused kernels.
   { name: 'cva-first-visit', file: 'cva', spec: testSpec, expectEngine: 'WebGPU' },
   // A Bermudan is priced by American Monte Carlo inside the fused kernels: Auto stays on WebGPU.
@@ -83,7 +107,7 @@ const pairs = {};
 let failures = 0;
 console.log(`testing ${root} ${fileMode ? 'from file:// (no server)' : `over ${base}`}`);
 
-for (const { name, file, spec, engine, expectEngine, pair, device, gpuStub, expectReason } of cases.filter((c) => !filter || c.name.includes(filter))) {
+for (const { name, file, spec, engine, expectEngine, pair, device, gpuStub, expectReason, analysis } of cases.filter((c) => !filter || c.name.includes(filter))) {
   const context = await browser.newContext(device ? { ...devices[device] } : { viewport: { width: 1400, height: 1000 } });
   const page = await context.newPage();
   const errors = [];
@@ -99,13 +123,14 @@ for (const { name, file, spec, engine, expectEngine, pair, device, gpuStub, expe
       stub === 'no-adapter' || (stub === 'compat-only' ? !('featureLevel' in options) : options.powerPreference === 'high-performance')
         ? Promise.resolve(null) : original(options);
   }, gpuStub);
-  await page.addInitScript(({ spec, engine }) => {
+  await page.addInitScript(({ spec, engine, analysis }) => {
     if (!sessionStorage.getItem('seeded')) {
       localStorage.setItem('ccr-spec-v1', JSON.stringify(spec));
+      if (analysis) localStorage.setItem('ccr-portfolio-analysis', analysis);
       if (engine) localStorage.setItem('ccr-engine', engine); else localStorage.removeItem('ccr-engine');
       sessionStorage.setItem('seeded', '1');
     }
-  }, { spec, engine });
+  }, { spec, engine, analysis });
   const t0 = Date.now();
   await page.goto(fileMode ? pathToFileURL(path.join(root, `${file}.html`)).href : `${base}/${file}.html`);
   let status = '';
@@ -133,6 +158,15 @@ for (const { name, file, spec, engine, expectEngine, pair, device, gpuStub, expe
   if (expectEngine === 'CPU fused kernels' && cpuRuns === 0) problems.push('the CPU fused kernels did not run');
   if (expectEngine && expectEngine !== 'WebGPU' && gpuRuns > 0) problems.push(`${gpuRuns} WebGPU dispatches while the ${expectEngine} engine ran`);
   if (expectEngine && expectEngine !== 'CPU fused kernels' && cpuRuns > 0) problems.push(`CPU kernels ran while the ${expectEngine} engine ran`);
+  if (file === 'portfolio' && !problems.length) {
+    // The book is the sum of its netting sets.
+    const r = await page.evaluate(() => window.__ccrEngineRun);
+    if (r.analysis === 'xva') {
+      const sum = r.sets.reduce((a, x) => a + x.total, 0);
+      if (Math.abs(sum - r.total.xva.total) > 1e-6 * Math.abs(sum)) problems.push(`book XVA ${r.total.xva.total} is not the sum of the netting sets ${sum}`);
+      if (r.sets.length !== 3 || r.total.byCounterparty.length !== 2) problems.push('expected 3 netting sets and 2 counterparties');
+    }
+  }
   if (pair) pairs[pair] = { ...(pairs[pair] || {}), [engine]: await page.evaluate(() => window.__ccrEngineRun) };
   if (device) {
     const layout = await page.evaluate(() => ({
@@ -174,6 +208,7 @@ for (const { name, file, spec, engine, expectEngine, pair, device, gpuStub, expe
 const metrics = {
   exposure: [['EEPE 1y', (r) => r.eepe1y]],
   amc: [['EEPE 1y', (r) => r.eepe1y]],
+  portfolio: [['book XVA', (r) => r.total.xva.total], ['book MVA', (r) => r.total.xva.mva], ['netting set FX CVA', (r) => r.sets[1].cva]],
   cva: [['CVA', (r) => r.cva]],
   xva: [['total XVA', (r) => r.total], ['CVA', (r) => r.cva], ['MVA', (r) => r.mva], ['KVA', (r) => r.kva]],
   allocation: [['CVA', (r) => r.totalCva], ['Σ marginal CVA', (r) => r.marginalSum]],

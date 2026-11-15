@@ -13,6 +13,7 @@ const page = initPage({
 });
 
 const DESCRIPTIONS = {
+  portfolio: 'A book of netting sets, each with its counterparty, CSA and trades: every analysis on the whole book on common scenarios, by netting set and counterparty.',
   core: 'Cholesky correlation, seeded normals, least-squares regression, exposure time grids, Brent root finding, quantiles.',
   market: 'Yield-curve interpolation and forwards, CDS pricing and hazard-rate bootstrapping.',
   models: 'Hull–White rates with exact numeraire, log-normal FX/equity, CIR++ intensity. Fan charts and martingale tests.',
@@ -31,8 +32,8 @@ const DESCRIPTIONS = {
 
 const map = card(page.main, 'Contexts', 'Each page maps onto one part of the library and one topic of the book.');
 const g = el('div', { class: 'grid' });
-for (const group of PAGES.slice(1))
-  for (const p of group.items)
+for (const group of PAGES)
+  for (const p of group.items.filter((x) => x.id !== 'index'))
     g.append(el('a', { href: p.href, class: 'tile', style: 'text-decoration:none;color:inherit' },
       el('div', { class: 'label', text: group.group }), el('div', { style: 'font-weight:650;font-size:15px', text: p.title }),
       el('div', { class: 'hint', text: DESCRIPTIONS[p.id] })));
