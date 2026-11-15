@@ -4,7 +4,9 @@
 import createCcrModule from '../wasm/ccr.js';
 import { defaultSpec, defaultBermudan } from '../js/spec.js';
 
-const ccr = await createCcrModule();
+const mod = await createCcrModule();
+// Every library entry point goes through ccr::app::call(name, spec).
+const ccr = new Proxy({}, { get: (_, name) => (spec = {}) => mod.call(String(name), spec) });
 let failures = 0;
 const check = (cond, msg) => { if (!cond) { failures++; console.log('  FAIL', msg); } };
 const near = (a, b, tol, msg) => check(Math.abs(a - b) <= tol, `${msg}: ${a} vs ${b} (tol ${tol})`);
@@ -69,8 +71,9 @@ if (jobs) {
   const p = jobs.plans[0];
   check(p.header instanceof Uint32Array && p.params instanceof Float32Array && p.header[1] === p.numDates, 'plan buffers');
 }
-const berm = ccr.gpuJobs({ ...spec, analysis: 'exposure', trades: [{ type: 'bermudan', id: 'B', ...defaultBermudan() }] });
-check(typeof berm.unsupported === 'string', 'Bermudan reported as unsupported on the GPU');
+const bermSpec = { ...spec, sim: { ...spec.sim, numPaths: 4000 }, trades: [...(spec.trades || []), { type: 'bermudan', id: 'B', ...defaultBermudan() }] };
+const berm = ccr.gpuJobs({ ...bermSpec, analysis: 'exposure' });
+check(!berm.unsupported && berm.plans.length === 1, 'Bermudan compiled for the GPU (AMC in the kernel)');
 const pathTol = 4 / Math.sqrt(4000);
 const pairSpec = { ...spec, sim: { ...spec.sim, numPaths: 4000 } };
 const emuCva = run('cpuKernels cva', () => ccr.cpuKernels({ ...pairSpec, analysis: 'cva' }));
@@ -111,11 +114,12 @@ if (emuAlloc) {
     near(t.standaloneCva, c.standaloneCva, pathTol * Math.max(scale, c.standaloneCva), `${t.id} standalone CVA vs CPU`);
   });
 }
-// CPU fused-kernel backend: one call; a Bermudan is reported as unsupported (falls back to WASM).
+// CPU fused-kernel backend: one call, Bermudans included (AMC inside the kernels).
 const one = ccr.cpuKernels({ ...pairSpec, analysis: 'cva' });
 check(one.threads === 1 && one.kernelMs > 0 && one.cva === emuCva.cva, 'cpuKernels: one thread in WebAssembly, deterministic');
-check(typeof ccr.cpuKernels({ ...spec, analysis: 'exposure', trades: [{ type: 'bermudan', id: 'B', ...defaultBermudan() }] }).unsupported === 'string',
-  'CPU kernels report a Bermudan as unsupported');
+const bermFused = run('cpuKernels exposure + Bermudan (AMC)', () => ccr.cpuKernels({ ...bermSpec, analysis: 'exposure' }));
+const bermCpu = ccr.exposure(bermSpec);
+if (bermFused) near(bermFused.profile.eepe1y, bermCpu.profile.eepe1y, 4 / Math.sqrt(4000) * bermCpu.profile.eepe1y, 'AMC in the kernels: EEPE vs ExposureEngine');
 // gpuAnalyse with read-backs from the emulated kernels' shape: wrong sizes are rejected.
 const badOut = ccr.gpuAnalyse({ ...spec, analysis: 'exposure', gpuOutputs: [{ sums: new Float32Array(3), pfe: new Float32Array(1) }] });
 check(typeof badOut.error === 'string', 'gpuAnalyse rejects read-backs that do not match the plan');

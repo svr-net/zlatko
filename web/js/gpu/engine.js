@@ -2,7 +2,7 @@
 //
 // No numerics live here. The library supplies the WGSL sources (gpuKernels) and, for every
 // job, a plan with ready-made buffers, dispatch sizes and buffer sizes (gpuJobs). This class
-// uploads the buffers, dispatches fused-exposure -> reduce-partials -> pfe-quantile and reads
+// uploads the buffers, dispatches fused-exposure -> reduce-partials -> row-statistics and reads
 // back two arrays, which go back to the library (gpuAnalyse) for all post-processing.
 
 // Adapter requests, in order. Some mobile drivers (seen on Android) return no adapter for a
@@ -18,12 +18,12 @@ const ADAPTER_OPTIONS = [
 ];
 
 // What the fused kernels need beyond the compatibility-mode defaults: 7 storage buffers in the
-// fused kernel, 256-invocation workgroups in pfe-quantile and its 12 KiB histogram (+ scalars).
+// fused kernel, 256-invocation workgroups in the row-statistics kernel and its 12 KiB histogram (+ 1 KiB sums).
 const KERNEL_LIMITS = {
   maxStorageBuffersPerShaderStage: 7,
   maxComputeInvocationsPerWorkgroup: 256,
   maxComputeWorkgroupSizeX: 256,
-  maxComputeWorkgroupStorageSize: 12352,
+  maxComputeWorkgroupStorageSize: 13440,
 };
 
 /** The kernel limits this adapter cannot meet, e.g. ["maxStorageBuffersPerShaderStage 4 < 7"]. */
@@ -118,10 +118,10 @@ export class GpuEngine {
       if (errors.length) throw new Error(`${label}: ${errors.map((e) => `${e.lineNum}:${e.linePos} ${e.message}`).join('; ')}`);
       return this.device.createComputePipelineAsync({ layout: 'auto', compute: { module, entryPoint: 'main' }, label });
     };
-    [this.fused, this.reduce, this.pfe] = await Promise.all([
+    [this.fused, this.reduce, this.stats] = await Promise.all([
       make(kernels.fusedExposure, 'fused-exposure'),
       make(kernels.reducePartials, 'reduce-partials'),
-      make(kernels.pfeQuantile, 'pfe-quantile'),
+      make(kernels.pfeQuantile, 'row-statistics'),
     ]);
     // The per-trade variant (XVA and allocation plans) is compiled on first use.
     this.fusedTrades = null;
@@ -135,7 +135,7 @@ export class GpuEngine {
     return buf;
   }
 
-  /** Runs one plan from gpuJobs. Resolves to { sums, pfe, gpuMs }. */
+  /** Runs one plan from gpuJobs. Resolves to { sums, values, gpuMs }. */
   async run(plan) {
     const d = this.device;
     const { bytes, dispatch } = plan;
@@ -155,9 +155,10 @@ export class GpuEngine {
       expo: scratch(bytes.expo ?? bytes.cube, S, 'expo'),  // positive exposure on the reporting dates
       partials: scratch(bytes.partials, S, 'partials'),
       sums: scratch(bytes.sums, S | GPUBufferUsage.COPY_SRC, 'sums'),
-      pfe: scratch(bytes.pfe, S | GPUBufferUsage.COPY_SRC, 'pfe'),
+      requests: this.upload(plan.requests, S, 'requests'),
+      values: scratch(bytes.values, S | GPUBufferUsage.COPY_SRC, 'values'),
       readSums: scratch(bytes.sums, GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST, 'read-sums'),
-      readPfe: scratch(bytes.pfe, GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST, 'read-pfe'),
+      readValues: scratch(bytes.values, GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST, 'read-values'),
     };
     const group = (pipeline, entries) => d.createBindGroup({
       layout: pipeline.getBindGroupLayout(0),
@@ -176,21 +177,21 @@ export class GpuEngine {
     pass.setPipeline(this.reduce);
     pass.setBindGroup(0, group(this.reduce, [bufs.header, bufs.partials, bufs.sums]));
     pass.dispatchWorkgroups(dispatch.reduce);
-    pass.setPipeline(this.pfe);
-    pass.setBindGroup(0, group(this.pfe, [bufs.header, bufs.expo, bufs.pfe]));
-    pass.dispatchWorkgroups(dispatch.pfe);
+    pass.setPipeline(this.stats);
+    pass.setBindGroup(0, group(this.stats, [bufs.header, bufs.expo, bufs.requests, bufs.values]));
+    pass.dispatchWorkgroups(dispatch.stats);
     pass.end();
     enc.copyBufferToBuffer(bufs.sums, 0, bufs.readSums, 0, bytes.sums);
-    enc.copyBufferToBuffer(bufs.pfe, 0, bufs.readPfe, 0, bytes.pfe);
+    enc.copyBufferToBuffer(bufs.values, 0, bufs.readValues, 0, bytes.values);
     d.queue.submit([enc.finish()]);
     globalThis.__ccrGpuRuns = (globalThis.__ccrGpuRuns || 0) + 1; // fused pipelines submitted (checked by the e2e test)
-    await Promise.all([bufs.readSums.mapAsync(GPUMapMode.READ), bufs.readPfe.mapAsync(GPUMapMode.READ)]);
+    await Promise.all([bufs.readSums.mapAsync(GPUMapMode.READ), bufs.readValues.mapAsync(GPUMapMode.READ)]);
     const gpuMs = performance.now() - t0;
     const oom = await d.popErrorScope();
     const validation = await d.popErrorScope();
     const out = validation || oom ? null : {
       sums: new Float32Array(bufs.readSums.getMappedRange().slice(0)),
-      pfe: new Float32Array(bufs.readPfe.getMappedRange().slice(0)),
+      values: new Float32Array(bufs.readValues.getMappedRange().slice(0)),
       gpuMs,
     };
     for (const b of Object.values(bufs)) b.destroy();

@@ -13,7 +13,7 @@ const page = initPage({
     'the bond terms <code>A·e<sup>−Bx</sup></code> for each date, fixing records, option terms and the margin-call look-back. A single WebGPU compute kernel, also part of the library, then ' +
     '<b>simulates, prices, nets, collateralises and aggregates</b> every path in one pass, without ever storing a scenario cube. ' +
     'The browser only uploads the tables, dispatches the kernels and hands the read-back to the library, which builds the profile, CVA and the checks below against its own CPU Monte Carlo run. ' +
-    'The GPU works in 32-bit floats with a different random number generator, so the two agree within Monte Carlo error, not to the last digit. Bermudan swaptions need AMC regression, so they stay on the WASM side.',
+    'The GPU works in 32-bit floats with a different random number generator, so the two agree within Monte Carlo error, not to the last digit. Bermudan swaptions are priced by American Monte Carlo inside the kernel: its regressions are fitted on a first pass of the same kernel.',
 });
 specEditor(page, ['market', 'assets', 'credit', 'correlation', 'simulation', 'csa', 'portfolio']);
 
