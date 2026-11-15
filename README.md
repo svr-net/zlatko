@@ -195,7 +195,7 @@ node web/tests/e2e.mjs                   # every page in headless Chromium (Play
 ## Proposed extension chapters: XVA
 
 The book stops at CVA/DVA, wrong-way risk and hedging. [`docs/xva_chapters.md`](docs/xva_chapters.md)
-proposes eight chapters that extend it, in the same style (definition, formula, discretisation on the
+proposes nine chapters that extend it, in the same style (definition, formula, discretisation on the
 exposure grid, Monte Carlo estimator, worked example, code and page), to cover everything implemented
 in `xva/xva.hpp`, `hedging/sensitivities.hpp` and [`web/xva.html`](web/xva.html):
 
@@ -208,7 +208,8 @@ in `xva/xva.hpp`, `hedging/sensitivities.hpp` and [`web/xva.html`](web/xva.html)
 | X5. XVA allocation to trades | Exact Euler allocation of CVA, FCA, KVA; incremental XVA | `allocateExposureXva`, [allocation](web/allocation.html) |
 | X6. XVA sensitivities and hedging | Bucketed CS01, CDS hedge notionals, own-credit paradox, common random numbers | [hedging](web/hedging.html) |
 | X7. Numerical practice | Monte Carlo error, grid, regression, validation checks, engines | [gpu](web/gpu.html) |
-| X8. Beyond this implementation | Collateralised funding, SA-CCR capital, stochastic spreads, conditional IM, AAD | open |
+| X8. Nested Monte Carlo in XVA | Inner/outer simulation, bias and the `B^{-2/3}` convergence, bias reduction, regression versus nesting, conditional initial margin, dual bounds, design | not implemented; builds on `core/regression.hpp`, [amc](web/amc.html) |
+| X9. Beyond this implementation | Collateralised funding, SA-CCR capital, stochastic spreads, conditional IM, AAD | open |
 
 ## Conventions
 

@@ -1,7 +1,7 @@
 # Proposed extension chapters: XVA
 
 *Modelling, Pricing, and Hedging Counterparty Credit Exposure* ends with CVA/DVA, wrong-way risk and
-hedging of credit risk. The eight chapters below extend it in the same style: a definition, the
+hedging of credit risk. The nine chapters below extend it in the same style: a definition, the
 continuous-time formula, the discretisation on the exposure grid, the Monte Carlo estimator, a worked
 example, and the pointer to the code (`include/ccr/xva/xva.hpp`, `include/ccr/hedging/sensitivities.hpp`)
 and to the page of the web front end that reproduces it. The chapters are not numbered against the book.
@@ -353,7 +353,168 @@ Schwartz (2001); Joshi (2008) on pricing and the Greeks.
 
 ---
 
-## X8. Beyond this implementation (outlook)
+## X8. Nested Monte Carlo in XVA modelling
+
+**Motivation.** Every XVA term of the previous chapters needs the value `V(t)` of the netting set at each
+future date and scenario. For the trades of the book (swaps, forwards, European options) `V(t)` is
+analytic given the state, so one simulation suffices (*simple* Monte Carlo). When it is not (Bermudan and
+barrier products, path-dependent payoffs, CVA on a CVA, conditional initial margin, XVA as the
+underlying of a hedge or of a capital calculation) the value is itself a conditional expectation and has
+to be estimated by simulation: *nested* (or "Monte Carlo on Monte Carlo") simulation.
+
+**Structure.** An *outer* simulation of `N_o` paths of the risk factors from `0` to the grid dates `t_k`
+produces the scenarios `ω`. At each `(t_k, ω)` an *inner* simulation of `N_i` paths started from the
+state `X(t_k, ω)` estimates
+
+```
+V(t_k, ω) = E[ Σ_{t_j > t_k} D(t_k, t_j) CF_j | F_{t_k} ](ω)  ≈  (1/N_i) Σ_{m=1}^{N_i} Σ_j D^m(t_k, t_j) CF_j^m
+```
+
+and the outer expectation is then taken of a (usually non-linear) function `g` of the inner estimate:
+
+```
+Y = E[ g( V(t_k) ) ]  ≈  (1/N_o) Σ_{n=1}^{N_o} g( V̂_{N_i}(t_k, ω_n) )
+```
+
+with `g(v) = D(0,t_k) v⁺` for EE*, `g(v) = D(0,t_k) v⁻` for ENE*, and the quantile for IM and PFE. The
+cost is `N_o · N_i · K` paths times the number of steps: with `N_o = 10⁴`, `N_i = 10³` and a grid of
+`K = 100` dates this is `10⁹` inner paths.
+
+**The bias of the nested estimator.** Because `g` is convex or non-smooth (`v⁺` has a kink at 0), the
+estimator is biased even when the inner estimate is unbiased. With `V̂ = V + ε`, `E[ε | V] = 0`,
+`Var(ε | V) = σ²(V)/N_i`, a second-order expansion gives
+
+```
+E[ g(V̂) ] − E[ g(V) ] ≈ ½ E[ g''(V) σ²(V) ] / N_i
+```
+
+and for `g(v) = v⁺`, `g'' = δ(v)`, hence the bias `≈ ½ f_V(0) σ²(0) / N_i`, with `f_V` the density of `V` at
+zero. The bias is `O(1/N_i)`, positive for convex `g` (the exposure is *overestimated*, since
+`E[(V+ε)⁺] ≥ (E[V+ε])⁺`), and largest where the exposure is near zero: at-the-money, at early dates and for
+netted books. The variance of the outer estimate is `O(1/N_o)`, so the mean-squared error is
+
+```
+MSE ≈ c₁ / N_i²  +  c₂ / N_o      with budget  N_o N_i = B
+```
+
+and is minimised at `N_i ∝ B^{1/3}` and `N_o ∝ B^{2/3}`, giving the *optimal convergence* `MSE ∝ B^{−2/3}`,
+i.e. root-MSE `O(B^{−1/3})`: slower than the `B^{−1/2}` of simple Monte Carlo (Gordy and Juneja 2010,
+"Nested simulation in portfolio risk measurement"). For a quantile (PFE, IM) the same rate holds under
+smoothness conditions on the density.
+
+**Bias reduction.**
+
+1. *Richardson or jackknife.* Combine estimates with `N_i` and `N_i/2` inner paths (or with halves of the
+   same sample): `2 g(V̂_{N_i}) − ½[g(V̂_a) + g(V̂_b)]` removes the `1/N_i` term and gives rate `B^{−4/5}`
+   (Giles and Haji-Ali 2019, multilevel nested simulation).
+2. *Common random numbers across outer scenarios.* The same inner normals (and antithetics) at every outer
+   point make the inner errors smooth in the state, which helps the regression-based and the
+   differentiated estimators below.
+3. *Control variates.* Use a product with an analytic value (the swap, the Jamshidian swaption of the
+   Hull–White chapter) as a control for the inner estimate of a Bermudan: the error of `V̂` is the error
+   of the *difference* only. The exact martingale property `E[D(0,t)V(t)] = V(0)` checks the sum.
+4. *Variance-reducing inner design.* Antithetic variates, stratified or quasi-random inner draws, and the
+   exact joint transition of `(x, ∫r)` of the Hull–White model keep the inner discretisation bias at zero.
+5. *Smoothing `g`.* Replace the kink by a smooth approximation of the positive part over a width
+   `h ∼ N_i^{−1/2}`; this trades a small bias in `h` for a large reduction in the inner-noise bias.
+
+**Regression instead of inner paths (least-squares Monte Carlo).** The cheapest "nesting" is none: the
+Longstaff–Schwartz regression of the AMC chapter estimates `V(t_k)` from the *outer* cross-section by
+projecting the discounted future cash flows onto basis functions `φ_l(X(t_k))`:
+
+```
+V̂(t_k, ω) = Σ_l β_l φ_l(X(t_k, ω)),     β = argmin Σ_n ( Y_n − Σ_l β_l φ_l(X_n) )²
+```
+
+With `N_o` paths and `L` basis functions the regression noise is `O(L/N_o)` and the basis bias is the
+projection error, so one simulation costs `N_o` paths (not `N_o N_i`), which is why the library
+(`core/regression.hpp`, `instruments/bermudan_swaption.hpp`) uses it. Its limits are the choice of the
+basis (completeness in a multi-factor state), the out-of-sample bias at the tail where PFE and IM live,
+and the cost of `K` regressions. The regression estimate of `V` is *smooth*, which also removes the
+kink-bias of the nested estimator at the price of a basis bias: the two are compared in the examples
+below. Hybrid schemes (a small inner simulation to compute the regression targets, as in *nested
+regression*, Broadie, Du and Moallemi 2015) get the robustness of the first at a cost close to the second.
+
+**Where nesting is genuinely needed in XVA.**
+
+- *Initial margin.* IM at `(t_k, ω)` is the quantile of the value change over the MPOR *conditional on the
+  state*: a quantile of the inner distribution, with `N_i` inner paths of length `MPOR` from each outer
+  point. The unconditional proxy of X3 replaces this nest by a quantile across the *outer* paths. The
+  conditional version makes MVA dependent on the current volatility and on the netting-set state, and
+  introduces a `1/√N_i` bias in the quantile (estimated by the order statistic) that can be reduced by the
+  Harrell–Davis or kernel quantile estimators.
+- *Exercise boundary of the exotics.* Regression gives a sub-optimal policy and therefore a low-biased
+  price. A nested inner simulation at the boundary evaluates the *continuation value* without the
+  regression bias (the upper bound of Andersen and Broadie 2004, the dual method), so the pair
+  lower/upper bounds brackets the true exposure.
+- *Wrong-way and right-way risk through default.* The inner simulation conditions on survival and on the
+  default of the counterparty at `t_k`, giving `V(t_k)` *given the default*; the close-out value
+  (the replacement cost of ISDA) then differs from the risk-free `V`, and the CVA of the book is a nest
+  of the close-out valuation at the default time (Brigo and Morini 2011, "Close-out convention
+  tensions"; Burgard and Kjaer).
+- *Capital and CVA of CVA.* KVA of a *hedged* CVA book needs the regulatory capital at `t_k`, which
+  is itself a function of the exposure simulated from `t_k`: the capital is a nested expectation
+  (the SA-CCR and the CVA capital formulas are evaluated on the inner exposure), the inner step
+  the exposure and the outer step the KVA integral.
+- *Forward-looking sensitivities.* The hedge ratios to be held at `t_k` (the "future CS01", needed
+  for the cost of hedging and for the MVA of the hedges) are inner derivatives at each outer node. With
+  a nest the differences need CRN and a pathwise or likelihood-ratio inner estimator (X6) to remain
+  stable.
+- *Model risk and the XVA of the XVA.* The valuation of the adjustment at `t_k` as an asset to be sold
+  (the *fair value* of the XVA, for the P&L explain and for the IFRS 13 measurement).
+
+**Computational design.**
+
+- *Allocation of the budget.* The rate `B^{−2/3}` above gives `N_i ∼ (c₁/c₂)^{1/3} B^{1/3}`: for a budget of
+  `10⁹` paths, `N_i` of order `10²` and `N_o` of order `10⁷`. In practice `N_i` is *small* (`10`–`100`) and
+  the bias is removed by (1) or (5).
+- *Adaptive nesting.* Outer scenarios far from the kink (deep in or out of the money) need few inner
+  paths. Allocate `N_i(ω) ∝ σ(V(ω))/|V(ω)|` or use sequential stopping on the standard error of the inner
+  estimate (Broadie, Du and Moallemi 2011, "Efficient risk estimation via nested sequential simulation").
+- *Re-use of the outer paths.* The inner simulation from `t_k` can re-use the outer paths from `t_k`
+  onward as the "inner" ones (a *kernel* or *one-sided* estimator): the inner estimate of the node `ω` is the
+  average of the outer continuation over the neighbours of `X(t_k, ω)`. This is the regression with a
+  local basis; it avoids the cube cost and the bias is the neighbourhood size.
+- *Parallelism and GPU.* The inner simulations are independent given the outer state: `N_o` independent
+  tasks, fused on a GPU with the structure of the WebGPU kernel of the GPU chapter (one thread per
+  outer path and inner replications in the thread loop; partial-sum reductions), and over Web Workers on
+  the CPU. Memory is the constraint: the nest must not store the cube `N_o × N_i × K`, but accumulate
+  `g(V̂)` online per outer node.
+- *Reproducibility.* Counter-based seeds of the form `(outer path, date, inner index)` make the nest
+  reproducible and independent of the work partition, and give the CRN of (2) at no cost.
+
+**Validation.**
+
+1. *Convergence study in `N_i`* at fixed large `N_o`: the exposure decreases as `1/N_i` towards the limit;
+   a log-log plot has slope `−1` and the Richardson extrapolate is flat.
+2. *Analytic benchmark*: a swap or a European option, for which `V(t)` is known, run through the nest
+   and compared with the analytic EE*, to measure the bias term by term.
+3. *Martingale test* on the discounted inner estimate, and the equality of the nested EE of a swap with
+   the regression one at large sample.
+4. *Dual bound check* for a Bermudan swaption: lower (regression policy) `≤` price `≤` upper (nested dual).
+
+**Worked example.** EE*, `EE` bias against `N_i` for an at-the-money 5y swap on a Hull–White model:
+nested estimator, with Richardson correction, against the regression estimate and the analytic value; the
+MSE for fixed budget `B` as `N_i` varies, with the minimum at `N_i ∼ B^{1/3}`; and the conditional IM
+profile against the unconditional proxy of X3, with the corresponding MVA.
+
+**Code / page.** Not implemented. The building blocks are present: simulation of the state (`ScenarioGenerator`),
+regression estimation of `V(t)` (`core/regression.hpp`, [`web/amc.html`](../web/amc.html)), the unconditional IM proxy
+(`initialMarginProfile`), and the fused kernels ([`web/gpu.html`](../web/gpu.html)). A nested engine would
+add an inner-simulation step per outer node on top of these.
+
+**Further reading.** Gordy and Juneja (2010) "Nested simulation in portfolio risk measurement",
+*Management Science* 56(10); Broadie, Du and Moallemi (2011) "Efficient risk estimation via nested
+sequential simulation", *Management Science* 57(6); Broadie, Du and Moallemi (2015) "Risk estimation via
+regression", *Operations Research* 63(5); Giles and Haji-Ali (2019) "Multilevel nested simulation for
+efficient risk estimation", *SIAM/ASA J. Uncertain. Quantif.* 7(2); Andersen and Broadie (2004)
+"Primal-dual simulation algorithm for pricing multidimensional American options", *Management Science*
+50(9); Lee (1998) *Monte Carlo methods for nested expectations* (PhD thesis); Brigo and Morini (2011)
+"Close-out convention tensions", *Risk*, December; Longstaff and Schwartz (2001).
+
+---
+
+## X9. Beyond this implementation (outlook)
 
 No code or web page exists yet for these topics; they are research directions that follow from the
 simplifications made above.
@@ -389,14 +550,19 @@ simplifications made above.
 ## References
 
 - Andersen, L., Duffie, D., Song, Y. (2019). Funding value adjustments. *Journal of Finance* 74(1).
+- Andersen, L., Broadie, M. (2004). Primal-dual simulation algorithm for pricing multidimensional American options. *Management Science* 50(9).
 - Andersen, L., Pykhtin, M., Sokol, A. (2017). Rethinking the margin period of risk. *Journal of Credit Risk* 13(1).
 - Brigo, D., Mercurio, F. (2006). *Interest Rate Models: Theory and Practice*. Springer.
 - Brigo, D., Morini, M., Pallavicini, A. (2013). *Counterparty Credit Risk, Collateral and Funding*. Wiley.
+- Broadie, M., Du, Y., Moallemi, C. (2011). Efficient risk estimation via nested sequential simulation. *Management Science* 57(6); (2015) Risk estimation via regression. *Operations Research* 63(5).
+- Brigo, D., Morini, M. (2011). Close-out convention tensions. *Risk*, December.
 - Burgard, C., Kjaer, M. (2011). In the balance. *Risk*, October; (2013) Funding strategies, funding costs. *Risk*, December.
 - Capriotti, L., Giles, M. (2012). Algorithmic differentiation: adjoint Greeks made easy. *Risk*, September.
 - Caspers, P., Giltinan, P., Lichters, R., Mazzoni, N. (2017). Forecasting initial margin requirements – a model evaluation. *Journal of Financial Risk Management*.
 - Fujii, M., Shimada, Y., Takahashi, A. (2010). A note on construction of multiple swap curves with and without collateral. CARF working paper.
+- Giles, M., Haji-Ali, A.-L. (2019). Multilevel nested simulation for efficient risk estimation. *SIAM/ASA Journal on Uncertainty Quantification* 7(2).
 - Glasserman, P. (2004). *Monte Carlo Methods in Financial Engineering*. Springer.
+- Gordy, M., Juneja, S. (2010). Nested simulation in portfolio risk measurement. *Management Science* 56(10).
 - Green, A. (2015). *XVA: Credit, Funding and Capital Valuation Adjustments*. Wiley.
 - Green, A., Kenyon, C., Dennis, C. (2014). KVA: capital valuation adjustment. *Risk*, December.
 - Gregory, J. (2020). *The xVA Challenge*, 4th ed. Wiley.
