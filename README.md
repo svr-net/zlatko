@@ -113,40 +113,43 @@ python3 -m http.server -d web 8000      # any static server; file:// will not lo
 # open http://localhost:8000
 ```
 
-| Page | Context | Entry point |
+Every Monte Carlo page runs one analysis of the library (`spec.analysis`) on the fused kernels:
+
+| Page | Context | Analysis / entry point |
 |---|---|---|
 | `core.html` | Cholesky correlation, regression, time grids, Brent, quantiles | `coreDemo` |
 | `market.html` | Yield curve, CDS pricing, hazard bootstrapping | `marketDemo` |
-| `models.html` | Hull–White, FX/equity, CIR++ fan charts and martingale tests | `simulate` |
-| `instruments.html` | Swaps, forwards, options, Bermudans on scenarios | `priceTrades` |
-| `amc.html` | Longstaff–Schwartz policy, physical vs cash exposure | `amc` |
-| `exposure.html` | EE/ENE/PFE/EPE/EEPE, netting benefit, distribution | `exposure` |
+| `models.html` | Hull–White, FX/equity, CIR++ fan charts and martingale tests (probe rows of the kernel) | `models` |
+| `instruments.html` | Swaps, forwards, options, Bermudans on scenarios, against their analytic prices | `instruments` |
+| `amc.html` | Longstaff–Schwartz policy inside the kernel, physical vs cash exposure | `amc` |
+| `exposure.html` | EE/ENE/PFE/EPE/EEPE, sample paths, netting benefit, per-trade profiles, distribution | `exposure` |
 | `collateral.html` | Thresholds, MTA, independent amount, margin period of risk | `collateral` |
 | `allocation.html` | Marginal (Euler), incremental and standalone CVA | `allocation` |
 | `cva.html` | Unilateral/bilateral CVA, term structure, running spread | `cva` |
 | `wwr.html` | Pathwise CVA against exposure–intensity correlation | `wrongWayRisk` |
 | `xva.html` | CVA, DVA, FVA, MVA and KVA with cumulative profiles, sweeps, allocation and sensitivities | `xva` |
 | `hedging.html` | CS01 buckets, CDS hedge, CRN vs independent-seed deltas, XVA credit and funding sensitivities | `hedging` |
-| `ai.html` | Surrogate XVA (ridge, MLP) back tested against the native engine, and a provider-neutral LLM agent skill (OpenAI, Anthropic, Gemini, MCP) with a tool harness | `xva` (spot-check) · dataset from `xva_ai_dataset` |
-| `gpu.html` | Fused WebGPU kernels validated against WASM, with a benchmark | `gpuJobs` · `gpuAnalyse` (`validation`) |
+| `ai.html` | Surrogate XVA (ridge, MLP) fitted and back tested in C++, and a provider-neutral LLM agent skill (OpenAI, Anthropic, Gemini, MCP) whose tools call `xva` / `xvaCompare` | `surrogateBacktest` · dataset from `xva_ai_dataset` |
+| `gpu.html` | Fused WebGPU kernels validated against the same kernels in C++, with a benchmark | `validation` |
 
 The pages share one specification: market, models, correlation, portfolio, CSA and simulation settings. You edit it on any
 page, and the browser's local storage keeps it. The WASM module runs in a module worker, so long Monte Carlo runs don't block the page.
 
-**Compute engine.** The Overview, Exposure, Collateral, Allocation, CVA/DVA, XVA, Wrong-way risk, CVA hedging and AI (agent tools) pages have an *Engine* selector:
+**Compute engine.** Every Monte Carlo page has an *Engine* selector:
 - **Auto** (the default) uses the fused **WebGPU** kernels wherever the browser offers a WebGPU adapter, on desktop and mobile alike. On Android it also tries a WebGPU compatibility-mode adapter.
-- Where there is no adapter, for example where Chrome blocks WebGPU for the GPU or driver, Auto runs the **same fused kernels on the CPU**: one call into C++ (`cpuKernels`), which compiles, runs and analyses them in the worker's WebAssembly instance. The result agrees with WebGPU to about 0.004%, and the kernels are several times faster than `ExposureEngine` even on one thread (the WebAssembly build is single-threaded, so the standalone zip still opens from `file://`).
-- Bermudan swaptions run on the fused kernels too: American Monte Carlo is inside the kernel (see below). Failures fall back to **WebAssembly** (the library's `ExposureEngine`).
-- **WebGPU**, **CPU fused kernels** or **WebAssembly** forces one engine. The status line names the engine that ran and why. Views that need individual paths (sample paths, the netting benefit, per-trade profiles, the exposure histogram) are WebAssembly-only.
-- On the WebGPU page, a device without WebGPU validates the CPU fused kernels against WebAssembly instead.
+- Where there is no adapter, for example where Chrome blocks WebGPU for the GPU or driver, Auto runs the **same fused kernels on the CPU**: one call into C++ (`cpuKernels`), which compiles, runs and analyses them in the worker's WebAssembly instance. The result agrees with WebGPU to about 0.005% (the same algorithm and random numbers in f32). The WebAssembly build is single-threaded, so the standalone zip still opens from `file://`; natively the CPU kernels run on every core.
+- **WebGPU** or **CPU fused kernels** forces one engine. The status line names the engine that ran and why.
+- `ExposureEngine` (double precision, its own random numbers) is not part of the front end: it is the native reference the unit tests check the kernels against.
 
-**All numerics are in C++.** The analyses live in the library (`src/app/analyses.cpp`, on the JSON-like `ccr::app::Value`), so they build and test natively; the WebAssembly binding (`wasm/bindings.cpp`, about 100 lines) only converts values and exposes `call(name, spec)`. Each Monte Carlo analysis (`exposure`, `collateral`, `allocation`, `cva`, `xva`, `wrongWayRisk`, `hedging`) is defined once in `wasm/bindings.cpp` as a list of exposure jobs (for example the base run, every bumped run and the rate shifts of the hedging analysis) and a combine step. On WebAssembly each job runs on `ExposureEngine`. On WebGPU:
+**All numerics are in C++, on the fused kernels.** The analyses live in the library (`src/app/analyses.cpp`, on the JSON-like `ccr::app::Value`), so they build and test natively; the WebAssembly binding (`wasm/bindings.cpp`, about 100 lines) only converts values and exposes `call(name, spec)`. Each Monte Carlo analysis is a list of jobs (one netting set under one model set-up each, with the views it needs from the kernels: `gpu::FusedOptions`) and a combine step, which also computes everything the pages show (checks, sums, shares, histograms). The pages only render. On WebGPU:
 
 1. `gpuJobs(spec)` compiles each job with `ccr::gpu::compile` into a plan of ready-made GPU buffers, dispatch sizes and buffer sizes.
 2. `web/js/gpu/engine.js` uploads each plan, dispatches the three kernels and reads back two arrays. The kernel sources come from the library (`gpuKernels`).
 3. `gpuAnalyse(spec)` turns the read-backs into profiles (`ccr::gpu::summarise`) and runs the same combine step as the CPU path.
 
-The JavaScript layer only routes calls and talks to WebGPU (`web/js/gpu`), and one Web Worker hosts the library (`web/js/ccr-client.js`); the pages only render results. `cpuKernels(spec)` runs the kernels on the CPU instead, which is also how Node tests the GPU path.
+The JavaScript layer only routes calls and talks to WebGPU (`web/js/gpu`), and one Web Worker hosts the library (`web/js/ccr-client.js`); the pages only render results. `cpuKernels(spec)` runs the kernels on the CPU instead, which is also how Node tests every analysis (`web/tests/wasm.test.mjs`).
+
+**AI chapter.** The surrogates (ridge regression of degree 1 and 2, a tanh MLP trained with Adam on the thread pool) and their back test are C++ (`ccr::ai`, `include/ccr/ai/surrogate.hpp`). The agent skill's market state (spread multipliers, rate shift, FX vol, funding spread) is applied by the library (`spec.marketState`), and `xvaCompare` prices a base and a shocked market as two jobs. The dataset (`examples/xva_ai_dataset.cpp`) is priced on the fused kernels too: 410 XVA runs in about 5 s natively (12.7 ms each, was 200 ms on `ExposureEngine`), reproducible on every platform.
 
 **WebGPU fused kernels** (`include/ccr/gpu/fused_exposure.hpp`). `compile()` uses the library's own models to turn the netting set into flat tables:
 - exact Hull–White step coefficients;

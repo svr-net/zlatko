@@ -1,16 +1,18 @@
-// Node smoke test of the WASM wrapper: every entry point on the default spec,
-// with sanity checks against the library's own invariants.
+// Node test of the WebAssembly build: every entry point through ccr::app::call, and every Monte
+// Carlo analysis on the fused kernels (cpuKernels: the CPU build of the kernels; no GPU in Node),
+// with checks against exact values and the library's invariants. The kernels themselves are
+// validated against the double-precision ExposureEngine by the native tests.
 //   node web/tests/wasm.test.mjs
 import createCcrModule from '../wasm/ccr.js';
 import { defaultSpec, defaultBermudan } from '../js/spec.js';
 
 const mod = await createCcrModule();
-// Every library entry point goes through ccr::app::call(name, spec).
-const ccr = new Proxy({}, { get: (_, name) => (spec = {}) => mod.call(String(name), spec) });
+const call = (name, spec = {}) => mod.call(name, spec);
 let failures = 0;
 const check = (cond, msg) => { if (!cond) { failures++; console.log('  FAIL', msg); } };
 const near = (a, b, tol, msg) => check(Math.abs(a - b) <= tol, `${msg}: ${a} vs ${b} (tol ${tol})`);
-const spec = defaultSpec();
+const spec = { ...defaultSpec(), sim: { numPaths: 4000, seed: 2024, antithetic: true } };
+const sum = (xs) => Array.from(xs).reduce((s, x) => s + x, 0);
 
 function run(name, fn) {
   const t0 = performance.now();
@@ -19,112 +21,83 @@ function run(name, fn) {
   console.log(`ok   ${name} (${(performance.now() - t0).toFixed(0)} ms)`);
   return r;
 }
+const fused = (analysis, extra = {}) => run(`cpuKernels ${analysis}`, () => call('cpuKernels', { ...spec, analysis, ...extra }));
 
-const ver = run('version', () => ccr.version());
+check(Array.from(mod.functions()).join() === 'version,coreDemo,marketDemo,gpuKernels,gpuJobs,gpuAnalyse,cpuKernels,surrogateBacktest', 'entry points');
+const ver = run('version', () => call('version'));
 const cmakeVersion = (await import('node:fs')).readFileSync(new URL('../../CMakeLists.txt', import.meta.url), 'utf8').match(/^\s*VERSION ([0-9.]+)$/m)[1];
 if (ver) check(ver.library === `zlatko ccr ${cmakeVersion}`, `version() reports the CMake project version: ${ver.library}`);
-const core = run('coreDemo', () => ccr.coreDemo({ ...spec, regression: { points: 300, noise: 0.2 } }));
+const core = run('coreDemo', () => call('coreDemo', { ...spec, regression: { points: 300, noise: 0.2 } }));
 if (core) {
   near(core.brent.impliedVol, core.brent.trueVol, 1e-10, 'Brent implied vol');
   near(core.realisedCorrelation.data[1], 0.2, 0.03, 'realised correlation');
 }
-const market = run('marketDemo', () => ccr.marketDemo(spec));
+const market = run('marketDemo', () => call('marketDemo', spec));
 if (market) for (const q of market.credits[0].quotes) near(q.parSpread, q.quote, 1e-10, 'CDS reprices');
-const sim = run('simulate', () => ccr.simulate(spec));
-if (sim) {
-  const last = sim.times.length - 1;
-  near(sim.rates.meanDeflator[last], sim.rates.curveDiscount[last], 5e-3, 'E[D] = P(0,T)');
-  near(sim.credits[0].meanSurvival[last], sim.credits[0].marketSurvival[last], 5e-3, 'CIR++ fit');
+
+// Every Monte Carlo analysis on the fused kernels.
+const expo = fused('exposure', { samplePaths: 12, histogramTime: 2 });
+const expoCsa = fused('exposure', { csa: { ...spec.csa, enabled: true }, samplePaths: 12 });
+if (expo && expoCsa) {
+  check(expo.exposureSamples.length === 12 && expo.exposureSamples[0].length === expo.profile.times.length, 'exposure sample paths');
+  near(sum(expo.histogram.shares), 1, 1e-6, 'histogram shares');
+  check(expo.nettingBenefit > 0 && expo.nettingBenefit < 1 && expo.trades.length === 4, 'netting benefit and per-trade profiles');
+  check(expoCsa.profile.eepe1y < expo.profile.eepe1y && expoCsa.collateralBands.length === 3, 'CSA reduces EEPE; collateral bands');
 }
-const priced = run('priceTrades', () => ccr.priceTrades(spec));
-if (priced) for (const t of priced.trades) near(t.value0, t.reference, 1e-6 * Math.max(1, Math.abs(t.reference)) + 1e-6, `${t.id} t0 value`);
-const amc = run('amc', () => ccr.amc({ ...spec, sim: { ...spec.sim, numPaths: 1000 }, bermudan: defaultBermudan() }));
-if (amc) check(amc.price >= Math.max(...amc.european) * 0.98, 'Bermudan >= max European');
-const expo = run('exposure', () => ccr.exposure(spec));
-const collateralised = run('exposure (CSA)', () => ccr.exposure({ ...spec, csa: { ...spec.csa, enabled: true } }));
-if (expo && collateralised) check(collateralised.profile.eepe1y < expo.profile.eepe1y, 'CSA reduces EEPE');
-const alloc = run('allocation', () => ccr.allocation(spec));
-if (alloc) near(alloc.trades.reduce((s, t) => s + t.marginalCva, 0), alloc.totalCva, 1e-6 * alloc.totalCva, 'Euler allocation adds up');
-const cva = run('cva', () => ccr.cva(spec));
+const coll = fused('collateral', { samplePaths: 12 });
+if (coll) {
+  check(coll.variants.length === 5 && coll.variants[0].eepeVsNoCsa === 1, 'CSA variants');
+  check(coll.variants[2].profile.eepe1y < coll.variants[0].profile.eepe1y && coll.nettedSamples.length === 12, 'zero-threshold CSA; samples');
+}
+const alloc = fused('allocation');
+if (alloc) near(alloc.marginalCvaSum, alloc.totalCva, 1e-4 * alloc.totalCva, 'Euler allocation adds up (f32)');
+const cva = fused('cva');
 if (cva) {
   check(cva.bilateral && cva.bilateral.dva > 0 && cva.cva > 0, 'CVA and DVA positive');
   near(cva.cumulativeCva[cva.cumulativeCva.length - 1], cva.cva, 1e-9 * cva.cva, 'cumulative CVA ends at CVA');
 }
-const coll = run('collateral', () => ccr.collateral({ ...spec, sim: { ...spec.sim, numPaths: 1000 } }));
-if (coll) {
-  check(coll.variants.length === 5 && coll.variants[0].eepeVsNoCsa === 1, 'CSA variants');
-  check(coll.variants[2].profile.eepe1y < coll.variants[0].profile.eepe1y, 'zero-threshold CSA reduces EEPE');
+const xva = fused('xva');
+if (xva) {
+  const x = xva.xva;
+  near(x.total, x.cva - x.dva + x.fca - x.fba + x.mva + x.kva, 1e-6 * Math.abs(x.total), 'XVA identity');
+  near(sum(xva.trades.map((t) => t.cva)), x.cva, 1e-4 * x.cva, 'XVA allocation adds up (f32)');
 }
-const wwr = run('wrongWayRisk', () => ccr.wrongWayRisk({ ...spec, sim: { ...spec.sim, numPaths: 1000 }, rhos: [-0.5, 0, 0.5] }));
+const wwr = fused('wrongWayRisk', { rhos: [-0.5, 0, 0.5] });
 if (wwr) check(wwr.results[2].pathwiseCva > wwr.results[0].pathwiseCva, 'WWR increases CVA');
-const hedgeSpec = { ...spec, sim: { ...spec.sim, numPaths: 500 }, bumps: [0.02, 0.01] };
-const hedge = run('hedging', () => ccr.hedging(hedgeSpec));
+const hedge = fused('hedging', { sim: { ...spec.sim, numPaths: 1000 }, bumps: [0.02, 0.01] });
 if (hedge) check(hedge.pnlVolRatio < 0.1, 'CDS hedge removes most spread P&L');
+const inst = fused('instruments', { samplePaths: 5, trades: [...spec.trades, { type: 'bermudan', id: 'B', ...defaultBermudan() }] });
+if (inst) for (const t of inst.trades) check(t.pass && t.samples.length === 5 && t.bands.length === 3, `${t.id}: t = 0 value ${t.value0} vs ${t.benchmarkLabel} ${t.benchmark}`);
+const models = fused('models', { samplePaths: 5 });
+if (models) {
+  for (const c of models.checks) check(c.pass, `${c.name}: ${c.value} vs ${c.exact}`);
+  near(models.realisedCorrelation.data[1], 0.2, 0.05, 'realised rate/FX correlation');
+}
+const amc = fused('amc', { samplePaths: 5, bermudan: defaultBermudan() });
+if (amc) {
+  check(amc.price >= 0.98 * amc.bestEuropean, `Bermudan ${amc.price} >= max European ${amc.bestEuropean}`);
+  near(sum(amc.exerciseDistribution), 1, 1e-6, 'exercise distribution');
+  check(amc.degreeSensitivity.length === 3 && Math.abs(amc.degreeSensitivity[1].vsHighest) < 0.02, 'price stable in the regression degree');
+}
+const valid = fused('validation');
+if (valid) {
+  const c = valid.checks;
+  check(c.t0Diff < 1e-5 && c.eeDiff === 0 && c.survDiff < 0.01, `validation checks ${JSON.stringify(c)}`);
+}
 
-// WebGPU path: plans and the combine step. No GPU in Node, so the kernels run through the
-// C++ CPU reference (cpuKernels); results must agree with the CPU library within MC error.
-const kernels = run('gpuKernels', () => ccr.gpuKernels({}));
-if (kernels) check(kernels.fusedExposure.includes('fn main') && kernels.pfeQuantile.includes('3072'), 'WGSL sources');
-const jobs = run('gpuJobs', () => ccr.gpuJobs({ ...spec, analysis: 'hedging', bumps: [0.02, 0.01] }));
+// The GPU entry points: plans for every job, read-backs checked against the plan.
+const jobs = run('gpuJobs', () => call('gpuJobs', { ...spec, analysis: 'hedging', bumps: [0.02, 0.01] }));
 if (jobs) {
   check(jobs.plans.length === 1 + 4 * 2 + 2, 'hedging plans: base, 4 per bump, 2 rate shifts');
   const p = jobs.plans[0];
-  check(p.header instanceof Uint32Array && p.params instanceof Float32Array && p.header[1] === p.numDates, 'plan buffers');
+  check(p.header instanceof Uint32Array && p.requests instanceof Float32Array && p.header[1] === p.numDates, 'plan buffers');
 }
-const bermSpec = { ...spec, sim: { ...spec.sim, numPaths: 4000 }, trades: [...(spec.trades || []), { type: 'bermudan', id: 'B', ...defaultBermudan() }] };
-const berm = ccr.gpuJobs({ ...bermSpec, analysis: 'exposure' });
-check(!berm.unsupported && berm.plans.length === 1, 'Bermudan compiled for the GPU (AMC in the kernel)');
-const pathTol = 4 / Math.sqrt(4000);
-const pairSpec = { ...spec, sim: { ...spec.sim, numPaths: 4000 } };
-const emuCva = run('cpuKernels cva', () => ccr.cpuKernels({ ...pairSpec, analysis: 'cva' }));
-const cpuCva = ccr.cva(pairSpec);
-if (emuCva) {
-  near(emuCva.cva, cpuCva.cva, pathTol * cpuCva.cva, 'emulated kernels CVA vs CPU');
-  near(emuCva.pathwiseCva, cpuCva.pathwiseCva, pathTol * cpuCva.pathwiseCva, 'emulated kernels pathwise CVA vs CPU');
-}
-const emuHedge = run('cpuKernels hedging', () => ccr.cpuKernels({ ...hedgeSpec, analysis: 'hedging' }));
-if (emuHedge && hedge) {
-  near(emuHedge.parallelCs01, hedge.parallelCs01, 0.2 * Math.abs(hedge.parallelCs01), 'emulated CS01 vs CPU');
-  near(emuHedge.cvaDv01, hedge.cvaDv01, 0.2 * Math.abs(hedge.cvaDv01), 'emulated DV01 vs CPU');
-}
-const valid = run('cpuKernels validation', () => ccr.cpuKernels({ ...pairSpec, analysis: 'validation' }));
-if (valid) {
-  const c = valid.checks;
-  check(c.t0Diff < 1e-6 && c.eeDiff < c.tol && c.cvaDiff < c.tol && c.survDiff < 0.01, `validation checks ${JSON.stringify(c)}`);
-}
-// XVA and allocation on the fused kernels (per-trade statistics and the margin quantile in the
-// kernel) against the CPU library on the same spec.
-const emuXva = run('cpuKernels xva', () => ccr.cpuKernels({ ...pairSpec, analysis: 'xva' }));
-const cpuXva = ccr.xva(pairSpec);
-if (emuXva) {
-  for (const k of ['cva', 'dva', 'fca', 'mva', 'kva', 'total'])
-    near(emuXva.xva[k], cpuXva.xva[k], 2 * pathTol * Math.abs(cpuXva.xva[k]), `emulated kernels ${k.toUpperCase()} vs CPU`);
-  check(emuXva.trades.length === cpuXva.trades.length && emuXva.initialMargin.length === cpuXva.initialMargin.length, 'xva result shape');
-  near(emuXva.trades.reduce((s, t) => s + t.cva, 0), emuXva.xva.cva, 1e-4 * emuXva.xva.cva, 'emulated XVA allocation adds up (f32)');
-}
-const emuAlloc = run('cpuKernels allocation', () => ccr.cpuKernels({ ...pairSpec, analysis: 'allocation' }));
-const cpuAlloc = ccr.allocation(pairSpec);
-if (emuAlloc) {
-  near(emuAlloc.totalCva, cpuAlloc.totalCva, pathTol * cpuAlloc.totalCva, 'emulated allocation CVA vs CPU');
-  near(emuAlloc.trades.reduce((s, t) => s + t.marginalCva, 0), emuAlloc.totalCva, 1e-4 * emuAlloc.totalCva, 'emulated Euler allocation adds up (f32)');
-  emuAlloc.trades.forEach((t, i) => {
-    const c = cpuAlloc.trades[i], scale = cpuAlloc.totalCva;
-    near(t.marginalCva, c.marginalCva, pathTol * scale, `${t.id} marginal CVA vs CPU`);
-    near(t.incrementalCva, c.incrementalCva, pathTol * scale, `${t.id} incremental CVA vs CPU`);
-    near(t.standaloneCva, c.standaloneCva, pathTol * Math.max(scale, c.standaloneCva), `${t.id} standalone CVA vs CPU`);
-  });
-}
-// CPU fused-kernel backend: one call, Bermudans included (AMC inside the kernels).
-const one = ccr.cpuKernels({ ...pairSpec, analysis: 'cva' });
-check(one.threads === 1 && one.kernelMs > 0 && one.cva === emuCva.cva, 'cpuKernels: one thread in WebAssembly, deterministic');
-const bermFused = run('cpuKernels exposure + Bermudan (AMC)', () => ccr.cpuKernels({ ...bermSpec, analysis: 'exposure' }));
-const bermCpu = ccr.exposure(bermSpec);
-if (bermFused) near(bermFused.profile.eepe1y, bermCpu.profile.eepe1y, 4 / Math.sqrt(4000) * bermCpu.profile.eepe1y, 'AMC in the kernels: EEPE vs ExposureEngine');
-// gpuAnalyse with read-backs from the emulated kernels' shape: wrong sizes are rejected.
-const badOut = ccr.gpuAnalyse({ ...spec, analysis: 'exposure', gpuOutputs: [{ sums: new Float32Array(3), pfe: new Float32Array(1) }] });
+const kernels = run('gpuKernels', () => call('gpuKernels'));
+if (kernels) check(kernels.fusedExposure.includes('fn main') && kernels.fusedExposureTrades.includes('MAX_TRADES : u32 = 16u'), 'WGSL sources');
+const badOut = call('gpuAnalyse', { ...spec, analysis: 'exposure', gpuOutputs: [{ sums: new Float32Array(3), values: new Float32Array(1) }] });
 check(typeof badOut.error === 'string', 'gpuAnalyse rejects read-backs that do not match the plan');
-const bad = ccr.exposure({ ...spec, trades: [{ type: 'nonsense' }] });
-check(typeof bad.error === 'string', 'errors are reported, not thrown');
+check(typeof call('cpuKernels', { ...spec, analysis: 'exposure', trades: [{ type: 'nonsense' }] }).error === 'string', 'errors are reported, not thrown');
+check(typeof call('nonsense').error === 'string', 'unknown entry points are reported');
 
 console.log(failures ? `\n${failures} failure(s)` : '\nall checks passed');
 process.exit(failures ? 1 : 0);

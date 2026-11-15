@@ -44,12 +44,12 @@ const gpuSpec = { sim: { numPaths: 8000, seed: 11, antithetic: true } };
 const pairSpec = { sim: { numPaths: 4000, seed: 11, antithetic: true } };
 const bermudanTrade = { type: 'bermudan', id: 'Berm 1y×4y', notional: 1e6, fixedRate: 0.035, start: 1, tenor: 4, freq: 1, direction: 'receiver', degree: 2 };
 // Pages with the engine selector. With no stored choice they run on Auto, which must pick the
-// WebGPU kernels on desktop too; each also runs once forced onto WebAssembly.
-const enginePages = ['index', 'exposure', 'collateral', 'allocation', 'cva', 'xva', 'wwr', 'hedging'];
+// WebGPU kernels on desktop too; some also run once forced onto the CPU fused kernels.
+const enginePages = ['index', 'instruments', 'amc', 'models', 'exposure', 'collateral', 'allocation', 'cva', 'xva', 'wwr', 'hedging'];
 const cases = [
   ...['index', 'core', 'market', 'models', 'instruments', 'amc', 'exposure', 'collateral', 'allocation', 'cva', 'xva', 'ai', 'wwr', 'hedging']
     .map((name) => ({ name, file: name, spec: testSpec, ...(enginePages.includes(name) ? { engine: 'auto', expectEngine: 'WebGPU' } : {}) })),
-  ...['index', 'collateral', 'wwr'].map((name) => ({ name: `${name}-wasm`, file: name, spec: testSpec, engine: 'wasm', expectEngine: 'WebAssembly' })),
+  ...['index', 'collateral', 'wwr', 'models', 'amc'].map((name) => ({ name: `${name}-cpu`, file: name, spec: testSpec, engine: 'cpu', expectEngine: 'CPU fused kernels' })),
   // A first visit (nothing stored): the default is Auto, which must dispatch the fused kernels.
   { name: 'cva-first-visit', file: 'cva', spec: testSpec, expectEngine: 'WebGPU' },
   // A Bermudan is priced by American Monte Carlo inside the fused kernels: Auto stays on WebGPU.
@@ -59,15 +59,14 @@ const cases = [
   { name: 'gpu-csa', file: 'gpu', spec: { ...gpuSpec, csa: { enabled: true, thresholdCounterparty: 250e3, thresholdOwn: 250e3, mta: 50e3, independentAmount: 0, mpr: 10 / 250 } } },
   // WASM/GPU pairs on the same spec whose headline numbers must agree within Monte Carlo error.
   // A Bermudan on all three engines: AMC in the WGSL kernel, in its CPU mirror and in ExposureEngine.
-  ...[['wasm', 'WebAssembly'], ['gpu', 'WebGPU'], ['cpu', 'CPU fused kernels']].map(([engine, expectEngine]) => (
+  ...[['gpu', 'WebGPU'], ['cpu', 'CPU fused kernels']].map(([engine, expectEngine]) => (
     { name: `amc-${engine}-pair`, file: 'exposure', spec: { ...pairSpec, trades: [bermudanTrade] }, engine, expectEngine, pair: 'amc' })),
   ...['exposure', 'cva', 'xva', 'allocation', 'hedging'].flatMap((name) => [
-    { name: `${name}-wasm-pair`, file: name, spec: pairSpec, engine: 'wasm', expectEngine: 'WebAssembly', pair: name },
     { name: `${name}-gpu-pair`, file: name, spec: pairSpec, engine: 'gpu', expectEngine: 'WebGPU', pair: name },
     { name: `${name}-cpu-pair`, file: name, spec: pairSpec, engine: 'cpu', expectEngine: 'CPU fused kernels', pair: name },
   ]),
   // Android drivers: no adapter for a high-performance request but one for a plain request
-  // (Auto must still reach WebGPU), and no adapter at all (WebAssembly, with the reason).
+  // (Auto must still reach WebGPU), and no adapter at all (the CPU fused kernels, with the reason).
   { name: 'exposure-android-quirk', file: 'exposure', spec: testSpec, engine: 'auto', expectEngine: 'WebGPU', gpuStub: 'no-high-performance', device: 'Pixel 7' },
   // Chrome offers only a WebGPU compatibility-mode adapter (OpenGL ES): Auto must use it.
   { name: 'exposure-compat-only', file: 'exposure', spec: testSpec, engine: 'auto', expectEngine: 'WebGPU', gpuStub: 'compat-only', device: 'Pixel 7', expectReason: 'compatibility mode' },
@@ -125,7 +124,7 @@ for (const { name, file, spec, engine, expectEngine, pair, device, gpuStub, expe
   if (expectEngine && !status.includes(`· ${expectEngine}`)) problems.push(`expected the ${expectEngine} engine: ${status}`);
   if (expectReason && !status.includes(expectReason)) problems.push(`expected the reason "${expectReason}": ${status}`);
   // The status line is not enough: the fused kernels must really have been dispatched on WebGPU
-  // (and never when WebAssembly ran).
+  // (and never when the CPU kernels ran).
   const gpuRuns = await page.evaluate(() => globalThis.__ccrGpuRuns || 0);
   const cpuRuns = await page.evaluate(() => globalThis.__ccrCpuKernelRuns || 0);
   if (expectEngine === 'WebGPU' && gpuRuns === 0) problems.push('no fused pipeline was dispatched on WebGPU');
@@ -154,10 +153,10 @@ for (const { name, file, spec, engine, expectEngine, pair, device, gpuStub, expe
     if (!r) problems.push('no GPU result');
     else {
       const c = r.checks;
-      if (!(c.t0Diff < 1e-6)) problems.push(`t=0 value mismatch ${c.t0Diff}`);
-      if (!(c.eeDiff < c.tol)) problems.push(`EE mismatch ${c.eeDiff} > ${c.tol}`);
-      if (!(c.cvaDiff < c.tol)) problems.push(`CVA mismatch ${c.cvaDiff} > ${c.tol}`);
-      if (!(c.survDiff < 0.01)) problems.push(`CIR++ survival mismatch ${c.survDiff}`);
+      if (!c.t0Pass) problems.push(`t=0 value vs analytic ${c.t0Diff}`);
+      if (!c.eePass) problems.push(`EE GPU vs CPU kernels ${c.eeDiff} > ${c.tol}`);
+      if (!c.cvaPass) problems.push(`CVA GPU vs CPU kernels ${c.cvaDiff} > ${c.tol}`);
+      if (!c.survPass) problems.push(`CIR++ survival mismatch ${c.survDiff}`);
       console.log(`       GPU checks: EE ${(100 * c.eeDiff).toFixed(2)}%, CVA ${(100 * c.cvaDiff).toFixed(2)}% (tol ${(100 * c.tol).toFixed(1)}%), Q ${(100 * c.survDiff).toFixed(3)}%, t0 ${c.t0Diff.toExponential(1)}`);
     }
   }
@@ -179,22 +178,11 @@ const metrics = {
   hedging: [['CVA', (r) => r.cva], ['parallel CS01', (r) => r.parallelCs01], ['CVA DV01', (r) => r.cvaDv01],
     ['delta (CRN, h=0.005)', (r) => r.deltaCrn[0][3]]],
 };
+// The same spec on WebGPU and on the CPU kernels: the same algorithm and random numbers in f32,
+// so the headline numbers agree to rounding (GPU transcendental functions differ slightly).
 for (const [name, r] of Object.entries(pairs)) {
-  const tol = 4 / Math.sqrt(name === 'hedging' ? 1500 : pairSpec.sim.numPaths);
-  for (const fused of ['gpu', 'cpu']) {
-    if (!r.wasm || !r[fused]) continue;
-    for (const [label, get] of metrics[name]) {
-      const w = get(r.wasm), g = get(r[fused]);
-      const diff = Math.abs(g - w) / Math.abs(w);
-      const ok = diff < tol;
-      console.log(`${ok ? 'ok  ' : 'FAIL'} ${`${name} WASM/${fused}`.padEnd(16)} ${label}: WASM ${w.toFixed(1)} vs ${fused.toUpperCase()} ${g.toFixed(1)} (${(100 * diff).toFixed(2)}%, tol ${(100 * tol).toFixed(1)}%)`);
-      if (!ok) failures++;
-    }
-  }
-  // The CPU kernels run the GPU's algorithm and random numbers in f32: they agree with the GPU
-  // far more closely than either agrees with WebAssembly.
-  if (r.gpu && r.cpu) {
-    const [label, get] = metrics[name][0];
+  if (!r.gpu || !r.cpu) continue;
+  for (const [label, get] of metrics[name]) {
     const diff = Math.abs(get(r.cpu) - get(r.gpu)) / Math.abs(get(r.gpu));
     const ok = diff < 1e-3;
     console.log(`${ok ? 'ok  ' : 'FAIL'} ${`${name} GPU/CPU`.padEnd(16)} ${label}: GPU ${get(r.gpu).toFixed(2)} vs CPU kernels ${get(r.cpu).toFixed(2)} (${(100 * diff).toFixed(4)}%, tol 0.1%)`);

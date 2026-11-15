@@ -2,6 +2,7 @@
 
 /// Umbrella header for the counterparty credit risk library.
 
+#include "ccr/ai/surrogate.hpp"
 #include "ccr/core/math.hpp"
 #include "ccr/core/matrix.hpp"
 #include "ccr/core/parallel.hpp"

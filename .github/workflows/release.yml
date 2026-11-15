@@ -74,7 +74,7 @@ jobs:
             Unzip it anywhere and open `index.html`. It needs no server and no install, because the WebAssembly library is embedded in the bundle.
             The same folder can be uploaded unchanged to any static host (S3, GitHub Pages, nginx, IIS).
             It has 15 pages, one per library context: market data, risk-factor models, instruments, American Monte Carlo, exposure and netting, collateral, allocation, CVA/DVA, XVA (FVA, MVA, KVA), wrong-way risk, hedging, the WebGPU fused kernels, and AI surrogates with an LLM agent skill.
-            The Monte Carlo pages (exposure, collateral, allocation, CVA, XVA, wrong-way risk, hedging and the AI agent tools) run on the fused WebGPU kernels whenever the browser supports WebGPU (the *Auto* engine), and on the same fused kernels on the CPU otherwise. Bermudan swaptions are priced by American Monte Carlo inside the kernels.
+            Every Monte Carlo page (models, instruments, AMC, exposure, collateral, allocation, CVA, XVA, wrong-way risk, hedging and the AI agent tools) runs on the fused WebGPU kernels whenever the browser supports WebGPU (the *Auto* engine), and on the same fused kernels on the CPU otherwise. Bermudan swaptions are priced by American Monte Carlo inside the kernels.
             Verify the download with the attached `.sha256` file.
 
             ### From source

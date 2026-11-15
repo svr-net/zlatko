@@ -43,16 +43,13 @@ const button = runButton(page, 'Run quick exposure', async (spec) => {
   const t0 = performance.now();
   const runResult = await runAnalysis('exposure', spec);
   const r = runResult.result;
-  const onGpu = runResult.fused; // WebGPU or the CPU fused kernels: aggregates only
   const p = r.profile;
   window.__ccrEngineRun = { page: 'index', engine: runResult.engine, eepe1y: p.eepe1y };
   tiles(page.content, [
     { label: 'Effective EPE (1y)', value: fmt.compact(p.eepe1y) },
     { label: 'Peak PFE', value: fmt.compact(p.maxPfe) },
-    onGpu
-      ? { label: 'Netting benefit (EEPE)', value: '–', hint: 'WebAssembly engine only' }
-      : { label: 'Netting benefit (EEPE)', value: fmt.pct(r.nettingBenefit, 1), hint: 'vs sum of positive trade values' },
-    { label: 'Paths × dates', value: `${fmt.num(r.numPaths)} × ${r.simulationDates}`, hint: `${fmt.num(onGpu ? r.gpuMs : r.elapsedMs)} ms on ${runResult.label}` },
+    { label: 'Netting benefit (EEPE)', value: r.grossProfile ? fmt.pct(r.nettingBenefit, 1) : '–', hint: 'vs sum of positive trade values' },
+    { label: 'Paths × dates', value: `${fmt.num(r.numPaths)} × ${r.simulationDates}`, hint: `${fmt.num(r.gpuMs)} ms on ${runResult.label}` },
   ]);
   const gr = grid(page.content);
   lineChart(card(gr, 'Exposure profile of the default netting set', 'Full analysis on the <a href="exposure.html">exposure page</a>.'), {

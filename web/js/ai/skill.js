@@ -4,8 +4,8 @@
 //   1. TOOLS      JSON-Schema tool definitions (function calling / MCP) with adapters for the OpenAI,
 //                 Anthropic, Gemini and MCP formats.
 //   2. executeTool  validates the arguments of a tool call and runs it through an injected `runner`
-//                 (fn, spec) => result. In the browser the runner is the WebAssembly engine
-//                 (ccr-client.js run). The answer is a compact JSON object whose numbers the model can quote,
+//                 (fn, spec) => result. In the browser the runner is the library's XVA analysis on
+//                 the fused kernels (gpu/backend.js runAnalysis). The answer is a compact JSON object whose numbers the model can quote,
 //                 with the invariants (total = cva - dva + fca - fba + mva + kva) checked.
 //   3. SKILL_MD   the same knowledge as an Anthropic-style Agent Skill (SKILL.md with frontmatter).
 //   4. runAgentLoop  the generic tool-use loop. The model is a callback `llm(messages, tools)`, so any
@@ -23,19 +23,12 @@ export const STATE_FIELDS = {
   fundingSpread: { min: 0, max: 0.05, default: 0.01, description: 'Unsecured funding spread as a decimal; borrow = spread, lend = half of it, margin funding = spread.' },
 };
 
-/** Maps a market state to a full engine specification (mirrors price() of examples/xva_ai_dataset.cpp). */
+/** A market state as an engine specification: the default netting set plus the state, which the
+ *  library applies (C++ withMarketState, as price() of examples/xva_ai_dataset.cpp). */
 export function stateToSpec(state = {}) {
   const s = {};
   for (const [k, f] of Object.entries(STATE_FIELDS)) s[k] = state[k] ?? f.default;
-  const spec = defaultSpec();
-  spec.domestic.rates = spec.domestic.rates.map((r) => r + s.rateShift);
-  spec.assets[0].vol = s.fxVol;
-  const c = spec.credits[0];
-  c.quotes = c.quotes.map((q) => ({ ...q, spread: q.spread * s.cptySpreadMultiplier }));
-  c.cir = { ...c.cir, theta: c.cir.theta * s.cptySpreadMultiplier, xi: c.cir.xi * Math.sqrt(s.cptySpreadMultiplier), y0: c.cir.y0 * s.cptySpreadMultiplier };
-  spec.own.quotes = spec.own.quotes.map((q) => ({ ...q, spread: q.spread * s.ownSpreadMultiplier }));
-  spec.xva = { ...spec.xva, fundingSpreadBorrow: s.fundingSpread, fundingSpreadLend: 0.5 * s.fundingSpread, marginFundingSpread: s.fundingSpread };
-  return spec;
+  return { ...defaultSpec(), marketState: s };
 }
 
 // ----------------------------------------------------------------------------- tools
@@ -93,12 +86,11 @@ const arr = (a) => Array.from(a ?? []);
 
 function summarise(r) {
   const x = r.xva;
-  const check = x.cva - x.dva + x.fca - x.fba + x.mva + x.kva;
   return {
     currency: 'USD',
-    cva: round(x.cva), dva: round(x.dva), fca: round(x.fca), fba: round(x.fba), fva: round(x.fca - x.fba),
+    cva: round(x.cva), dva: round(x.dva), fca: round(x.fca), fba: round(x.fba), fva: round(x.fva),
     mva: round(x.mva), kva: round(x.kva), total: round(x.total),
-    invariant: { identity: 'total = cva - dva + fca - fba + mva + kva', holds: Math.abs(check - x.total) <= 1e-6 * Math.max(1, Math.abs(x.total)) },
+    invariant: { identity: 'total = cva - dva + fca - fba + mva + kva', holds: r.identityHolds },  // checked by the library
   };
 }
 
@@ -113,11 +105,10 @@ export async function executeTool(name, args, runner) {
       for (const k of Object.keys(args)) if (k !== 'base' && k !== 'shock') throw new ToolError(`unknown input "${k}"; allowed: base, shock`);
       if (args.shock === undefined) throw new ToolError('"shock" is required');
       const base = validateState(args.base ?? {}, 'base'), shock = validateState(args.shock, 'shock');
-      const b = summarise(await runner('xva', stateToSpec(base)));
-      const s = summarise(await runner('xva', stateToSpec({ ...base, ...shock })));
-      const change = {};
-      for (const k of ['cva', 'dva', 'fca', 'fba', 'fva', 'mva', 'kva', 'total']) change[k] = round(s[k] - b[k]);
-      return { ok: true, tool: name, base: b, shocked: s, change };
+      // One library call prices both markets (two jobs) and returns the changes.
+      const r = await runner('xvaCompare', { ...stateToSpec(base), shockState: stateToSpec({ ...base, ...shock }).marketState });
+      const change = Object.fromEntries(Object.entries(r.change).map(([k, v]) => [k, round(v)]));
+      return { ok: true, tool: name, base: summarise(r.base), shocked: summarise(r.shocked), change };
     }
     const state = validateState(args);
     const r = await runner('xva', stateToSpec(state));

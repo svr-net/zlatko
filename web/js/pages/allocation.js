@@ -17,12 +17,11 @@ const button = runButton(page, 'Allocate', async (spec) => {
   const t0 = performance.now();
   const runResult = await runAnalysis('allocation', spec);
   const r = runResult.result;
-  const sum = (k) => r.trades.reduce((s, t) => s + t[k], 0);
   tiles(page.content, [
     { label: 'Netting-set CVA', value: fmt.num(r.totalCva) },
-    { label: 'Σ marginal CVA', value: fmt.num(sum('marginalCva')), hint: 'adds up exactly' },
-    { label: 'Σ standalone CVA', value: fmt.num(sum('standaloneCva')), hint: `netting saves ${fmt.pct(1 - r.totalCva / sum('standaloneCva'), 1)}` },
-    { label: 'Σ incremental CVA', value: fmt.num(sum('incrementalCva')), hint: 'does not add up' },
+    { label: 'Σ marginal CVA', value: fmt.num(r.marginalCvaSum), hint: 'adds up' },
+    { label: 'Σ standalone CVA', value: fmt.num(r.standaloneCvaSum), hint: `netting saves ${fmt.pct(r.nettingSaving, 1)}` },
+    { label: 'Σ incremental CVA', value: fmt.num(r.incrementalCvaSum), hint: 'does not add up' },
   ]);
   const g = grid(page.content);
   barChart(card(g, 'CVA by trade', ''), {
@@ -40,15 +39,15 @@ const button = runButton(page, 'Allocate', async (spec) => {
   });
   const box = card(g, 'Allocation table', '');
   table(box, ['trade', 'marginal', 'share', 'incremental', 'standalone'], [
-    ...r.trades.map((tr) => [tr.id, fmt.num(tr.marginalCva), fmt.pct(tr.marginalCva / r.totalCva, 1), fmt.num(tr.incrementalCva), fmt.num(tr.standaloneCva)]),
-    ['total', fmt.num(sum('marginalCva')), passFail(Math.abs(sum('marginalCva') - r.totalCva) < (runResult.fused ? 1e-4 : 1e-6) * Math.abs(r.totalCva), runResult.fused ? 'adds up (f32)' : 'adds up'), fmt.num(sum('incrementalCva')), fmt.num(sum('standaloneCva'))],
+    ...r.trades.map((tr) => [tr.id, fmt.num(tr.marginalCva), fmt.pct(tr.marginalShare, 1), fmt.num(tr.incrementalCva), fmt.num(tr.standaloneCva)]),
+    ['total', fmt.num(r.marginalCvaSum), passFail(r.addsUp, 'adds up (f32)'), fmt.num(r.incrementalCvaSum), fmt.num(r.standaloneCvaSum)],
   ]);
   const xvaBox = card(g, 'XVA allocation', 'CVA, FCA and KVA are linear in the discounted EE, so the marginal contributions allocate them exactly.');
   table(xvaBox, ['trade', 'CVA', 'FCA', 'KVA'], [
     ...r.trades.map((tr) => [tr.id, fmt.num(tr.marginalCva), fmt.num(tr.marginalFca), fmt.num(tr.marginalKva)]),
     ['netting set', fmt.num(r.totalCva), fmt.num(r.totalFca), fmt.num(r.totalKva)],
   ]);
-  window.__ccrEngineRun = { page: 'allocation', engine: runResult.engine, totalCva: r.totalCva, marginalSum: sum('marginalCva') };
+  window.__ccrEngineRun = { page: 'allocation', engine: runResult.engine, totalCva: r.totalCva, marginalSum: r.marginalCvaSum };
   return engineNote(runResult, performance.now() - t0);
 });
 

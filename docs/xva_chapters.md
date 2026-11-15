@@ -586,7 +586,7 @@ runs at states `x_i` chosen by Latin hypercube sampling over a box `B`:
 θ* = argmin  (1/n) sum_i || F(x_i) - F̂(x_i; θ) ||²  +  λ ||θ||²
 ```
 
-Three model classes are implemented in `web/js/ai/surrogate.js`:
+Three model classes are implemented in C++ (`include/ccr/ai/surrogate.hpp`, `src/ai/surrogate.cpp`; the MLP gradient runs on the lock-free thread pool):
 
 1. **Linear ridge**: `F̂ = b + w·x`. The first-order Taylor model; it equals the bucketed
    sensitivities of X6 applied to the market move.
@@ -730,7 +730,7 @@ An AI component is a model under SR 11-7 / the PRA SS1/23 principles. For a surr
 | Item | Location |
 |---|---|
 | Dataset generator | `examples/xva_ai_dataset.cpp`, target `xva_ai_dataset`; `./build/xva_ai_dataset > web/js/ai/backtest-data.js` |
-| Surrogates and back test | `web/js/ai/surrogate.js` |
+| Surrogates and back test | `src/ai/surrogate.cpp` (entry point `surrogateBacktest`) |
 | Agent skill, tools, harness | `web/js/ai/skill.js` |
 | Page | [`web/ai.html`](../web/ai.html), entry `web/js/pages/ai.js` |
 | Node tests | `web/tests/ai.test.mjs` |
