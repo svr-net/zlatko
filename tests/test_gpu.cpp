@@ -257,3 +257,18 @@ TEST(gpu_per_trade_statistics_and_initial_margin) {
   CHECK(!gpu::limitation(s.engine, many, true).empty() && gpu::limitation(s.engine, many, false).empty());
   CHECK_THROWS(gpu::compile(s.engine, many, o));
 }
+
+TEST(gpu_cpu_kernels_are_bit_identical_on_any_number_of_threads) {
+  // The CPU backend runs workgroups, statistics and quantile rows on the lock-free pool: one
+  // thread and eight must give the same bits, per-trade and margin plans included.
+  const auto s = gpuSetup(3000, true);
+  gpu::FusedOptions o;
+  o.perTrade = true;
+  o.imQuantile = 0.99;
+  for (const auto& plan : {gpu::compile(s.engine, s.nettingSet), gpu::compile(s.engine, s.nettingSet, o)}) {
+    SpinPool one(0), eight(7);
+    const auto a = gpu::runFusedReference(plan, one), b = gpu::runFusedReference(plan, eight);
+    CHECK(a.sums == b.sums);
+    CHECK(a.pfe == b.pfe);
+  }
+}

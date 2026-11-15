@@ -9,6 +9,7 @@
 #include <limits>
 #include <stdexcept>
 
+#include "ccr/core/parallel.hpp"
 #include "ccr/gpu/fused_exposure.hpp"
 
 namespace ccr::gpu {
@@ -214,7 +215,7 @@ void simulatePath(const PlanView& v, std::uint32_t p, float* stats, float* expo,
 
 }  // namespace
 
-FusedSlice runFusedWorkgroups(const FusedPlan& plan, std::size_t wgBegin, std::size_t wgEnd) {
+FusedSlice runFusedWorkgroups(const FusedPlan& plan, std::size_t wgBegin, std::size_t wgEnd, SpinPool& pool) {
   const PlanView v(plan);
   wgEnd = std::min<std::size_t>(wgEnd, v.numWG);
   if (wgBegin > wgEnd) throw std::invalid_argument("runFusedWorkgroups: empty or reversed workgroup range");
@@ -227,30 +228,36 @@ FusedSlice runFusedWorkgroups(const FusedPlan& plan, std::size_t wgBegin, std::s
   slice.partials.assign((wgEnd - wgBegin) * nT * nS, 0.0f);
   slice.exposure.assign(nQ * count, 0.0f);
 
-  std::vector<float> stats(kWorkgroupSize * nT * nS), vals(nT), red(kWorkgroupSize * nS);
-  for (std::size_t g = wgBegin; g < wgEnd; ++g) {
-    // The 64 invocations of the workgroup; inactive ones (past the last path) contribute zeros.
-    std::fill(stats.begin(), stats.end(), 0.0f);
-    for (std::uint32_t l = 0; l < kWorkgroupSize; ++l) {
-      const std::size_t p = g * kWorkgroupSize + l;
-      if (p >= v.nP) break;
-      simulatePath(v, static_cast<std::uint32_t>(p), &stats[l * nT * nS], &slice.exposure[p - slice.pathBegin], count,
-                   vals.data());
+  // Workgroups are independent (each writes its own partials and its own paths' exposures), so
+  // the lock-free pool runs them in parallel and the result is the same bits on any number of
+  // threads. Scratch buffers are per chunk of workgroups.
+  float* partials = slice.partials.data();
+  float* exposure = slice.exposure.data();
+  pool.parallelFor(wgEnd - wgBegin, 1, [&](std::size_t cb, std::size_t ce) {
+    std::vector<float> stats(kWorkgroupSize * nT * nS), vals(nT), red(kWorkgroupSize * nS);
+    for (std::size_t g = wgBegin + cb; g < wgBegin + ce; ++g) {
+      // The 64 invocations of the workgroup; inactive ones (past the last path) contribute zeros.
+      std::fill(stats.begin(), stats.end(), 0.0f);
+      for (std::uint32_t l = 0; l < kWorkgroupSize; ++l) {
+        const std::size_t p = g * kWorkgroupSize + l;
+        if (p >= v.nP) break;
+        simulatePath(v, static_cast<std::uint32_t>(p), &stats[l * nT * nS], exposure + (p - slice.pathBegin), count, vals.data());
+      }
+      // Workgroup tree reduction, as in the kernel.
+      for (std::size_t j = 0; j < nT; ++j) {
+        for (std::uint32_t l = 0; l < kWorkgroupSize; ++l)
+          for (std::size_t f = 0; f < nS; ++f) red[l * nS + f] = stats[(l * nT + j) * nS + f];
+        for (std::uint32_t s = kWorkgroupSize / 2; s > 0; s >>= 1)
+          for (std::uint32_t l = 0; l < s; ++l)
+            for (std::size_t f = 0; f < nS; ++f) red[l * nS + f] += red[(l + s) * nS + f];
+        for (std::size_t f = 0; f < nS; ++f) partials[((g - wgBegin) * nT + j) * nS + f] = red[f];
+      }
     }
-    // Workgroup tree reduction, as in the kernel.
-    for (std::size_t j = 0; j < nT; ++j) {
-      for (std::uint32_t l = 0; l < kWorkgroupSize; ++l)
-        for (std::size_t f = 0; f < nS; ++f) red[l * nS + f] = stats[(l * nT + j) * nS + f];
-      for (std::uint32_t s = kWorkgroupSize / 2; s > 0; s >>= 1)
-        for (std::uint32_t l = 0; l < s; ++l)
-          for (std::size_t f = 0; f < nS; ++f) red[l * nS + f] += red[(l + s) * nS + f];
-      for (std::size_t f = 0; f < nS; ++f) slice.partials[((g - wgBegin) * nT + j) * nS + f] = red[f];
-    }
-  }
+  });
   return slice;
 }
 
-FusedOutput finishFused(const FusedPlan& plan, const std::vector<FusedSlice>& slices) {
+FusedOutput finishFused(const FusedPlan& plan, const std::vector<FusedSlice>& slices, SpinPool& pool) {
   const PlanView v(plan);
   const std::size_t nT = v.nT, n = nT * v.nS, nQ = plan.quantileRows();
   std::size_t next = 0;
@@ -264,23 +271,25 @@ FusedOutput finishFused(const FusedPlan& plan, const std::vector<FusedSlice>& sl
 
   FusedOutput out;
   // reduce-partials: Kahan summation across workgroups, in workgroup order.
+  // Every statistic is independent: the pool sums them in parallel, each in workgroup order.
   out.sums.resize(n);
-  for (std::size_t i = 0; i < n; ++i) {
-    float sum = 0.0f, comp = 0.0f;
-    for (const auto& s : slices)
-      for (std::size_t g = 0; g < s.wgEnd - s.wgBegin; ++g) {
-        const float yv = s.partials[g * n + i] - comp;
-        const float tv = sum + yv;
-        comp = (tv - sum) - yv;
-        sum = tv;
-      }
-    out.sums[i] = sum / static_cast<float>(v.nP);
-  }
+  pool.parallelFor(n, 0, [&](std::size_t ib, std::size_t ie) {
+    for (std::size_t i = ib; i < ie; ++i) {
+      float sum = 0.0f, comp = 0.0f;
+      for (const auto& s : slices)
+        for (std::size_t g = 0; g < s.wgEnd - s.wgBegin; ++g) {
+          const float yv = s.partials[g * n + i] - comp;
+          const float tv = sum + yv;
+          comp = (tv - sum) - yv;
+          sum = tv;
+        }
+      out.sums[i] = sum / static_cast<float>(v.nP);
+    }
+  });
 
   // pfe-quantile, as the kernel: the order statistics k = floor(rank) and k + 1 from a coarse
   // and a fine histogram and the extremes of k's fine bin, interpolated as ccr::quantile.
   out.pfe.resize(nQ);
-  std::vector<std::uint32_t> hist(kPfeBins);
   const float bins = static_cast<float>(kPfeBins), big = std::numeric_limits<float>::max();
   const std::uint32_t last = kPfeBins - 1;
   auto forEach = [&](std::size_t r, auto&& f) {
@@ -289,7 +298,10 @@ FusedOutput finishFused(const FusedPlan& plan, const std::vector<FusedSlice>& sl
       for (std::size_t k = 0; k < count; ++k) f(s.exposure[r * count + k]);
     }
   };
-  for (std::size_t r = 0; r < nQ; ++r) {
+  // One quantile row per task, as one workgroup per row on the GPU.
+  pool.parallelFor(nQ, 1, [&](std::size_t rb, std::size_t re) {
+  std::vector<std::uint32_t> hist(kPfeBins);
+  for (std::size_t r = rb; r < re; ++r) {
     const float level = r >= v.nR ? v.imLevel : v.quantileLevel;  // PFE rows, then margin rows
     const float rank = level * static_cast<float>(v.nP - 1);
     const std::uint32_t k = std::min(static_cast<std::uint32_t>(std::floor(rank)), v.nP - 1);
@@ -347,11 +359,12 @@ FusedOutput finishFused(const FusedPlan& plan, const std::vector<FusedSlice>& sl
     }
     out.pfe[r] = result;
   }
+  });
   return out;
 }
 
-FusedOutput runFusedReference(const FusedPlan& plan) {
-  return finishFused(plan, {runFusedWorkgroups(plan, 0, plan.numWorkgroups())});
+FusedOutput runFusedReference(const FusedPlan& plan, SpinPool& pool) {
+  return finishFused(plan, {runFusedWorkgroups(plan, 0, plan.numWorkgroups(), pool)}, pool);
 }
 
 }  // namespace ccr::gpu

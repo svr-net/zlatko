@@ -1,14 +1,14 @@
 // Runs a Monte Carlo analysis of the library on one of three engines:
 //   WebGPU       the fused kernels on the GPU;
-//   CPU kernels  the same fused kernels on the CPU, workgroups split across Web Workers;
+//   CPU kernels  the same fused kernels on the CPU, in C++ (one call);
 //   WebAssembly  the library's ExposureEngine (path-level views, AMC).
 // Auto tries them in that order: WebGPU where the browser offers an adapter, the CPU kernels
 // where it does not, WebAssembly for portfolios the kernels cannot price (Bermudans).
 //
 // GPU path: gpuJobs (C++ compiles the plans) -> GpuEngine.run per plan (upload, dispatch,
-// read back) -> gpuAnalyse. CPU kernel path: cpuKernelSlices on every worker -> cpuKernelAnalyse.
-// Both end in the same C++ analysis; this file only routes calls.
-import { callOn, run, workerCount } from '../ccr-client.js';
+// read back) -> gpuAnalyse. CPU kernel path: cpuKernels. Both end in the same C++ analysis;
+// this file only routes calls.
+import { run } from '../ccr-client.js';
 import { el } from '../ui.js';
 import { GpuEngine } from './engine.js';
 
@@ -48,21 +48,13 @@ export async function runOnGpu(analysis, spec, { warmUp = false } = {}) {
   return { result: { ...result, gpuMs, adapter: gpu.name, plans: jobs.plans.length, compileMs: jobs.compileMs, numTerms: first?.numTerms, numDates: first?.numDates } };
 }
 
-/**
- * The fused kernels on the CPU: every worker runs its share of the workgroups of every job
- * (cpuKernelSlices), then the library finishes and analyses them (cpuKernelAnalyse). The
- * result does not depend on the number of workers.
- */
+/** The fused kernels on the CPU: one call into C++, which runs and analyses them. */
 export async function runOnCpuKernels(analysis, spec) {
-  const n = workerCount();
-  const t0 = performance.now();
-  const parts = (await Promise.all(Array.from({ length: n }, (_, part) =>
-    callOn(part, 'cpuKernelSlices', { ...spec, analysis, part, parts: n })))).map((r) => r.result);
-  if (parts[0].unsupported) return { unsupported: parts[0].unsupported };
-  const kernelMs = performance.now() - t0;
+  const result = await run('cpuKernels', { ...spec, analysis });
+  if (result.unsupported) return { unsupported: result.unsupported };
   globalThis.__ccrCpuKernelRuns = (globalThis.__ccrCpuKernelRuns || 0) + 1; // checked by the e2e test
-  const result = await run('cpuKernelAnalyse', { ...spec, analysis, parts });
-  return { result: { ...result, gpuMs: kernelMs, adapter: `${n} worker${n === 1 ? '' : 's'}`, workers: n } };
+  const n = result.threads;
+  return { result: { ...result, gpuMs: result.kernelMs, adapter: `${n} thread${n === 1 ? '' : 's'}` } };
 }
 
 const outcome = (engine, result, reason) => ({ result, engine, fused: engine !== 'wasm', label: LABELS[engine], reason });
