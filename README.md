@@ -125,7 +125,8 @@ python3 -m http.server -d web 8000      # any static server; file:// will not lo
 | `allocation.html` | Marginal (Euler), incremental and standalone CVA | `allocation` |
 | `cva.html` | Unilateral/bilateral CVA, term structure, running spread | `cva` |
 | `wwr.html` | Pathwise CVA against exposure–intensity correlation | `wrongWayRisk` |
-| `hedging.html` | CS01 buckets, CDS hedge, CRN vs independent-seed deltas | `hedging` |
+| `xva.html` | CVA, DVA, FVA, MVA and KVA with cumulative profiles, sweeps, allocation and sensitivities (WebAssembly engine) | `xva` |
+| `hedging.html` | CS01 buckets, CDS hedge, CRN vs independent-seed deltas, XVA credit and funding sensitivities | `hedging` |
 | `gpu.html` | Fused WebGPU kernels validated against WASM, with a benchmark | `gpuJobs` · `gpuAnalyse` (`validation`) |
 
 The pages share one specification: market, models, correlation, portfolio, CSA and simulation settings. You edit it on any
@@ -188,7 +189,8 @@ node web/tests/e2e.mjs                   # every page in headless Chromium (Play
 | Pricing counterparty risk | `cva/cva.hpp` | Unilateral CVA, CVA term structure, bilateral CVA/DVA with first-to-default, CVA as a running spread |
 | Wrong-way risk | `cva/cva.hpp` (`pathwiseCva`) | Path-by-path CVA using the simulated survival probabilities, with the intensity correlated to the exposure drivers |
 | GPU exposure | `gpu/fused_exposure.hpp` | The exposure pipeline as fused WGSL kernels: plan compiler, kernel sources, read-back summary, and a CPU reference of the kernels |
-| Hedging | `hedging/sensitivities.hpp` | Bucketed CS01 of CVA with re-bootstrapped curves, CDS hedge notionals from the hedge Jacobian, and market-risk deltas by bump-and-revalue with common random numbers |
+| XVA | `xva/xva.hpp` | FCA, FBA (FVA), MVA from a simulated initial-margin proxy, KVA, the combined total, and exact allocation of CVA, FCA and KVA to trades |
+| Hedging | `hedging/sensitivities.hpp` | XVA credit (counterparty and own) and funding sensitivities; bucketed CS01 of CVA with re-bootstrapped curves, CDS hedge notionals from the hedge Jacobian, and market-risk deltas by bump-and-revalue with common random numbers |
 
 ## Conventions
 

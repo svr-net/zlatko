@@ -136,6 +136,7 @@ struct Env {
   std::size_t counterparty = 0;
   std::shared_ptr<const CreditCurve> ownCurve;
   double ownRecovery = 0.4;
+  std::vector<CdsQuote> ownQuotes;
 
   ScenarioGenerator generator() const { return ScenarioGenerator(hw, assets, credits, correlation); }
   NettingSet nettingSet(bool withCsa = true) const {
@@ -279,8 +280,8 @@ Env parseEnv(const val& spec) {
   env.counterparty = static_cast<std::size_t>(num(spec, "counterparty", 0));
   if (has(spec, "own")) {
     env.ownRecovery = num(spec["own"], "recovery", 0.4);
-    env.ownCurve = std::make_shared<CreditCurve>(
-        bootstrapCreditCurve(*env.domestic, parseQuotes(spec["own"]["quotes"]), env.ownRecovery));
+    env.ownQuotes = parseQuotes(spec["own"]["quotes"]);
+    env.ownCurve = std::make_shared<CreditCurve>(bootstrapCreditCurve(*env.domestic, env.ownQuotes, env.ownRecovery));
   }
   if (has(spec, "trades")) {
     const val t = spec["trades"];
@@ -825,6 +826,40 @@ val exposure(val spec) {
   });
 }
 
+// Funding, margin and capital inputs of the XVA analyses (spec.xva, all optional).
+XvaParameters parseXva(const val& spec) {
+  XvaParameters p;
+  if (!has(spec, "xva")) return p;
+  const val x = spec["xva"];
+  p.fundingSpreadBorrow = num(x, "fundingSpreadBorrow", p.fundingSpreadBorrow);
+  p.fundingSpreadLend = num(x, "fundingSpreadLend", p.fundingSpreadLend);
+  p.marginFundingSpread = num(x, "marginFundingSpread", p.marginFundingSpread);
+  p.hurdleRate = num(x, "hurdleRate", p.hurdleRate);
+  p.capitalRatio = num(x, "capitalRatio", p.capitalRatio);
+  p.riskWeight = num(x, "riskWeight", p.riskWeight);
+  p.alpha = num(x, "alpha", p.alpha);
+  return p;
+}
+
+// Our own credit curve for XVA: without a spec.own section we are treated as default-free.
+const CreditCurve& ownCurveOrRiskless(const Env& env) {
+  static const CreditCurve riskless = CreditCurve::flat(0.0);
+  return env.ownCurve ? *env.ownCurve : riskless;
+}
+
+val xvaToJs(const Xva& x) {
+  val o = val::object();
+  o.set("cva", x.cva);
+  o.set("dva", x.dva);
+  o.set("fca", x.fca);
+  o.set("fba", x.fba);
+  o.set("fva", x.fva());
+  o.set("mva", x.mva);
+  o.set("kva", x.kva);
+  o.set("total", x.total());
+  return o;
+}
+
 // Marginal / incremental / standalone allocation of exposure and CVA.
 val allocation(val spec) {
   return guarded([&] {
@@ -843,10 +878,15 @@ val allocation(val spec) {
     const auto marginal = marginalExposureContributions(values, net, &deflator);
     const auto marginalEe = marginalExposureContributions(values, net);
     const double total = unilateralCva(r.profile, cc, rec);
+    const XvaParameters xvaParams = parseXva(spec);
+    const auto marginalXva = allocateExposureXva(times, marginal, cc, rec, ownCurveOrRiskless(env), xvaParams);
+    const ExposureXva totalXva = exposureXva(times, r.profile.discountedExpectedExposure, cc, rec, ownCurveOrRiskless(env), xvaParams);
 
     val out = val::object();
     out.set("times", arr(times));
     out.set("totalCva", total);
+    out.set("totalFca", totalXva.fca);
+    out.set("totalKva", totalXva.kva);
     out.set("totalEe", arr(r.profile.expectedExposure));
     val trades = val::array();
     for (std::size_t i = 0; i < values.size(); ++i) {
@@ -859,6 +899,8 @@ val allocation(val spec) {
       o.set("id", env.trades[i].trade->id());
       o.set("marginalEe", arr(marginalEe[i]));
       o.set("marginalCva", unilateralCva(times, marginal[i], cc, rec));
+      o.set("marginalFca", marginalXva[i].fca);
+      o.set("marginalKva", marginalXva[i].kva);
       o.set("incrementalCva", unilateralCva(times, inc, cc, rec));
       o.set("standaloneCva", unilateralCva(standalone, cc, rec));
       o.set("standaloneEe", arr(standalone.expectedExposure));
@@ -1139,6 +1181,25 @@ val creditHedges(const val& spec, const Env& env, const ExposureProfile& profile
   out.set("pnlUnhedged", arr(unhedged));
   out.set("pnlHedged", arr(hedged));
   out.set("pnlVolRatio", rms(hedged) / rms(unhedged));
+
+  // The same hedge for the whole XVA (CVA, DVA, FVA and KVA; MVA needs paths, see the xva page).
+  const XvaParameters xvaParams = parseXva(spec);
+  val xv = val::object();
+  const Xva total = xva(profile, {}, env.cptyCurve(), rec, ownCurveOrRiskless(env), env.ownRecovery, xvaParams);
+  xv.set("xva", xvaToJs(total));
+  if (!env.ownQuotes.empty()) {
+    const XvaSensitivities s = xvaSensitivities(profile, {}, *env.domestic, quotes, rec, env.ownQuotes, env.ownRecovery, xvaParams);
+    double parallelXva = 0.0, parallelOwn = 0.0;
+    for (double c : s.counterpartyCs01) parallelXva += c;
+    for (double c : s.ownCs01) parallelOwn += c;
+    xv.set("counterpartyCs01", arr(s.counterpartyCs01));
+    xv.set("counterpartyHedgeNotionals", arr(cdsHedgeNotionals(s.counterpartyCs01, jac)));
+    xv.set("parallelCounterpartyCs01", parallelXva);
+    xv.set("ownCs01", arr(s.ownCs01));
+    xv.set("parallelOwnCs01", parallelOwn);
+    xv.set("fundingSpread01", s.fundingSpread01);
+  }
+  out.set("xva", xv);
   return out;
 }
 
@@ -1265,6 +1326,99 @@ val runAnalysisOnCpu(const val& spec, const std::string& analysis) {
 
 val cva(val spec) {
   return guarded([&] { return runAnalysisOnCpu(spec, "cva"); });
+}
+
+// All XVA adjustments of the netting set on the CPU engine (the margin profile needs the paths):
+// CVA, DVA, FCA, FBA, MVA and KVA, their sensitivities and the allocation to trades.
+val xvaAnalysis(val spec) {
+  return guarded([&] {
+    const Env env = parseEnv(spec);
+    const auto jobs = analysisJobs(spec, env, "cva");
+    const JobResult r = runOnCpu(jobs.at(0), env, true);
+    if (!r.error.empty()) throw std::invalid_argument(r.error);
+    const ExposureResult& x = *r.paths;
+    const CreditCurve& cc = env.cptyCurve();
+    const CreditCurve& own = ownCurveOrRiskless(env);
+    const double rec = env.cptyRecovery();
+    const XvaParameters params = parseXva(spec);
+    const auto& times = r.profile.times;
+
+    const Matrix net = selectColumns(x.nettedValue, x.reportingIndices);
+    const Matrix deflator = selectColumns(x.scenarios.deflator, x.reportingIndices);
+    const auto im = initialMarginProfile(net, TimeGrid(times), deflator, num(spec, "imQuantile", 0.99),
+                                         num(spec, "imMprDays", 10.0) / 250.0);
+    const Xva total = xva(r.profile, im, cc, rec, own, env.ownRecovery, params);
+
+    val out = val::object();
+    out.set("profile", profileToJs(r.profile));
+    out.set("initialMargin", arr(im));
+    out.set("xva", xvaToJs(total));
+
+    // Cumulative cost of each adjustment up to every date (each is an integral over time).
+    auto part = [&](double Xva::*field) {
+      std::vector<double> c(times.size(), 0.0);
+      for (std::size_t k = 1; k < times.size(); ++k) {
+        ExposureProfile head = r.profile;
+        head.times.resize(k + 1);
+        head.discountedExpectedExposure.resize(k + 1);
+        head.discountedExpectedNegativeExposure.resize(k + 1);
+        const std::vector<double> imHead(im.begin(), im.begin() + static_cast<std::ptrdiff_t>(k + 1));
+        c[k] = xva(head, imHead, cc, rec, own, env.ownRecovery, params).*field;
+      }
+      return c;
+    };
+    out.set("cumulativeCva", arr(part(&Xva::cva)));
+    out.set("cumulativeFca", arr(part(&Xva::fca)));
+    out.set("cumulativeMva", arr(part(&Xva::mva)));
+    out.set("cumulativeKva", arr(part(&Xva::kva)));
+
+    // Funding spread and hurdle rate sweeps: FVA is linear in the spread, KVA in the hurdle rate.
+    std::vector<double> spreads, fvaBySpread, hurdles, kvaByHurdle;
+    for (int i = 0; i <= 10; ++i) {
+      XvaParameters p = params;
+      p.fundingSpreadBorrow = p.fundingSpreadLend = 0.0005 * i;
+      spreads.push_back(p.fundingSpreadBorrow);
+      fvaBySpread.push_back(xva(r.profile, {}, cc, rec, own, env.ownRecovery, p).fva());
+      p = params;
+      p.hurdleRate = 0.02 * i;
+      hurdles.push_back(p.hurdleRate);
+      kvaByHurdle.push_back(xva(r.profile, {}, cc, rec, own, env.ownRecovery, p).kva);
+    }
+    out.set("spreadGrid", arr(spreads));
+    out.set("fvaBySpread", arr(fvaBySpread));
+    out.set("hurdleGrid", arr(hurdles));
+    out.set("kvaByHurdle", arr(kvaByHurdle));
+
+    if (!env.ownQuotes.empty()) {
+      const XvaSensitivities s = xvaSensitivities(r.profile, im, *env.domestic, env.creditQuotes.at(env.counterparty), rec,
+                                                  env.ownQuotes, env.ownRecovery, params);
+      std::vector<double> mats;
+      for (const auto& q : env.creditQuotes.at(env.counterparty)) mats.push_back(q.maturity);
+      val sens = val::object();
+      sens.set("maturities", arr(mats));
+      sens.set("counterpartyCs01", arr(s.counterpartyCs01));
+      sens.set("ownCs01", arr(s.ownCs01));
+      sens.set("fundingSpread01", s.fundingSpread01);
+      out.set("sensitivities", sens);
+    }
+
+    // Marginal allocation of the EE-driven adjustments (CVA, FCA, KVA) to trades.
+    std::vector<Matrix> values;
+    for (const auto& m : x.tradeValues) values.push_back(selectColumns(m, x.reportingIndices));
+    const auto marginal = marginalExposureContributions(values, net, &deflator);
+    const auto parts = allocateExposureXva(times, marginal, cc, rec, own, params);
+    val trades = val::array();
+    for (std::size_t i = 0; i < parts.size(); ++i) {
+      val o = val::object();
+      o.set("id", env.trades[i].trade->id());
+      o.set("cva", parts[i].cva);
+      o.set("fca", parts[i].fca);
+      o.set("kva", parts[i].kva);
+      trades.call<void>("push", o);
+    }
+    out.set("trades", trades);
+    return out;
+  });
 }
 
 val wrongWayRisk(val spec) {
@@ -1547,6 +1701,7 @@ EMSCRIPTEN_BINDINGS(ccr) {
   emscripten::function("collateral", &collateral);
   emscripten::function("wrongWayRisk", &wrongWayRisk);
   emscripten::function("hedging", &hedging);
+  emscripten::function("xva", &xvaAnalysis);
   emscripten::function("gpuKernels", &gpuKernels);
   emscripten::function("gpuJobs", &gpuJobs);
   emscripten::function("gpuAnalyse", &gpuAnalyse);

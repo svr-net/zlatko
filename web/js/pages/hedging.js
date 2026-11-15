@@ -4,13 +4,13 @@ import { card, grid, initPage, runButton, specEditor, table, tiles } from '../ui
 
 const page = initPage({
   id: 'hedging',
-  title: 'Hedging CVA',
-  context: 'ccr/hedging: creditSpreadSensitivities · cdsHedgeJacobian · cdsHedgeNotionals · centralDifference',
+  title: 'Hedging CVA and XVA',
+  context: 'ccr/hedging: creditSpreadSensitivities · cdsHedgeJacobian · cdsHedgeNotionals · xvaSensitivities · centralDifference',
   description: 'Credit risk: bump each CDS quote by 1bp, re-bootstrap the curve and reprice CVA to get bucketed CS01s. Then solve for the CDS notionals whose ' +
     'sensitivities offset them. Market risk: bump-and-revalue the whole Monte Carlo. Re-using the same random numbers for the up and down runs ' +
     '(common random numbers) is what makes the finite-difference delta stable as the bump shrinks.',
 });
-specEditor(page, ['market', 'assets', 'credit', 'simulation', 'portfolio', 'csa']);
+specEditor(page, ['market', 'assets', 'credit', 'own', 'xva', 'simulation', 'portfolio', 'csa']);
 
 const button = runButton(page, 'Compute hedges', async (spec) => {
   const t0 = performance.now();
@@ -48,6 +48,21 @@ const button = runButton(page, 'Compute hedges', async (spec) => {
     table(box, ['quantity', 'value'], [
       [`CVA delta (CRN, h = ${a.hedgeBump})`, fmt.num(a.hedgeDelta, 0)],
       ['hedge', `${a.hedgeUnits > 0 ? 'buy' : 'sell'} ${fmt.num(Math.abs(a.hedgeUnits))} units forward (horizon)`],
+    ]);
+  }
+  if (r.xva && r.xva.counterpartyCs01) {
+    const x = r.xva;
+    barChart(card(g, 'XVA credit sensitivities', 'Change in the total XVA (CVA − DVA + FCA − FBA + KVA) for a 1bp move in each counterparty and own CDS quote.'), {
+      labels, series: [{ name: 'counterparty CS01', values: Array.from(x.counterpartyCs01) }, { name: 'own CS01', values: Array.from(x.ownCs01), colorIndex: 2 }],
+      tooltipFormat: (v) => fmt.num(v, 2),
+    });
+    const xbox = card(g, 'XVA hedge', 'Counterparty CDS protection that offsets the XVA credit sensitivity, and the funding sensitivity.');
+    table(xbox, ['quantity', 'value'], [
+      ['total XVA (no MVA)', fmt.num(x.xva.total)],
+      ['FVA01 (funding spreads +1bp)', fmt.num(x.fundingSpread01, 1)],
+      ['parallel counterparty CS01', fmt.num(x.parallelCounterpartyCs01, 1)],
+      ['parallel own CS01', fmt.num(x.parallelOwnCs01, 1)],
+      ...Array.from(x.counterpartyHedgeNotionals).map((n, i) => [`CDS ${labels[i]} notional`, fmt.num(n, 0)]),
     ]);
   }
   const box = card(g, 'Hedge Jacobian', 'Change in value of a unit-notional par CDS (rows) for a 1bp move in each quote (columns).');

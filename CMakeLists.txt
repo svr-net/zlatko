@@ -37,6 +37,7 @@ add_library(ccr
   src/exposure/exposure_engine.cpp
   src/exposure/allocation.cpp
   src/cva/cva.cpp
+  src/xva/xva.cpp
   src/hedging/sensitivities.cpp
   src/gpu/fused_exposure.cpp
   src/gpu/fused_kernels.cpp
@@ -85,6 +86,7 @@ if(CCR_BUILD_TESTS)
     tests/test_instruments.cpp
     tests/test_exposure.cpp
     tests/test_cva.cpp
+    tests/test_xva.cpp
     tests/test_hedging.cpp
     tests/test_gpu.cpp
   )
