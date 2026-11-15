@@ -2,7 +2,6 @@ import { run } from '../ccr-client.js';
 import { barChart, fmt, lineChart } from '../charts.js';
 import data from '../ai/backtest-data.js';
 import { SKILL_MD, STATE_FIELDS, TOOLS, adapters, executeTool, runAgentLoop, runHarness, scriptedLlm } from '../ai/skill.js';
-import { TARGETS, runBacktest } from '../ai/surrogate.js';
 import { engineSelector, runAnalysis } from '../gpu/backend.js';
 import { card, el, grid, initPage, runButton, table, tiles } from '../ui.js';
 
@@ -27,8 +26,9 @@ const pctS = (v) => (v === null || v === undefined ? '–' : (100 * v).toFixed(1
 
 runButton(page, 'Run surrogate back test', async () => {
   const t0 = performance.now();
-  const bt = await runBacktest(data, { onProgress: (m) => { page.status.textContent = m + '…'; } });
-  const day = Array.from({ length: bt.days }, (_, i) => i);
+  page.status.textContent = 'Fitting and back-testing the surrogates in C++…';
+  const bt = await run('surrogateBacktest', { dataset: data });
+  const day = Array.from(bt.truthTotal, (_, i) => i);
   const mlp = bt.models.mlp, poly = bt.models.poly2, lin = bt.models.linear;
   window.__aiBacktest = { mlpMaeBp: mlp.walkForward.total.maeBp, polyMaeBp: poly.static.total.maeBp };
 
@@ -36,7 +36,7 @@ runButton(page, 'Run surrogate back test', async () => {
     { label: 'MLP walk-forward error', value: bp(mlp.walkForward.total.maeBp), hint: `mean abs. error of total XVA, % of the ${usd(meta.grossNotional)} gross notional` },
     { label: 'MLP P&L-explain', value: pctS(mlp.walkForward.pnl.effectiveness), hint: 'share of daily XVA P&L variance explained' },
     { label: 'Stress days (outside training box)', value: `${bt.outsideDays} of ${bt.days}`, hint: 'days 150-200 leave the Latin-hypercube range' },
-    { label: 'Speed-up', value: `${fmt.num(1000 * data.nativeMsPerRun / mlp.inferMicros)}×`, hint: `${fmt.num(data.nativeMsPerRun)} ms per Monte Carlo run vs ${mlp.inferMicros.toFixed(1)} µs per surrogate call` },
+    { label: 'Speed-up', value: `${fmt.num(mlp.speedUp)}×`, hint: `${fmt.num(data.nativeMsPerRun)} ms per Monte Carlo run vs ${mlp.inferMicros.toFixed(1)} µs per surrogate call` },
   ]);
 
   const g = grid(page.content, true);
@@ -49,14 +49,13 @@ runButton(page, 'Run surrogate back test', async () => {
       { name: 'MLP', y: mlp.static.predTotal, colorIndex: 2, dash: true },
     ],
   });
-  const err = (m) => m.map((v, i) => v - bt.truthTotal[i]);
   lineChart(card(g, 'Pricing error (surrogate − engine)', 'Static models. The error grows when the market leaves the training range.'), {
     x: day, xLabel: 'day', yLabel: 'error (USD)', zero: true,
     series: [
-      { name: 'Linear', y: err(lin.static.predTotal), colorIndex: 3 },
-      { name: 'Quadratic ridge', y: err(poly.static.predTotal), colorIndex: 1 },
-      { name: 'MLP', y: err(mlp.static.predTotal), colorIndex: 2 },
-      { name: 'MLP walk-forward', y: err(mlp.walkForward.predTotal), colorIndex: 4 },
+      { name: 'Linear', y: Array.from(lin.static.errorTotal), colorIndex: 3 },
+      { name: 'Quadratic ridge', y: Array.from(poly.static.errorTotal), colorIndex: 1 },
+      { name: 'MLP', y: Array.from(mlp.static.errorTotal), colorIndex: 2 },
+      { name: 'MLP walk-forward', y: Array.from(mlp.walkForward.errorTotal), colorIndex: 4 },
     ],
   });
 
@@ -73,14 +72,14 @@ runButton(page, 'Run surrogate back test', async () => {
     'Walk-forward refits every 21 days on the training window plus all earlier days (their engine prices are known overnight).'),
   ['model', 'parameters', 'MAE (all)', 'MAE (inside)', 'MAE (stress)', 'MAPE', 'max error', 'P&L explain', 'sign hit'], rows);
 
-  const names = TARGETS.map((t) => t.toUpperCase());
+  const comps = Object.entries(mlp.walkForward.components);
   barChart(card(page.content, 'Error by adjustment (MLP, walk-forward)', 'Mean absolute error of each adjustment, in USD.'), {
-    labels: names, series: [{ name: 'MAE', values: TARGETS.map((t) => mlp.walkForward.components[t].mae) }],
+    labels: comps.map(([k]) => k.toUpperCase()), series: [{ name: 'MAE', values: comps.map(([, c]) => c.mae) }],
   });
   table(card(page.content, 'Cost of the models', 'Training once is cheap; the expensive part is the Monte Carlo labels (160 engine runs).'),
     ['model', 'fit time', 'per prediction', 'engine runs to train'],
     [lin, poly, mlp].map((m) => [m.label, `${fmt.num(m.fitMs)} ms`, `${m.inferMicros.toFixed(1)} µs`, `${meta.trainStates}`]));
-  return `Done in ${fmt.num(performance.now() - t0)} ms (${bt.days} days, ${meta.trainStates} training states)`;
+  return `Done in ${fmt.num(performance.now() - t0)} ms (${bt.days} days, ${meta.trainStates} training states, fitted in C++)`;
 });
 
 // ------------------------------------------------------------------ 2. agent skill (static sections)
@@ -92,7 +91,7 @@ page.main.append(extra);
 // else on the CPU); the agent layer only sees the library's result.
 let lastEngine = '';
 const engineRunner = async (fn, spec) => {
-  if (fn !== 'xva') return run(fn, spec);
+  if (fn !== 'xva' && fn !== 'xvaCompare') return run(fn, spec);
   const r = await runAnalysis(fn, spec);
   lastEngine = `${r.label} (${r.result.adapter})`;
   return r.result;

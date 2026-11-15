@@ -40,6 +40,7 @@ add_library(ccr
   src/cva/cva.cpp
   src/xva/xva.cpp
   src/app/analyses.cpp
+  src/ai/surrogate.cpp
   src/hedging/sensitivities.cpp
   src/gpu/fused_exposure.cpp
   src/gpu/fused_kernels.cpp
@@ -97,6 +98,7 @@ if(CCR_BUILD_TESTS)
     tests/test_hedging.cpp
     tests/test_gpu.cpp
     tests/test_parallel.cpp
+    tests/test_ai.cpp
   )
   target_link_libraries(ccr_tests PRIVATE ccr)
   add_test(NAME ccr_tests COMMAND ccr_tests)

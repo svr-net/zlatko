@@ -603,6 +603,17 @@ std::vector<double> hedgingBumps(const val& spec) {
   return has(spec, "bumps") ? vec(spec["bumps"]) : std::vector<double>{0.04, 0.02, 0.01, 0.005};
 }
 
+Value withMarketState(const Value& spec);  // see the AI chapter below
+
+// spec with its marketState replaced by spec.shockState, applied.
+Value shockedSpec(const Value& spec) {
+  Value s = Value::object();
+  for (const auto& [k, v] : spec.items())
+    if (k != "marketState" && k != "shockState") s.set(k, v);
+  s.set("marketState", spec["shockState"]);
+  return withMarketState(s);
+}
+
 struct BermudanSpec {
   InterestRateSwap swap;
   std::vector<double> exercises;
@@ -639,6 +650,14 @@ std::vector<Job> analysisJobs(const val& spec, const Env& env, const std::string
   } else if (analysis == "cva" || analysis == "validation" || analysis == "xva") {
     jobs.push_back(makeJob("base", env, fixed(gen), env.sim, env.csa));
     if (analysis == "xva") jobs.back().options.perTrade = true, jobs.back().options.imQuantile = num(spec, "imQuantile", 0.99);
+  } else if (analysis == "xvaCompare") {
+    // The base market and the shocked one (spec.shockState) as two jobs of one analysis.
+    jobs.push_back(makeJob("base", env, fixed(gen), env.sim, env.csa));
+    jobs.back().options.perTrade = true, jobs.back().options.imQuantile = num(spec, "imQuantile", 0.99);
+    const Env shocked = parseEnv(shockedSpec(spec));
+    jobs.push_back(makeJob("shocked", shocked, [g = shocked.generator()] { return g; }, shocked.sim, shocked.csa,
+                           shocked.nettingSet(false)));
+    jobs.back().options = jobs.front().options;
   } else if (analysis == "instruments") {
     jobs.push_back(makeJob("trades", env, fixed(gen), env.sim, std::nullopt));
     jobs.back().options.tradeViews = true;
@@ -895,6 +914,8 @@ val xvaResult(const val& spec, const Env& env, const JobResult& r) {
   out.set("profile", profileToJs(r.profile));
   out.set("initialMargin", arr(im));
   out.set("xva", xvaToJs(total));
+  out.set("identityHolds", std::fabs(total.cva - total.dva + total.fca - total.fba + total.mva + total.kva - total.total()) <=
+                               1e-6 * std::max(1.0, std::fabs(total.total())));
   out.set("numPaths", static_cast<double>(r.numPaths));
 
   // Cumulative cost of each adjustment up to every date (each is an integral over time).
@@ -1317,6 +1338,17 @@ val combine(const val& spec, const Env& env, const std::string& analysis, const 
     }
     out.set("assetDeltas", deltas);
     out.set("cvaDv01", 0.5 * (cvaAt(i) - cvaAt(i + 1)));
+  } else if (analysis == "xvaCompare") {
+    if (val e = firstError(results); !e.isUndefined()) throw std::invalid_argument(e.as<std::string>());
+    const Value shocked = shockedSpec(spec);
+    const Env shockedEnv = parseEnv(shocked);
+    const val base = xvaResult(spec, env, results.at(0)), bumped = xvaResult(shocked, shockedEnv, results.at(1));
+    val change = val::object();
+    for (const char* k : {"cva", "dva", "fca", "fba", "fva", "mva", "kva", "total"})
+      change.set(k, bumped["xva"][k].as<double>() - base["xva"][k].as<double>());
+    out.set("base", base);
+    out.set("shocked", bumped);
+    out.set("change", change);
   } else if (analysis == "instruments") {
     out = instrumentsResult(env, results.at(0));
   } else if (analysis == "models") {
@@ -1345,6 +1377,8 @@ val combine(const val& spec, const Env& env, const std::string& analysis, const 
 // uploads, dispatches and reads back. gpuAnalyse(spec) takes the read-backs
 // (spec.gpuOutputs[i] = { sums, pfe }, null for an invalid job) and returns the result in
 // the shape of the CPU analysis. cpuKernels(spec) runs the same kernels on the CPU instead.
+
+Value withMarketState(const Value& spec);  // see the AI chapter below
 
 val gpuKernels(val) {
   val o = val::object();
@@ -1414,7 +1448,8 @@ GpuJobs compileJobs(const val& spec, const Env& env) {
   return g;
 }
 
-val gpuJobs(val spec) {
+val gpuJobs(val input) {
+  const val spec = withMarketState(input);
   return guarded([&] {
     const Env env = parseEnv(spec);
     const double t0 = nowMs();
@@ -1518,7 +1553,8 @@ val analyseFused(const val& spec, const std::function<std::optional<gpu::FusedOu
   return combine(spec, env, analysis, g.jobs, results);
 }
 
-val gpuAnalyse(val spec) {
+val gpuAnalyse(val input) {
+  const val spec = withMarketState(input);
   return guarded([&] {
     const val outputs = spec["gpuOutputs"];
     return analyseFused(spec, [&](std::size_t i, const gpu::FusedPlan&) -> std::optional<gpu::FusedOutput> {
@@ -1534,7 +1570,8 @@ val gpuAnalyse(val spec) {
 // The CPU backend of the fused pipeline: the same kernels in C++ (runFusedReference), parallel
 // on the lock-free SpinPool where the build has threads (natively; one thread in this
 // single-threaded WebAssembly build). One call per analysis, the same result shape as gpuAnalyse.
-val cpuKernels(val spec) {
+val cpuKernels(val input) {
+  const val spec = withMarketState(input);
   return guarded([&] {
     double kernelMs = 0.0;  // the kernels only (validation also runs ExposureEngine in this call)
     val out = analyseFused(spec, [&](std::size_t, const gpu::FusedPlan& plan) -> std::optional<gpu::FusedOutput> {
@@ -1547,6 +1584,162 @@ val cpuKernels(val spec) {
       out.set("kernelMs", kernelMs);
       out.set("threads", static_cast<double>(defaultPool().concurrency()));
     }
+    return out;
+  });
+}
+
+// ------------------------------------------------------------------ AI chapter (X10)
+
+// A deep copy of a value (Values share their contents, like JavaScript objects).
+Value deepCopy(const Value& v) {
+  switch (v.type()) {
+    case Value::Type::Object: {
+      Value o = Value::object();
+      for (const auto& [k, e] : v.items()) o.set(k, deepCopy(e));
+      return o;
+    }
+    case Value::Type::Array: {
+      Value a = Value::array();
+      for (const auto& e : v.elements()) a.push(deepCopy(e));
+      return a;
+    }
+    default: return v;  // scalars and typed arrays are not modified below
+  }
+}
+
+// The market state of the XVA agent tools and the surrogates, applied to a specification:
+// counterparty CDS quotes and CIR parameters scaled, own quotes scaled, a parallel rate shift,
+// the EURUSD volatility and the funding spreads (as price() of examples/xva_ai_dataset.cpp).
+Value withMarketState(const Value& spec) {
+  const Value& st = spec["marketState"];
+  if (st.isUndefined() || st.isNull()) return spec;
+  const double mc = num(st, "cptySpreadMultiplier", 1.0), mo = num(st, "ownSpreadMultiplier", 1.0);
+  const double dr = num(st, "rateShift", 0.0), vol = num(st, "fxVol", 0.1), fs = num(st, "fundingSpread", 0.01);
+  Value out = deepCopy(spec);
+  auto scaled = [](const Value& quotes, double m) {
+    Value q = Value::array();
+    for (const auto& e : quotes.elements()) {
+      Value o = deepCopy(e);
+      o.set("spread", e["spread"].as<double>() * m);
+      q.push(o);
+    }
+    return q;
+  };
+  Value domestic = deepCopy(spec["domestic"]);
+  Value rates = Value::array();
+  for (double r : vec(spec["domestic"]["rates"])) rates.push(r + dr);
+  domestic.set("rates", rates);
+  out.set("domestic", domestic);
+  if (spec["assets"].size() > 0) {
+    Value list = Value::array();
+    Value first = deepCopy(spec["assets"][0]);
+    first.set("vol", vol);
+    list.push(first);
+    for (std::size_t i = 1; i < spec["assets"].size(); ++i) list.push(spec["assets"][i]);
+    out.set("assets", list);
+  }
+  if (spec["credits"].size() > 0) {
+    Value credits = Value::array();
+    Value c = deepCopy(spec["credits"][0]);
+    c.set("quotes", scaled(spec["credits"][0]["quotes"], mc));
+    const Value& cir = spec["credits"][0]["cir"];
+    Value ncir = deepCopy(cir);
+    ncir.set("theta", num(cir, "theta", 0.02) * mc);
+    ncir.set("xi", num(cir, "xi", 0.1) * std::sqrt(mc));
+    ncir.set("y0", num(cir, "y0", 0.012) * mc);
+    c.set("cir", ncir);
+    credits.push(c);
+    for (std::size_t i = 1; i < spec["credits"].size(); ++i) credits.push(spec["credits"][i]);
+    out.set("credits", credits);
+  }
+  if (has(spec, "own")) {
+    Value own = deepCopy(spec["own"]);
+    own.set("quotes", scaled(spec["own"]["quotes"], mo));
+    out.set("own", own);
+  }
+  Value x = has(spec, "xva") ? deepCopy(spec["xva"]) : Value::object();
+  x.set("fundingSpreadBorrow", fs);
+  x.set("fundingSpreadLend", 0.5 * fs);
+  x.set("marginFundingSpread", fs);
+  out.set("xva", x);
+  return out;
+}
+
+ai::Rows rowsOf(const Value& v) {
+  ai::Rows rows;
+  for (const auto& r : v.elements()) rows.push_back(r.numbers());
+  return rows;
+}
+
+Value statsToJs(const ai::ErrorStats& e) {
+  Value o = Value::object();
+  o.set("mae", e.mae), o.set("rmse", e.rmse), o.set("bias", e.bias), o.set("max", e.max);
+  o.set("p95", e.p95), o.set("maeBp", e.maeBp), o.set("mape", e.mape);
+  return o;
+}
+
+Value scoreToJs(const ai::Score& s) {
+  Value o = Value::object();
+  o.set("predTotal", arr(s.predTotal));
+  o.set("errorTotal", arr(s.errorTotal));
+  o.set("total", statsToJs(s.total));
+  o.set("inRange", s.inRange ? statsToJs(*s.inRange) : Value::null());
+  o.set("outRange", s.outRange ? statsToJs(*s.outRange) : Value::null());
+  Value comp = Value::object();
+  for (std::size_t k = 0; k < ai::kTargets; ++k) comp.set(ai::kTargetNames[k], statsToJs(s.components[k]));
+  o.set("components", comp);
+  Value pnl = Value::object();
+  pnl.set("effectiveness", s.pnl.effectiveness), pnl.set("signHit", s.pnl.signHit);
+  pnl.set("residualSd", s.pnl.residualSd), pnl.set("actualSd", s.pnl.actualSd);
+  o.set("pnl", pnl);
+  return o;
+}
+
+// The surrogate back test of the AI page on the committed dataset (spec.dataset, the content of
+// web/js/ai/backtest-data.js), fitted and scored in C++ (the MLP on the thread pool natively).
+Value surrogateBacktest(Value spec) {
+  return guarded([&] {
+    const Value& d = spec["dataset"];
+    ai::Dataset data;
+    data.trainX = rowsOf(d["train"]["x"]);
+    data.trainY = rowsOf(d["train"]["y"]);
+    data.testX = rowsOf(d["backtest"]["x"]);
+    data.testY = rowsOf(d["backtest"]["y"]);
+    data.low = d["meta"]["low"].numbers();
+    data.high = d["meta"]["high"].numbers();
+    data.grossNotional = d["meta"]["grossNotional"].as<double>();
+    ai::BacktestOptions o;
+    o.mlpEpochs = static_cast<std::size_t>(num(spec, "mlpEpochs", 2500));
+    o.mlpRefitEpochs = static_cast<std::size_t>(num(spec, "mlpRefitEpochs", 400));
+    o.refitEvery = static_cast<std::size_t>(num(spec, "refitEvery", 21));
+    const double t0 = nowMs();
+    const ai::Backtest bt = ai::runBacktest(data, o);
+    Value out = Value::object();
+    out.set("days", static_cast<double>(bt.days));
+    out.set("outsideDays", static_cast<double>(bt.outsideDays));
+    out.set("truthTotal", arr(bt.truthTotal));
+    out.set("elapsedMs", nowMs() - t0);
+    Value baseline = Value::object();
+    Value lag1 = scoreToJs(bt.lag1), weekly = scoreToJs(bt.weekly);
+    lag1.set("label", "Yesterday's engine value");
+    weekly.set("label", "Engine run weekly, carried forward");
+    baseline.set("lag1", lag1);
+    baseline.set("weekly", weekly);
+    out.set("baseline", baseline);
+    const double engineMs = num(d, "nativeMsPerRun", 0.0);
+    Value models = Value::object();
+    for (const auto& m : bt.models) {
+      Value o2 = Value::object();
+      o2.set("label", m.label);
+      o2.set("parameters", static_cast<double>(m.parameters));
+      o2.set("fitMs", m.fitMs);
+      o2.set("inferMicros", m.inferMicros);
+      o2.set("speedUp", m.inferMicros > 0.0 ? 1000.0 * engineMs / m.inferMicros : kNaN);  // engine run vs one prediction
+      o2.set("static", scoreToJs(m.fittedOnce));
+      o2.set("walkForward", scoreToJs(m.walkForward));
+      models.set(m.key, o2);
+    }
+    out.set("models", models);
     return out;
   });
 }
@@ -1568,6 +1761,7 @@ const std::vector<std::pair<std::string, Entry>>& table() {
       {"gpuJobs", &gpuJobs},
       {"gpuAnalyse", &gpuAnalyse},
       {"cpuKernels", &cpuKernels},
+      {"surrogateBacktest", &surrogateBacktest},
   };
   return t;
 }

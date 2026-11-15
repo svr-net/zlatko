@@ -23,7 +23,7 @@ function run(name, fn) {
 }
 const fused = (analysis, extra = {}) => run(`cpuKernels ${analysis}`, () => call('cpuKernels', { ...spec, analysis, ...extra }));
 
-check(Array.from(mod.functions()).join() === 'version,coreDemo,marketDemo,gpuKernels,gpuJobs,gpuAnalyse,cpuKernels', 'entry points');
+check(Array.from(mod.functions()).join() === 'version,coreDemo,marketDemo,gpuKernels,gpuJobs,gpuAnalyse,cpuKernels,surrogateBacktest', 'entry points');
 const ver = run('version', () => call('version'));
 const cmakeVersion = (await import('node:fs')).readFileSync(new URL('../../CMakeLists.txt', import.meta.url), 'utf8').match(/^\s*VERSION ([0-9.]+)$/m)[1];
 if (ver) check(ver.library === `zlatko ccr ${cmakeVersion}`, `version() reports the CMake project version: ${ver.library}`);
