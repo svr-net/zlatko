@@ -9,9 +9,8 @@ self.onmessage = async (event) => {
   const { id, fn, spec } = event.data;
   try {
     const ccr = await ready;
-    if (typeof ccr[fn] !== 'function') throw new Error(`unknown function ${fn}`);
     const t0 = performance.now();
-    const result = ccr[fn](spec);
+    const result = ccr.call(fn, spec ?? {}); // every entry point is ccr::app::call(fn, spec) in C++
     const ms = performance.now() - t0;
     if (result && result.error) self.postMessage({ id, error: result.error });
     else self.postMessage({ id, result, ms });

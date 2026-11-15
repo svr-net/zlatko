@@ -199,7 +199,9 @@ FusedPlan compile(const ExposureEngine& engine, const NettingSet& nettingSet, do
 FusedPlan compile(const ExposureEngine& engine, const NettingSet& nettingSet, const FusedOptions& options) {
   const double pfeQuantile = options.pfeQuantile;
   const std::size_t counterparty = options.counterparty;
-  if (options.perTrade && nettingSet.trades.size() > kMaxTradeGroups)
+  FusedOptions effective = options;
+  if (options.gross || options.tradeViews) effective.perTrade = true;
+  if (effective.perTrade && nettingSet.trades.size() > kMaxTradeGroups)
     throw std::invalid_argument("per-trade statistics on the GPU support at most 16 trades");
   if (options.imQuantile < 0.0 || options.imQuantile > 1.0) throw std::invalid_argument("imQuantile must be in [0, 1]");
   const ScenarioGenerator& gen = engine.generator();
@@ -230,7 +232,7 @@ FusedPlan compile(const ExposureEngine& engine, const NettingSet& nettingSet, co
   plan.hasCsa = nettingSet.collateral.has_value();
   plan.pfeQuantile = pfeQuantile;
   plan.imQuantile = options.imQuantile;
-  plan.numTradeGroups = options.perTrade ? nettingSet.trades.size() : 0;
+  plan.numTradeGroups = effective.perTrade ? nettingSet.trades.size() : 0;
   plan.statsPerDate = (kStatsPerDate + kTradeStats * plan.numTradeGroups + 3) / 4 * 4;
 
   // Per-step deterministic coefficients (the exact transitions of ScenarioGenerator).
@@ -400,6 +402,171 @@ FusedPlan compile(const ExposureEngine& engine, const NettingSet& nettingSet, co
     }
   }
 
+  // ---- Rows and row-statistics requests of the requested views.
+  std::vector<std::size_t> reportingDates;
+  for (std::size_t j = 0; j < nT; ++j)
+    if (reporting.find(grid[j]).has_value()) reportingDates.push_back(j);
+  const auto nR = static_cast<std::uint32_t>(reportingDates.size());
+  const std::size_t nTr = plan.numTradeGroups;
+  const std::size_t S = std::min(options.samples, std::min<std::size_t>(kMaxSamples, plan.numPaths));
+  RowLayout& L = plan.rows;
+  ViewOutputs& V = plan.views;
+  std::uint32_t nextRow = 0;
+  auto block = [&](std::uint32_t rows) { const std::uint32_t r = nextRow; nextRow += rows; return r; };
+  L.exposure = block(nR);
+  if (plan.hasInitialMargin()) L.valueChange = block(nR);
+  const bool histogram = options.histogramTime >= 0.0;
+  if (S > 0 || histogram) L.exposureValue = block(nR);
+  if (S > 0) L.netted = block(nR);
+  if (plan.hasCsa && (S > 0 || options.collateralBands)) L.collateral = block(nR);
+  if (options.gross) L.gross = block(nR);
+  if (options.tradeViews) L.trades = block(static_cast<std::uint32_t>(nTr * nR));
+  if (options.exerciseViews && !plan.amc.empty()) L.exercise = block(static_cast<std::uint32_t>(plan.amc.size()));
+  // Risk-factor probes: terms that write the state into a row on a date.
+  auto probe = [&](std::size_t j, std::uint32_t row, int what, std::size_t index, double offset = 0.0, double A = 0.0, double B = 0.0) {
+    termsAt[j].push_back({double(kProbe), double(what + 16 * static_cast<int>(index)), offset, A, B, double(row), 0.0, 0.0, 0.0, 0.0, 0.0});
+  };
+  std::uint32_t deflatorRows = kNoRow;
+  if (options.gross || options.tradeViews || options.factorViews) {
+    deflatorRows = block(nR);
+    for (std::uint32_t r = 0; r < nR; ++r) probe(reportingDates[r], deflatorRows + r, 1, 0);
+  }
+  struct FactorRows { std::uint32_t x = kNoRow, bond = kNoRow; std::vector<std::uint32_t> asset, deflatedAsset, intensity, survival, increments; } F;
+  if (options.factorViews) {
+    F.x = block(nR);
+    F.bond = block(nR);
+    for (std::uint32_t r = 0; r < nR; ++r) {
+      const std::size_t j = reportingDates[r];
+      const double T = std::max(options.bondMaturity, grid[j]);
+      probe(j, F.x + r, 0, 0);
+      probe(j, F.bond + r, 7, 0, 0.0, bondA(grid[j], T), bondB(grid[j], T));
+    }
+    for (std::size_t ai = 0; ai < assets.size(); ++ai) {
+      F.asset.push_back(block(nR));
+      F.deflatedAsset.push_back(block(nR));
+      for (std::uint32_t r = 0; r < nR; ++r) {
+        probe(reportingDates[r], F.asset.back() + r, 2, ai);
+        probe(reportingDates[r], F.deflatedAsset.back() + r, 6, ai);
+      }
+    }
+    for (std::size_t c = 0; c < credits.size(); ++c) {
+      F.intensity.push_back(block(nR));
+      F.survival.push_back(block(nR));
+      for (std::uint32_t r = 0; r < nR; ++r) {
+        probe(reportingDates[r], F.intensity.back() + r, 4, c);
+        probe(reportingDates[r], F.survival.back() + r, 5, c);
+      }
+    }
+    if (nT > 1) {  // first-step increments: x(t1) - 0, ln S(t1) / S0, y(t1) - y0
+      F.increments.push_back(block(1));
+      probe(1, F.increments.back(), 0, 0);
+      for (std::size_t ai = 0; ai < assets.size(); ++ai) F.increments.push_back(block(1)), probe(1, F.increments.back(), 3, ai);
+      for (std::size_t c = 0; c < credits.size(); ++c)
+        F.increments.push_back(block(1)), probe(1, F.increments.back(), 4, c, -credits[c]->y0());
+    }
+  }
+  L.total = nextRow;
+
+  auto request = [&](RowOp op, std::uint32_t row, std::uint32_t count = 1, double level = 0.0, std::uint32_t row2 = 0,
+                     double lo = 0.0, double hi = 0.0) {
+    const std::size_t out = plan.numOutputs;
+    for (double v : {double(op), double(row), double(row2), double(count), level, lo, hi, double(out)})
+      plan.requests.push_back(static_cast<float>(v));
+    plan.numOutputs += op == kRowHistogram ? count + 2 : count;
+    return out;
+  };
+  auto perDate = [&](RowOp op, std::uint32_t base, std::uint32_t count = 1, double level = 0.0, std::uint32_t row2Base = 0) {
+    std::size_t first = ViewOutputs::none;
+    for (std::uint32_t r = 0; r < nR; ++r) {
+      const std::size_t o = request(op, base + r, count, level, row2Base == 0 ? 0 : row2Base + r);
+      if (r == 0) first = o;
+    }
+    return first;
+  };
+  auto profileOf = [&](std::uint32_t base) {
+    ProfileOutputs o;
+    o.mean = perDate(kRowMean, base);
+    o.positive = perDate(kRowMeanPos, base);
+    o.negative = perDate(kRowMeanNeg, base);
+    o.pfe = perDate(kRowQuantilePos, base, 1, pfeQuantile);
+    o.positiveDiscounted = perDate(kRowMeanPosTimes, base, 1, 0.0, deflatorRows);
+    o.negativeDiscounted = perDate(kRowMeanNegTimes, base, 1, 0.0, deflatorRows);
+    return o;
+  };
+  V.pfe = perDate(kRowQuantile, L.exposure, 1, pfeQuantile);
+  if (plan.hasInitialMargin()) V.valueChange = perDate(kRowQuantile, L.valueChange, 1, options.imQuantile);
+  V.samples = S;
+  if (S > 0) {
+    V.exposureSamples = perDate(kRowSamples, L.exposureValue, static_cast<std::uint32_t>(S));
+    V.nettedSamples = perDate(kRowSamples, L.netted, static_cast<std::uint32_t>(S));
+    if (L.collateral != kNoRow) V.collateralSamples = perDate(kRowSamples, L.collateral, static_cast<std::uint32_t>(S));
+  }
+  if (options.collateralBands && L.collateral != kNoRow)
+    for (double q : options.bandLevels) V.collateralBands.push_back(perDate(kRowQuantile, L.collateral, 1, q));
+  if (options.gross) {
+    V.gross = true;
+    V.grossProfile = profileOf(L.gross);
+  }
+  if (histogram) {
+    std::size_t rank = 0;
+    for (std::size_t r = 0; r < nR; ++r)
+      if (grid[reportingDates[r]] <= options.histogramTime + 1e-10) rank = r;
+    V.histogramRank = rank;
+    V.histogramBins = std::max<std::size_t>(1, std::min<std::size_t>(options.histogramBins, kPfeBins));
+    V.histogram = request(kRowHistogram, L.exposureValue + static_cast<std::uint32_t>(rank), static_cast<std::uint32_t>(V.histogramBins));
+  }
+  if (options.tradeViews)
+    for (std::size_t i = 0; i < nTr; ++i) {
+      const auto base = L.trades + static_cast<std::uint32_t>(i * nR);
+      ViewOutputs::Trade t;
+      t.profile = profileOf(base);
+      if (S > 0) t.samples = perDate(kRowSamples, base, static_cast<std::uint32_t>(S));
+      for (double q : options.bandLevels) t.bands.push_back(perDate(kRowQuantile, base, 1, q));
+      t.meanDeflated = perDate(kRowMeanProduct, base, 1, 0.0, deflatorRows);
+      V.trades.push_back(std::move(t));
+    }
+  if (L.exercise != kNoRow)
+    for (std::size_t b = 0; b < plan.amc.size(); ++b) {
+      const auto row = L.exercise + static_cast<std::uint32_t>(b);
+      const double nE = static_cast<double>(plan.amc[b].exerciseDates.size());
+      V.exerciseHistogram.push_back(request(kRowHistogram, row, static_cast<std::uint32_t>(nE + 1), 0.0, 0, -1.5, nE - 0.5));
+      V.exerciseSamples.push_back(S > 0 ? request(kRowSamples, row, static_cast<std::uint32_t>(S)) : ViewOutputs::none);
+    }
+  if (options.factorViews) {
+    V.factors = true;
+    if (S > 0) V.rateSamples = perDate(kRowSamples, F.x, static_cast<std::uint32_t>(S));
+    for (double q : options.factorBandLevels) V.rateBands.push_back(perDate(kRowQuantile, F.x, 1, q));
+    V.rateMean = perDate(kRowMean, F.x);
+    V.deflatorMean = perDate(kRowMean, deflatorRows);
+    V.bondMean = perDate(kRowMean, F.bond);
+    for (std::size_t ai = 0; ai < assets.size(); ++ai) {
+      ViewOutputs::Asset o;
+      if (S > 0) o.samples = perDate(kRowSamples, F.asset[ai], static_cast<std::uint32_t>(S));
+      for (double q : options.factorBandLevels) o.bands.push_back(perDate(kRowQuantile, F.asset[ai], 1, q));
+      o.mean = perDate(kRowMean, F.asset[ai]);
+      o.deflatedMean = perDate(kRowMean, F.deflatedAsset[ai]);
+      V.assets.push_back(std::move(o));
+    }
+    for (std::size_t c = 0; c < credits.size(); ++c) {
+      ViewOutputs::Credit o;
+      if (S > 0) {
+        o.intensitySamples = perDate(kRowSamples, F.intensity[c], static_cast<std::uint32_t>(S));
+        o.survivalSamples = perDate(kRowSamples, F.survival[c], static_cast<std::uint32_t>(S));
+      }
+      for (double q : options.factorBandLevels) o.intensityBands.push_back(perDate(kRowQuantile, F.intensity[c], 1, q));
+      o.survivalMean = perDate(kRowMean, F.survival[c]);
+      V.credits.push_back(std::move(o));
+    }
+    V.increments = F.increments.size();
+    if (!F.increments.empty()) {
+      V.incrementMeans = plan.numOutputs;
+      for (auto row : F.increments) request(kRowMean, row);
+      V.incrementProducts = plan.numOutputs;
+      for (auto ra : F.increments)
+        for (auto rb : F.increments) request(kRowMeanProduct, ra, 1, 0.0, rb);
+    }
+  }
+
   // Index table: termStart[nT+1] | callIndex[nT] | reportingSlot[nT] (1 + rank among the reporting dates, 0 if not one).
   const std::size_t offCall = nT + 1, offReporting = offCall + nT;
   plan.indices.assign(offReporting + nT, 0u);
@@ -469,16 +636,120 @@ FusedPlan compile(const ExposureEngine& engine, const NettingSet& nettingSet, co
                  static_cast<std::uint32_t>(offCall), static_cast<std::uint32_t>(offReporting),
                  floatBits(static_cast<float>(pfeQuantile)), static_cast<std::uint32_t>(plan.numWorkgroups()),
                  static_cast<std::uint32_t>(plan.statsPerDate), static_cast<std::uint32_t>(plan.reporting.size()),
-                 static_cast<std::uint32_t>(plan.numTradeGroups), plan.hasInitialMargin() ? 1u : 0u,
-                 floatBits(static_cast<float>(plan.imQuantile)), 0u, 0u, 0u};
+                 static_cast<std::uint32_t>(plan.numTradeGroups), plan.rows.valueChange, plan.rows.exposureValue,
+                 plan.rows.netted, plan.rows.collateral, plan.rows.gross, plan.rows.trades, plan.rows.exercise,
+                 static_cast<std::uint32_t>(plan.numRequests()), static_cast<std::uint32_t>(plan.amc.size()),
+                 plan.rows.exposure, 0u, 0u, 0u};
   if (!plan.amc.empty()) fitAmc(plan);
   return plan;
 }
 
+namespace {
+
+// The path views of a plan from the outputs of the row-statistics kernel.
+void addViews(const FusedPlan& plan, const std::vector<float>& out, FusedResult& r) {
+  const ViewOutputs& V = plan.views;
+  const std::size_t nR = plan.reporting.size(), S = V.samples;
+  const auto& times = r.profile.times;
+  auto series = [&](std::size_t o) {
+    std::vector<double> v(nR);
+    for (std::size_t k = 0; k < nR; ++k) v[k] = out[o + k];
+    return v;
+  };
+  auto samples = [&](std::size_t o) {  // outputs [date][path] -> [path][date]
+    std::vector<std::vector<double>> v(S, std::vector<double>(nR));
+    for (std::size_t k = 0; k < nR; ++k)
+      for (std::size_t q = 0; q < S; ++q) v[q][k] = out[o + k * S + q];
+    return v;
+  };
+  auto bands = [&](const std::vector<std::size_t>& offsets) {
+    std::vector<std::vector<double>> v;
+    for (std::size_t o : offsets) v.push_back(series(o));
+    return v;
+  };
+  auto profile = [&](const ProfileOutputs& o) {
+    ExposureProfile p;
+    p.pfeQuantile = plan.pfeQuantile;
+    p.times = times;
+    p.expectedValue = series(o.mean);
+    p.expectedExposure = series(o.positive);
+    p.expectedNegativeExposure = series(o.negative);
+    p.potentialFutureExposure = series(o.pfe);
+    p.discountedExpectedExposure = series(o.positiveDiscounted);
+    p.discountedExpectedNegativeExposure = series(o.negativeDiscounted);
+    return p;
+  };
+  constexpr std::size_t none = ViewOutputs::none;
+  if (V.exposureSamples != none) r.exposureSamples = samples(V.exposureSamples);
+  if (V.nettedSamples != none) r.nettedSamples = samples(V.nettedSamples);
+  if (V.collateralSamples != none) r.collateralSamples = samples(V.collateralSamples);
+  r.collateralBands = bands(V.collateralBands);
+  if (V.gross) r.grossProfile = profile(V.grossProfile);
+  if (V.histogram != none) {
+    const std::size_t nB = V.histogramBins;
+    const double lo = out[V.histogram + nB], hi = out[V.histogram + nB + 1];
+    r.histogramTime = times.at(V.histogramRank);
+    for (std::size_t b = 0; b <= nB; ++b) r.histogramEdges.push_back(lo + (hi - lo) * static_cast<double>(b) / static_cast<double>(nB));
+    for (std::size_t b = 0; b < nB; ++b) r.histogramCounts.push_back(out[V.histogram + b] / static_cast<double>(plan.numPaths));
+  }
+  for (const auto& t : V.trades) {
+    FusedResult::TradeView v;
+    v.profile = profile(t.profile);
+    if (t.samples != none) v.samples = samples(t.samples);
+    v.bands = bands(t.bands);
+    v.meanDeflated = series(t.meanDeflated);
+    r.tradeViews.push_back(std::move(v));
+  }
+  for (std::size_t b = 0; b < V.exerciseHistogram.size(); ++b) {
+    FusedResult::ExerciseView e;
+    const std::size_t nE = plan.amc[b].exerciseDates.size();
+    for (std::size_t k = 1; k <= nE; ++k) e.distribution.push_back(out[V.exerciseHistogram[b] + k] / static_cast<double>(plan.numPaths));
+    e.distribution.push_back(out[V.exerciseHistogram[b]] / static_cast<double>(plan.numPaths));  // never exercised (-1)
+    if (V.exerciseSamples[b] != none)
+      for (std::size_t q = 0; q < S; ++q) e.sampleIndex.push_back(out[V.exerciseSamples[b] + q]);
+    r.exercise.push_back(std::move(e));
+  }
+  if (V.factors) {
+    FusedResult::FactorView f;
+    if (V.rateSamples != none) f.rateSamples = samples(V.rateSamples);
+    f.rateBands = bands(V.rateBands);
+    f.rateMean = series(V.rateMean);
+    f.deflatorMean = series(V.deflatorMean);
+    f.bondMean = series(V.bondMean);
+    for (const auto& a : V.assets) {
+      FusedResult::FactorView::Asset o;
+      if (a.samples != none) o.samples = samples(a.samples);
+      o.bands = bands(a.bands);
+      o.mean = series(a.mean);
+      o.deflatedMean = series(a.deflatedMean);
+      f.assets.push_back(std::move(o));
+    }
+    for (const auto& c : V.credits) {
+      FusedResult::FactorView::Credit o;
+      if (c.intensitySamples != none) o.intensitySamples = samples(c.intensitySamples), o.survivalSamples = samples(c.survivalSamples);
+      o.intensityBands = bands(c.intensityBands);
+      o.survivalMean = series(c.survivalMean);
+      f.credits.push_back(std::move(o));
+    }
+    const std::size_t n = V.increments;
+    f.incrementCorrelation = Matrix(n, n, 0.0);
+    for (std::size_t i = 0; i < n; ++i)
+      for (std::size_t k = 0; k < n; ++k) {
+        auto m = [&](std::size_t a) { return static_cast<double>(out[V.incrementMeans + a]); };
+        auto e = [&](std::size_t a, std::size_t b) { return static_cast<double>(out[V.incrementProducts + a * n + b]); };
+        const double cov = e(i, k) - m(i) * m(k), vi = e(i, i) - m(i) * m(i), vk = e(k, k) - m(k) * m(k);
+        f.incrementCorrelation(i, k) = vi > 0 && vk > 0 ? cov / std::sqrt(vi * vk) : (i == k ? 1.0 : 0.0);
+      }
+    r.factors = std::move(f);
+  }
+}
+
+}  // namespace
+
 FusedResult summarise(const FusedPlan& plan, const FusedOutput& output) {
   const std::size_t nT = plan.numDates();
-  const std::size_t nS = plan.statsPerDate, nR = plan.reporting.size();
-  if (output.sums.size() != nT * nS || output.pfe.size() != plan.quantileRows())
+  const std::size_t nS = plan.statsPerDate;
+  if (output.sums.size() != nT * nS || output.values.size() < plan.numOutputs)
     throw std::invalid_argument("gpu::summarise: read-back does not match the plan");
   FusedResult r;
   ExposureProfile& p = r.profile;
@@ -493,12 +764,12 @@ FusedResult summarise(const FusedPlan& plan, const FusedOutput& output) {
     p.expectedNegativeExposure.push_back(stat(j, 2));
     p.discountedExpectedExposure.push_back(stat(j, 3));
     p.discountedExpectedNegativeExposure.push_back(stat(j, 4));
-    p.potentialFutureExposure.push_back(output.pfe[k]);
+    p.potentialFutureExposure.push_back(output.values[plan.views.pfe + k]);
     r.cvaIncrements.push_back(stat(j, 5));
     r.meanSurvival.push_back(stat(j, 6));
     r.marketSurvival.push_back(plan.marketSurvival[j]);
     r.meanDeflator.push_back(stat(j, 7));
-    if (plan.hasInitialMargin()) r.valueChangeQuantile.push_back(k ? output.pfe[nR + k] : 0.0);
+    if (plan.hasInitialMargin()) r.valueChangeQuantile.push_back(k ? output.values[plan.views.valueChange + k] : 0.0);
     for (std::size_t i = 0; i < plan.numTradeGroups; ++i) {
       const std::size_t o = kStatsPerDate + kTradeStats * i;
       auto& t = r.trades[i];
@@ -509,6 +780,7 @@ FusedResult summarise(const FusedPlan& plan, const FusedOutput& output) {
       t.standalone.push_back(stat(j, o + 4));
     }
   }
+  addViews(plan, output.values, r);
   for (std::size_t k = 0; k < r.cvaIncrements.size(); ++k) {
     const double pd = k ? r.meanSurvival[k - 1] - r.meanSurvival[k] : 0.0;
     r.conditionalDiscountedEe.push_back(k && pd > 0 ? r.cvaIncrements[k] / pd : std::numeric_limits<double>::quiet_NaN());

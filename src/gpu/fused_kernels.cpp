@@ -9,9 +9,10 @@
 //    No scenario cube is ever materialised: only the netted value (needed for the margin
 //    call look-back) and the positive exposure (for PFE) are written.
 // 2. reducePartialsKernel: sums the per-workgroup partial statistics.
-// 3. pfeQuantileKernel: one workgroup per quantile row (reporting date) finds the empirical quantile of the
-//    exposure distribution (interpolated between order statistics, as ccr::quantile) from a
-//    two-level histogram, without sorting.
+// 3. pfeQuantileKernel (row statistics): one workgroup per request computes a quantile (the
+//    empirical quantile interpolated between order statistics, as ccr::quantile, from a
+//    two-level histogram without sorting), a mean, a cross moment, a histogram or sample paths
+//    of one row of the exposure buffer: PFE, initial margin and every path view.
 //
 // Buffer layouts are produced by gpu::compile(); constants match fused_exposure.hpp
 // (workgroup 64, 7 statistics per date, 3072 PFE bins, 256 PFE threads), and
@@ -21,7 +22,7 @@
 namespace ccr::gpu {
 
 static_assert(kWorkgroupSize == 64 && kStatsPerDate == 8 && kTradeStats == 5 && kMaxTradeGroups == 16 && kMaxBermudans == 4 &&
-                  kPfeBins == 3072 && kPfeWorkgroupSize == 256 && kHeaderWords == 24,
+                  kPfeBins == 3072 && kPfeWorkgroupSize == 256 && kHeaderWords == 32,
               "the WGSL sources below hard-code these constants");
 
 namespace {
@@ -33,8 +34,10 @@ struct Header {
   substeps : u32, nNormals : u32, seed : u32, antithetic : u32,
   hasCsa : u32, cpty : u32, stepStride : u32, nCorr : u32,
   offCall : u32, offReporting : u32, quantile : f32, numWG : u32,
-  nS : u32, nR : u32, nTr : u32, hasIm : u32,       // stats per date, reporting dates, trades, margin rows
-  imQuantile : f32, pad0 : u32, pad1 : u32, pad2 : u32,
+  nS : u32, nR : u32, nTr : u32, rowDV : u32,       // stats per date, reporting dates, trades; rows (see RowLayout)
+  rowE : u32, rowV : u32, rowC : u32, rowGross : u32,
+  rowTrades : u32, rowEx : u32, nReq : u32, nBerm : u32,
+  rowEP : u32, pad0 : u32, pad1 : u32, pad2 : u32,
 };
 )wgsl";
 
@@ -49,6 +52,7 @@ const WG : u32 = 64u;
 const NB : u32 = 8u;          // netting-set statistics per date, before the per-trade ones
 const NB_BERM : u32 = 4u;     // Bermudan swaptions per netting set
 const NOT_EXERCISED : u32 = 0xFFFFFFFFu;
+const NO_ROW : u32 = 0xFFFFFFFFu;
 const STEP_VEC : u32 = 6u;    // vec4s per date in STEPS
 const TERM_TILE : u32 = 64u;  // valuation terms staged in workgroup memory at a time
 const CHOL_VEC : u32 = 16u;   // Cholesky factor: 8 padded rows of 2 vec4s
@@ -269,6 +273,22 @@ fn main(@builtin(global_invocation_id) gid : vec3<u32>,
           }
           case 7u: { if (exercised[bm] == NOT_EXERCISED) { term = a.y * max(amcPoly(a, b, x), 0.0); } }
           case 8u: { if (exercised[bm] != NOT_EXERCISED && exercised[bm] <= extra) { term = a.z * a.w * exp(-b.x * x); } }
+          case 10u: {  // risk-factor probe into row b.y: what = slot & 15, index = slot >> 4
+            let what = slot & 15u;
+            let ix = min(slot >> 4u, 3u);
+            var q = 0.0;
+            switch what {
+              case 0u: { q = x; }
+              case 1u: { q = D; }
+              case 2u: { q = S[ix]; }
+              case 3u: { q = lnS[ix]; }
+              case 4u: { q = y[min(ix, 1u)]; }
+              case 5u: { q = select(exp(-Y[min(ix, 1u)] - stepTile[5][min(ix, 1u)]), 1.0, j == 0u); }
+              case 6u: { q = D * S[ix]; }
+              default: { q = D * a.w * exp(-b.x * x); }
+            }
+            if (isActive) { EXPO[u32(b.y) * nP + p] = q + a.z; }
+          }
           default: {
             if (exercised[bm] != NOT_EXERCISED && exercised[bm] <= extra) { term = (a.z * fix[slot] + b.y) * a.w * exp(-b.x * x); }
           }
@@ -301,9 +321,27 @@ fn main(@builtin(global_invocation_id) gid : vec3<u32>,
     let en = min(e, 0.0);
     let rs = IDX[H.offReporting + j];
     if (isActive && rs > 0u) {
-      EXPO[(rs - 1u) * nP + p] = ep;
+      // Rows of the path views on this reporting date (see RowLayout; NO_ROW blocks are absent).
+      let k = rs - 1u;
+      EXPO[(H.rowEP + k) * nP + p] = ep;
       // Initial margin: |V(t_k) - V(t_{k-1})| of the uncollateralised value between reporting dates.
-      if (H.hasIm == 1u) { EXPO[(H.nR + rs - 1u) * nP + p] = select(abs(v - prevRV), 0.0, rs == 1u); }
+      if (H.rowDV != NO_ROW) { EXPO[(H.rowDV + k) * nP + p] = select(abs(v - prevRV), 0.0, rs == 1u); }
+      if (H.rowE != NO_ROW) { EXPO[(H.rowE + k) * nP + p] = e; }
+      if (H.rowV != NO_ROW) { EXPO[(H.rowV + k) * nP + p] = v; }
+      if (H.rowC != NO_ROW) { EXPO[(H.rowC + k) * nP + p] = collateral; }
+      if (H.rowGross != NO_ROW) {
+        var gross = 0.0;
+        for (var i = 0u; i < min(H.nTr, MAX_TRADES); i++) { gross = gross + max(vt[i], 0.0); }
+        EXPO[(H.rowGross + k) * nP + p] = gross;
+      }
+      if (H.rowTrades != NO_ROW) {
+        for (var i = 0u; i < min(H.nTr, MAX_TRADES); i++) { EXPO[(H.rowTrades + i * H.nR + k) * nP + p] = vt[i]; }
+      }
+    }
+    if (isActive && H.rowEx != NO_ROW) {
+      for (var i = 0u; i < min(H.nBerm, NB_BERM); i++) {
+        EXPO[(H.rowEx + i) * nP + p] = select(f32(exercised[i]), -1.0, exercised[i] == NOT_EXERCISED);
+      }
     }
 
     var cvaInc = 0.0;
@@ -387,104 +425,160 @@ fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
 
 const std::string& pfeQuantileKernel() {
   static const std::string source = withHeader(R"wgsl(
-
 const BINS : u32 = 3072u;  // 12 KiB of histogram: fits the portable 16 KiB workgroup-storage limit
-const BIG : u32 = 0x7F7FFFFFu;  // bits of the largest finite f32
 @group(0) @binding(0) var<uniform> H : Header;
 @group(0) @binding(1) var<storage, read> EXPO : array<f32>;
-@group(0) @binding(2) var<storage, read_write> PFE : array<f32>;
+@group(0) @binding(2) var<storage, read> REQ : array<vec4<f32>>;   // per request: (op, row, row2, count) (level, lo, hi, out)
+@group(0) @binding(3) var<storage, read_write> OUT : array<f32>;
 
-// Exposures are >= 0, so their f32 bit patterns order like the values: min/max are u32 atomics.
 var<workgroup> hist : array<atomic<u32>, 3072>;
-var<workgroup> zeros : atomic<u32>;
-var<workgroup> maxBits : atomic<u32>;
-var<workgroup> minBits : atomic<u32>;   // smallest positive exposure
-var<workgroup> loBits : atomic<u32>;    // extremes of the fine bin holding order statistic k
-var<workgroup> hiBits : atomic<u32>;
-var<workgroup> aboveBits : atomic<u32>; // smallest exposure above that fine bin
-var<workgroup> pick : vec4<u32>;        // (coarse bin, paths below it, k, done)
+var<workgroup> wsum : array<f32, 256>;
+var<workgroup> minKey : atomic<u32>;
+var<workgroup> maxKey : atomic<u32>;
+var<workgroup> loKey : atomic<u32>;     // extremes of the fine bin holding order statistic k
+var<workgroup> hiKey : atomic<u32>;
+var<workgroup> aboveKey : atomic<u32>;  // smallest value above that fine bin
+var<workgroup> req : array<vec4<f32>, 2>;
+var<workgroup> range : vec2<f32>;
+var<workgroup> pick : vec4<u32>;        // (coarse bin, paths below it, -, -)
 var<workgroup> fine : vec4<u32>;        // (fine bin, paths below it, paths in it, -)
 
-fn coarseBin(v : f32, mx : f32) -> u32 { return min(u32(v / mx * f32(BINS)), BINS - 1u); }
+// f32 <-> u32 keys that order like the values, signed ones included, for atomic min / max.
+fn toKey(v : f32) -> u32 {
+  let b = bitcast<u32>(v);
+  return select(b | 0x80000000u, ~b, (b & 0x80000000u) != 0u);
+}
+fn fromKey(k : u32) -> f32 { return bitcast<f32>(select(~k, k & 0x7FFFFFFFu, (k & 0x80000000u) != 0u)); }
+
+fn rowValue(op : u32, row : u32, p : u32) -> f32 {
+  let x = EXPO[row * H.nP + p];
+  return select(x, max(x, 0.0), op == 7u);
+}
+fn coarseBin(v : f32, lo : f32, span : f32) -> u32 { return min(u32(max((v - lo) / span, 0.0) * f32(BINS)), BINS - 1u); }
 fn fineBin(v : f32, lo : f32, width : f32) -> u32 { return min(u32(clamp((v - lo) / width, 0.0, 1.0) * f32(BINS)), BINS - 1u); }
 
-// The empirical quantile with linear interpolation between order statistics k = floor(rank) and
-// k + 1 (as ccr::quantile), per reporting date, without sorting: a coarse histogram over
-// [0, max] finds the bin of order statistic k, a fine histogram splits that bin into BINS
-// sub-bins, and a last pass reads the extremes of k's sub-bin and the next exposure above it.
-// The result is exact whenever k's sub-bin (max / BINS^2 wide) holds one path, as it nearly
-// always does, and otherwise interpolated inside that sub-bin.
+// Row statistics, one workgroup per request (see ccr::gpu::RowOp). Means are Kahan sums per
+// invocation and a tree across the workgroup. Quantiles are the empirical quantile interpolated
+// between order statistics k = floor(rank) and k + 1 (as ccr::quantile), found without sorting:
+// a coarse histogram over [min, max] locates order statistic k, a fine histogram splits that bin
+// BINS ways, and a last pass reads the extremes of k's fine bin and the next value above it.
 @compute @workgroup_size(256)
 fn main(@builtin(workgroup_id) wid : vec3<u32>, @builtin(local_invocation_id) lid : vec3<u32>) {
-  let j = wid.x;
+  let l = lid.x;
+  if (l < 2u) { req[l] = REQ[2u * wid.x + l]; }
+  let r0 = workgroupUniformLoad(&req[0]);
+  let r1 = workgroupUniformLoad(&req[1]);
+  let op = u32(r0.x);
+  let row = u32(r0.y);
+  let row2 = u32(r0.z);
+  let count = u32(r0.w);
+  let out = u32(r1.w);
   let nP = H.nP;
-  for (var i = lid.x; i < BINS; i += 256u) { atomicStore(&hist[i], 0u); }
-  if (lid.x == 0u) {
-    atomicStore(&zeros, 0u);
-    atomicStore(&maxBits, 0u);
-    atomicStore(&minBits, BIG);
-    atomicStore(&loBits, BIG);
-    atomicStore(&hiBits, 0u);
-    atomicStore(&aboveBits, BIG);
+
+  if (op == 4u) {  // samples
+    for (var p = l; p < count; p += 256u) { OUT[out + p] = EXPO[row * nP + p]; }
+    return;
   }
-  workgroupBarrier();
-  var m = 0.0;
-  var mn = bitcast<f32>(BIG);
-  for (var p = lid.x; p < nP; p += 256u) {
-    let v = EXPO[j * nP + p];
-    m = max(m, v);
-    if (v > 0.0) { mn = min(mn, v); }
-  }
-  atomicMax(&maxBits, bitcast<u32>(m));
-  atomicMin(&minBits, bitcast<u32>(mn));
-  workgroupBarrier();
-  let mx = bitcast<f32>(atomicLoad(&maxBits));
-  for (var p = lid.x; p < nP; p += 256u) {
-    let v = EXPO[j * nP + p];
-    if (v <= 0.0) {
-      atomicAdd(&zeros, 1u);
-    } else {
-      atomicAdd(&hist[coarseBin(v, mx)], 1u);
+  if (op != 0u && op != 5u && op != 7u) {  // means
+    var sum = 0.0;
+    var comp = 0.0;
+    for (var p = l; p < nP; p += 256u) {
+      let x = EXPO[row * nP + p];
+      var f = x;
+      switch op {
+        case 2u: { f = max(x, 0.0); }
+        case 3u: { f = min(x, 0.0); }
+        case 6u: { f = x * EXPO[row2 * nP + p]; }
+        case 8u: { f = max(x, 0.0) * EXPO[row2 * nP + p]; }
+        case 9u: { f = min(x, 0.0) * EXPO[row2 * nP + p]; }
+        default: { }
+      }
+      let yv = f - comp;
+      let tv = sum + yv;
+      comp = (tv - sum) - yv;
+      sum = tv;
     }
+    wsum[l] = sum;
+    workgroupBarrier();
+    for (var s = 128u; s > 0u; s = s >> 1u) {
+      if (l < s) { wsum[l] = wsum[l] + wsum[l + s]; }
+      workgroupBarrier();
+    }
+    if (l == 0u) { OUT[out] = wsum[0] / f32(nP); }
+    return;
+  }
+
+  // Histogram and quantiles: the range first.
+  for (var i = l; i < BINS; i += 256u) { atomicStore(&hist[i], 0u); }
+  if (l == 0u) {
+    atomicStore(&minKey, 0xFFFFFFFFu);
+    atomicStore(&maxKey, 0u);
+    atomicStore(&loKey, 0xFFFFFFFFu);
+    atomicStore(&hiKey, 0u);
+    atomicStore(&aboveKey, 0xFFFFFFFFu);
   }
   workgroupBarrier();
-  let level = select(H.quantile, H.imQuantile, j >= H.nR);  // PFE rows, then margin rows
-  let rank = level * f32(nP - 1u);
+  var kMin = 0xFFFFFFFFu;
+  var kMax = 0u;
+  for (var p = l; p < nP; p += 256u) {
+    let key = toKey(rowValue(op, row, p));
+    kMin = min(kMin, key);
+    kMax = max(kMax, key);
+  }
+  atomicMin(&minKey, kMin);
+  atomicMax(&maxKey, kMax);
+  workgroupBarrier();
+  if (l == 0u) { range = vec2<f32>(fromKey(atomicLoad(&minKey)), fromKey(atomicLoad(&maxKey))); }
+  let rg = workgroupUniformLoad(&range);  // uniform: the branches below contain barriers
+  var lo = rg.x;
+  var hi = rg.y;
+
+  if (op == 5u) {  // histogram of `count` bins on [lo, hi] (the given range unless r1.y == r1.z)
+    if (r1.y != r1.z) { lo = r1.y; hi = r1.z; }
+    let span = max(hi - lo, 1e-30);
+    for (var p = l; p < nP; p += 256u) {
+      let b = min(u32(max((EXPO[row * nP + p] - lo) / span, 0.0) * f32(count)), count - 1u);
+      atomicAdd(&hist[b], 1u);
+    }
+    workgroupBarrier();
+    for (var b = l; b < count; b += 256u) { OUT[out + b] = f32(atomicLoad(&hist[b])); }
+    if (l == 0u) { OUT[out + count] = lo; OUT[out + count + 1u] = hi; }
+    return;
+  }
+
+  let rank = r1.x * f32(nP - 1u);
   let k = min(u32(floor(rank)), nP - 1u);
   let frac = rank - f32(k);
-  if (lid.x == 0u) {
-    let nz = atomicLoad(&zeros);
-    if (k < nz) {
-      // Order statistic k is a zero; k + 1 is a zero too or the smallest positive exposure.
-      var result = 0.0;
-      if (k + 1u >= nz && k + 1u < nP && frac > 0.0) { result = frac * bitcast<f32>(atomicLoad(&minBits)); }
-      PFE[j] = result;
-      pick = vec4<u32>(0u, 0u, k, 1u);
-    } else {
-      var cum = nz;
-      var b = 0u;
-      for (; b < BINS - 1u; b++) {
-        let c = atomicLoad(&hist[b]);
-        if (cum + c > k) { break; }
-        cum = cum + c;
-      }
-      pick = vec4<u32>(b, cum, k, 0u);
-    }
+  let span = hi - lo;
+  if (span <= 0.0) {  // every path has the same value
+    if (l == 0u) { OUT[out] = lo; }
+    return;
   }
-  let chosen = workgroupUniformLoad(&pick);  // includes the barrier
-  if (chosen.w == 1u) { return; }
+  for (var p = l; p < nP; p += 256u) { atomicAdd(&hist[coarseBin(rowValue(op, row, p), lo, span)], 1u); }
+  workgroupBarrier();
+  if (l == 0u) {
+    var cum = 0u;
+    var b = 0u;
+    for (; b < BINS - 1u; b++) {
+      let c = atomicLoad(&hist[b]);
+      if (cum + c > k) { break; }
+      cum = cum + c;
+    }
+    pick = vec4<u32>(b, cum, 0u, 0u);
+  }
+  let chosen = workgroupUniformLoad(&pick);
 
   // Fine histogram inside the coarse bin of order statistic k.
-  for (var i = lid.x; i < BINS; i += 256u) { atomicStore(&hist[i], 0u); }
+  for (var i = l; i < BINS; i += 256u) { atomicStore(&hist[i], 0u); }
   workgroupBarrier();
-  let width = mx / f32(BINS);
-  let lo = f32(chosen.x) * width;
-  for (var p = lid.x; p < nP; p += 256u) {
-    let v = EXPO[j * nP + p];
-    if (v > 0.0 && coarseBin(v, mx) == chosen.x) { atomicAdd(&hist[fineBin(v, lo, width)], 1u); }
+  let width = span / f32(BINS);
+  let blo = lo + f32(chosen.x) * width;
+  for (var p = l; p < nP; p += 256u) {
+    let v = rowValue(op, row, p);
+    if (coarseBin(v, lo, span) == chosen.x) { atomicAdd(&hist[fineBin(v, blo, width)], 1u); }
   }
   workgroupBarrier();
-  if (lid.x == 0u) {
+  if (l == 0u) {
     var cum = chosen.y;
     var b = 0u;
     var c = 0u;
@@ -497,41 +591,40 @@ fn main(@builtin(workgroup_id) wid : vec3<u32>, @builtin(local_invocation_id) li
   }
   let f = workgroupUniformLoad(&fine);
 
-  // Extremes of k's fine bin and the next exposure above it.
-  var bLo = bitcast<f32>(BIG);
-  var bHi = 0.0;
-  var above = bitcast<f32>(BIG);
-  for (var p = lid.x; p < nP; p += 256u) {
-    let v = EXPO[j * nP + p];
-    if (v <= 0.0) { continue; }
-    let cb = coarseBin(v, mx);
+  // Extremes of k's fine bin and the next value above it.
+  var bLo = 0xFFFFFFFFu;
+  var bHi = 0u;
+  var above = 0xFFFFFFFFu;
+  for (var p = l; p < nP; p += 256u) {
+    let v = rowValue(op, row, p);
+    let cb = coarseBin(v, lo, span);
     var fb = 0u;
-    if (cb == chosen.x) { fb = fineBin(v, lo, width); }
+    if (cb == chosen.x) { fb = fineBin(v, blo, width); }
     if (cb == chosen.x && fb == f.x) {
-      bLo = min(bLo, v);
-      bHi = max(bHi, v);
+      bLo = min(bLo, toKey(v));
+      bHi = max(bHi, toKey(v));
     } else if (cb > chosen.x || (cb == chosen.x && fb > f.x)) {
-      above = min(above, v);
+      above = min(above, toKey(v));
     }
   }
-  atomicMin(&loBits, bitcast<u32>(bLo));
-  atomicMax(&hiBits, bitcast<u32>(bHi));
-  atomicMin(&aboveBits, bitcast<u32>(above));
+  atomicMin(&loKey, bLo);
+  atomicMax(&hiKey, bHi);
+  atomicMin(&aboveKey, above);
   workgroupBarrier();
-  if (lid.x == 0u) {
-    let vLo = bitcast<f32>(atomicLoad(&loBits));
-    let vHi = bitcast<f32>(atomicLoad(&hiBits));
+  if (l == 0u) {
+    let vLo = fromKey(atomicLoad(&loKey));
+    let vHi = fromKey(atomicLoad(&hiKey));
     let i = k - f.y;  // position of k inside its fine bin (f.z paths)
     let spread = vHi - vLo;
     var ek = vHi;
     if (f.z > 1u) { ek = vLo + spread * f32(i) / f32(f.z - 1u); }
     var result = ek;
     if (frac > 0.0 && k + 1u < nP) {
-      var ek1 = bitcast<f32>(atomicLoad(&aboveBits));
+      var ek1 = fromKey(atomicLoad(&aboveKey));
       if (i + 1u < f.z) { ek1 = vLo + spread * f32(i + 1u) / f32(f.z - 1u); }
       result = ek + frac * (ek1 - ek);
     }
-    PFE[j] = result;
+    OUT[out] = result;
   }
 }
 )wgsl");

@@ -151,7 +151,7 @@ TEST(gpu_fused_kernel_split_across_workers_is_exact) {
     for (std::size_t k = 0; k < parts; ++k) slices.push_back(gpu::runFusedWorkgroups(plan, numWG * k / parts, numWG * (k + 1) / parts));
     const auto split = gpu::finishFused(plan, slices);
     CHECK(split.sums == whole.sums);
-    CHECK(split.pfe == whole.pfe);
+    CHECK(split.values == whole.values);
   }
   // Slices that leave a gap are rejected.
   CHECK_THROWS(gpu::finishFused(plan, {gpu::runFusedWorkgroups(plan, 0, numWG / 2)}));
@@ -195,12 +195,12 @@ TEST(gpu_pfe_kernel_is_the_interpolated_empirical_quantile) {
       const auto plan = gpu::compile(s.engine, s.nettingSet, level, 0);
       const auto slice = gpu::runFusedWorkgroups(plan, 0, plan.numWorkgroups());
       const auto out = gpu::finishFused(plan, {slice});
-      CHECK(out.pfe.size() == plan.reporting.size());
+      CHECK(out.values.size() >= plan.reporting.size());
       const std::size_t nP = plan.numPaths;
       for (std::size_t r = 0; r < plan.reporting.size(); ++r) {
         const std::vector<double> e(slice.exposure.begin() + r * nP, slice.exposure.begin() + (r + 1) * nP);
         const double exact = quantile(e, level), mx = *std::max_element(e.begin(), e.end());
-        CHECK_NEAR(out.pfe[r], exact, 1e-6 * std::max(mx, 1.0));
+        CHECK_NEAR(out.values[plan.views.pfe + r], exact, 1e-6 * std::max(mx, 1.0));
       }
     }
 }
@@ -270,7 +270,7 @@ TEST(gpu_cpu_kernels_are_bit_identical_on_any_number_of_threads) {
     SpinPool one(0), eight(7);
     const auto a = gpu::runFusedReference(plan, one), b = gpu::runFusedReference(plan, eight);
     CHECK(a.sums == b.sums);
-    CHECK(a.pfe == b.pfe);
+    CHECK(a.values == b.values);
   }
 }
 
@@ -301,4 +301,93 @@ TEST(gpu_amc_bermudan_matches_exposure_engine) {
       CHECK(worst < 0.03 * scale);
     }
   }
+}
+
+TEST(gpu_path_views_match_exposure_engine) {
+  // The path views computed by the row-statistics kernel against the double-precision engine:
+  // sample paths are consistent, distributions and profiles agree within Monte Carlo error, and
+  // the risk-factor martingale tests and correlations hold.
+  const auto s = gpuSetup(8000, true);
+  gpu::FusedOptions o;
+  o.samples = 12;
+  o.histogramTime = 2.0;
+  o.gross = true;
+  o.collateralBands = true;
+  o.tradeViews = true;
+  const auto plan = gpu::compile(s.engine, s.nettingSet, o);
+  const auto f = gpu::summarise(plan, gpu::runFusedReference(plan));
+  const ExposureResult cpu = s.engine.run(s.nettingSet, 0.95);
+  const std::size_t nR = f.profile.times.size();
+  CHECK(f.exposureSamples.size() == 12 && f.exposureSamples[0].size() == nR);
+  for (std::size_t q = 0; q < 12; ++q)
+    for (std::size_t k = 0; k < nR; ++k)
+      CHECK_NEAR(f.exposureSamples[q][k], f.nettedSamples[q][k] - f.collateralSamples[q][k], 1e-3 * (1.0 + std::fabs(f.nettedSamples[q][k])));
+  // Histogram: fractions of paths summing to one over increasing edges.
+  double total = 0.0;
+  for (double c : f.histogramCounts) total += c;
+  CHECK(f.histogramCounts.size() == 40 && std::fabs(total - 1.0) < 1e-6 && f.histogramEdges.front() < f.histogramEdges.back());
+  CHECK_NEAR(f.histogramTime, 2.0, 0.26);
+  // Profiles against the engine.
+  const auto& idx = cpu.reportingIndices;
+  const TimeGrid rep(cpu.profile.times);
+  const Matrix deflator = selectColumns(cpu.scenarios.deflator, idx);
+  Matrix gross(cpu.nettedValue.rows(), idx.size(), 0.0);
+  for (const auto& m : cpu.tradeValues) {
+    const Matrix v = selectColumns(m, idx);
+    for (std::size_t p = 0; p < v.rows(); ++p)
+      for (std::size_t k = 0; k < v.cols(); ++k) gross(p, k) += std::max(v(p, k), 0.0);
+  }
+  const auto grossCpu = ExposureProfile::compute(gross, rep, deflator, 0.95);
+  const double tol = 6.0 / std::sqrt(8000.0);
+  CHECK(f.grossProfile && maxRelDiff(f.grossProfile->expectedExposure, grossCpu.expectedExposure) < tol);
+  CHECK(maxRelDiff(f.grossProfile->potentialFutureExposure, grossCpu.potentialFutureExposure) < tol);
+  CHECK(maxRelDiff(f.grossProfile->discountedExpectedExposure, grossCpu.discountedExpectedExposure) < tol);
+  CHECK(f.tradeViews.size() == 3);
+  for (std::size_t i = 0; i < 3; ++i) {
+    const auto tcpu = ExposureProfile::compute(selectColumns(cpu.tradeValues[i], idx), rep, deflator, 0.95);
+    const auto& tv = f.tradeViews[i];
+    CHECK_NEAR(tv.profile.expectedValue[0], tcpu.expectedValue[0], 1e-5 * 1e6);  // t = 0: deterministic
+    double scale = 1.0;
+    for (double x : tcpu.expectedExposure) scale = std::max(scale, x);
+    for (double x : tcpu.expectedNegativeExposure) scale = std::max(scale, -x);
+    for (std::size_t k = 0; k < nR; ++k) {
+      CHECK_NEAR(tv.profile.expectedExposure[k], tcpu.expectedExposure[k], tol * scale);
+      CHECK_NEAR(tv.profile.expectedNegativeExposure[k], tcpu.expectedNegativeExposure[k], tol * scale);
+      CHECK(tv.bands[0][k] <= tv.bands[1][k] + 1e-6 && tv.bands[1][k] <= tv.bands[2][k] + 1e-6);
+    }
+  }
+  const Matrix coll = selectColumns(cpu.collateral, idx);
+  double collScale = 1.0, worst = 0.0;
+  for (std::size_t k = 0; k < nR; ++k) {
+    std::vector<double> c(coll.rows());
+    for (std::size_t p = 0; p < coll.rows(); ++p) c[p] = coll(p, k);
+    for (std::size_t b = 0; b < 3; ++b) {
+      const double q = quantile(c, std::vector<double>{0.05, 0.5, 0.95}[b]);
+      collScale = std::max(collScale, std::fabs(q));
+      worst = std::max(worst, std::fabs(f.collateralBands[b][k] - q));
+    }
+  }
+  CHECK(worst < 0.1 * collScale);
+
+  // Risk factors: martingale tests, CIR++ fit and realised correlation.
+  gpu::FusedOptions fo;
+  fo.factorViews = true;
+  fo.samples = 5;
+  fo.bondMaturity = 8.0;
+  const NettingSet empty;
+  const auto fp = gpu::compile(s.engine, empty, fo);
+  const auto fr = gpu::summarise(fp, gpu::runFusedReference(fp));
+  CHECK(fr.factors.has_value());
+  const auto& F = *fr.factors;
+  const auto& gen = s.engine.generator();
+  const auto& times = fr.profile.times;
+  for (std::size_t k = 0; k < times.size(); ++k) {
+    CHECK_NEAR(F.deflatorMean[k], gen.rateModel()->curve().discount(times[k]), 5e-3);
+    CHECK_NEAR(F.bondMean[k], gen.rateModel()->curve().discount(8.0), 5e-3);
+    CHECK_NEAR(F.assets[0].deflatedMean[k], gen.assets()[0]->spot() * gen.assets()[0]->carryCurve().discount(times[k]), 0.01);
+    CHECK_NEAR(F.credits[0].survivalMean[k], s.market->survival(times[k]), 0.01);
+  }
+  CHECK(F.rateSamples.size() == 5 && F.rateBands.size() == 5 && F.incrementCorrelation.rows() == 3);
+  CHECK_NEAR(F.incrementCorrelation(0, 1), 0.2, 0.05);
+  CHECK_NEAR(F.incrementCorrelation(0, 2), 0.0, 0.05);
 }

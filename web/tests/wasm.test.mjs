@@ -4,7 +4,9 @@
 import createCcrModule from '../wasm/ccr.js';
 import { defaultSpec, defaultBermudan } from '../js/spec.js';
 
-const ccr = await createCcrModule();
+const mod = await createCcrModule();
+// Every library entry point goes through ccr::app::call(name, spec).
+const ccr = new Proxy({}, { get: (_, name) => (spec = {}) => mod.call(String(name), spec) });
 let failures = 0;
 const check = (cond, msg) => { if (!cond) { failures++; console.log('  FAIL', msg); } };
 const near = (a, b, tol, msg) => check(Math.abs(a - b) <= tol, `${msg}: ${a} vs ${b} (tol ${tol})`);

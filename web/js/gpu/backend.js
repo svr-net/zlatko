@@ -40,7 +40,7 @@ export async function runOnGpu(analysis, spec, { warmUp = false } = {}) {
   let gpuMs = 0;
   for (const plan of jobs.plans) {
     const out = plan ? await gpu.run(plan) : null;
-    gpuOutputs.push(out && { sums: out.sums, pfe: out.pfe });
+    gpuOutputs.push(out && { sums: out.sums, values: out.values });
     gpuMs += out ? out.gpuMs : 0;
   }
   const result = await run('gpuAnalyse', { ...spec, analysis, gpuOutputs });
