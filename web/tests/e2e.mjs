@@ -39,9 +39,11 @@ const browser = await chromium.launch({
 });
 
 // Small path counts keep the run fast; the pages pick the spec up from localStorage.
-const testSpec = { sim: { numPaths: 1000, seed: 11, antithetic: true } };
+// The nested initial margin of the XVA pages uses 16 inner paths here (the 99% quantile from the 16
+// largest): the emulated GPU of the CI would take minutes with the default 128.
+const testSpec = { sim: { numPaths: 1000, seed: 11, antithetic: true }, imInnerPaths: 16 };
 const gpuSpec = { sim: { numPaths: 8000, seed: 11, antithetic: true } };
-const pairSpec = { sim: { numPaths: 4000, seed: 11, antithetic: true } };
+const pairSpec = { sim: { numPaths: 4000, seed: 11, antithetic: true }, imInnerPaths: 16 };
 const bermudanTrade = { type: 'bermudan', id: 'Berm 1y×4y', notional: 1e6, fixedRate: 0.035, start: 1, tenor: 4, freq: 1, direction: 'receiver', degree: 2 };
 // Pages with the engine selector. With no stored choice they run on Auto, which must pick the
 // WebGPU kernels on desktop too; some also run once forced onto the CPU fused kernels.

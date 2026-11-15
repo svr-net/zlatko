@@ -132,7 +132,8 @@ MVA = s_m ∫₀ᵀ IM*(t) Q_c(t) Q_o(t) dt
 
 **The IM proxy.** The IM of the regulatory models (SIMM for uncleared, a clearing-house VaR for
 cleared) is a quantile of the distribution of the portfolio value change over the MPOR, conditional on
-the scenario at `t`. The library uses the unconditional proxy implemented by `initialMarginProfile`:
+the scenario at `t`. The library offers two estimates: the conditional IM by nested Monte Carlo (X8, the
+default of the XVA page) and the unconditional proxy implemented by `initialMarginProfile`:
 
 ```
 IM(t_k) = q_{99%}  |V(t_k) − V(t_{k−1})|  ·  sqrt(MPOR / Δ_k),      MPOR = 10 / 250
@@ -140,8 +141,10 @@ IM*(t_k) = IM(t_k) · E[D(0,t_k)]
 ```
 
 The quantile `q` is taken over the paths at each grid date, the square-root-of-time rule scales the grid
-step to the MPOR, and the mean deflator discounts. This uses the simulated paths, so MVA runs on the
-WebAssembly engine only (the fused GPU kernels return aggregates).
+step to the MPOR, and the mean deflator discounts. In the fused kernels the proxy is a row-statistics
+request (the quantile of the value change between reporting dates), so it runs on WebGPU and on the CPU
+kernels alike. The nested estimate replaces `IM*(t)` by `E[D(0,t) IM(t, ω)]`, with `IM(t, ω)` the
+conditional quantile of `|V(t + MPOR) − V(t)|` given the path; see X8.
 
 **Properties.** MVA is not linear in the exposures, so it does not allocate to trades by Euler's
 theorem (X5). It rises with volatility and is largest for long-dated, at-the-money positions, where
@@ -149,16 +152,18 @@ the exposure profile and the IM profile are both high. Netting and the choice of
 first-order effect: the 99% quantile of a normal is 2.33σ, and the portfolio `σ` is lower than the
 sum of the trade `σ` by the diversification of the netting set.
 
-**Limitations.** The proxy does not condition on the state of the paths (a regression of `IM` on the
-risk factors, as in the nested-simulation-free approach of Andersen, Pykhtin and Sokol 2017, or the
-Longstaff–Schwartz regression of the AMC chapter, would); it ignores that IM is `MPOR`-dependent
+**Limitations.** The proxy does not condition on the state of the paths; the nested estimate of X8
+does (at the cost of the inner simulation and a small downward bias of the empirical quantile), and a
+regression of `IM` on the risk factors (Andersen, Pykhtin and Sokol 2017, or the Longstaff–Schwartz
+machinery of the AMC chapter) would do so more cheaply, with a basis bias instead. Both estimates ignore that IM is `MPOR`-dependent
 per trade type; and it does not net the IM received (MVA is the cost of IM *posted*; the IM *received*
 and rehypothecation are beyond the model).
 
 **Worked example.** IM profile and MVA as `s_m` varies for a 10y interest-rate swap; the dependence of
 the IM on the MPOR (10 versus 20 business days).
 
-**Code / page.** `initialMarginProfile`, `marginValuationAdjustment`; [`web/xva.html`](../web/xva.html).
+**Code / page.** `initialMarginProfile`, `marginValuationAdjustment`; nested IM `FusedOptions::imInnerPaths`
+(analysis option `imMethod`: `"nested"` by default, or `"proxy"`); [`web/xva.html`](../web/xva.html) shows both.
 
 **Further reading.** Green and Kenyon (2015) "MVA by replication and regression"; Andersen, Pykhtin and
 Sokol (2017) "Rethinking the margin period of risk"; Caspers, Giltinan, Lichters and Mazzoni (2017)
@@ -498,10 +503,20 @@ nested estimator, with Richardson correction, against the regression estimate an
 MSE for fixed budget `B` as `N_i` varies, with the minimum at `N_i ∼ B^{1/3}`; and the conditional IM
 profile against the unconditional proxy of X3, with the corresponding MVA.
 
-**Code / page.** Not implemented. The building blocks are present: simulation of the state (`ScenarioGenerator`),
-regression estimation of `V(t)` (`core/regression.hpp`, [`web/amc.html`](../web/amc.html)), the unconditional IM proxy
-(`initialMarginProfile`), and the fused kernels ([`web/gpu.html`](../web/gpu.html)). A nested engine would
-add an inner-simulation step per outer node on top of these.
+**Code / page.** The conditional initial margin is implemented in the fused kernels
+(`FusedOptions::imInnerPaths`, `imMarginPeriod`; WGSL in `src/gpu/fused_kernels.cpp`, its CPU mirror in
+`src/gpu/fused_reference.cpp`). From every outer path at every reporting date `t` the kernel runs
+`N_i` antithetic inner paths of the risk factors to `t + MPOR` (the `t + MPOR` dates are added to the
+grid), revalues the netting set on each with the same pricing terms as the outer simulation, and keeps the
+16 largest `|V(t + MPOR) − V(t)|` by insertion, so the `q`-quantile (0.99 by default) is read from
+order statistics without storing the inner sample. That limits `N_i` to `2..1024` with
+`N_i − 1 − ⌊q(N_i − 1)⌋ < 15`. The result is `IM(t, ω)` per path, its mean and 5/50/95% bands, and
+MVA = Σ spread · E[D(t) IM(t)] Δt. The XVA analysis (`spec.imMethod`, `"nested"` by default with
+`imInnerPaths` = 128, or `"proxy"`) reports the X3 proxy alongside, and [`web/xva.html`](../web/xva.html) plots
+both profiles. The unit test `gpu_nested_initial_margin_matches_the_analytic_conditional_quantile`
+checks an FX forward against the analytic conditional quantile. The low-biased empirical quantile
+(about −4% at 128 inner paths, −1.3% at 512, −0.6% at 1024) is the inner bias discussed above.
+Not implemented: the Richardson or multilevel bias corrections and the nested dual bound.
 
 **Further reading.** Gordy and Juneja (2010) "Nested simulation in portfolio risk measurement",
 *Management Science* 56(10); Broadie, Du and Moallemi (2011) "Efficient risk estimation via nested
@@ -531,9 +546,10 @@ simplifications made above.
    correlated with the intensity of the own bank and the exposure; the FVA becomes a pathwise integral
    `∫ D(0,t) s_b(t) V⁺(t) Q dt` with a non-trivial correlation structure, as for the wrong-way
    CVA of the Wrong-way risk page.
-4. **Conditional initial margin.** A regression-based or nested-simulation IM per path (SIMM
-   sensitivities with the Longstaff–Schwartz machinery, or the full-revaluation historical VaR of CCPs),
-   and the IM that we *receive* with its rehypothecation.
+4. **Conditional initial margin, beyond nesting.** The nested IM per path is implemented (X8); open
+   are a regression-based IM (SIMM sensitivities with the Longstaff–Schwartz machinery), the
+   full-revaluation historical VaR of CCPs, bias corrections of the nested quantile, and the IM that we
+   *receive* with its rehypothecation.
 5. **XVA as a coherent measure with feedback.** The semi-linear PDE of Burgard–Kjaer with the
    cross-dependence of the funding rate on the adjusted value (the non-linearity, fixed here by taking
    the exposure at the risk-free value). Solvable by BSDE and regression (Henry-Labordère 2012;
@@ -577,6 +593,12 @@ spread multipliers, a parallel rate shift, the FX volatility and the funding spr
 ```
 XVA_k(x) = F_k(x),   k in {CVA, DVA, FCA, FBA, MVA, KVA},   total = CVA - DVA + FCA - FBA + MVA + KVA
 ```
+
+The MVA of the dataset and of the agent tools uses the unconditional IM proxy of X3 (`imMethod:
+"proxy"`), not the nested IM that the XVA page shows by default: the proxy is about a hundred times
+cheaper per state, which keeps the 410 training and back-test runs and each tool call fast, and the
+surrogates and the tools then share one definition. A nested-IM surrogate is the same exercise with a
+noisier, slightly biased target.
 
 Without common random numbers `F_k` carries Monte Carlo noise of order `N^{-1/2}`, which a surrogate
 would learn as noise; the fixed seed removes it. A surrogate `F̂_k(x; θ)` is trained on `n` engine
@@ -679,7 +701,7 @@ four provider-neutral JSON-Schema tools:
 
 | Tool | Engine call | Returns |
 |---|---|---|
-| `price_xva` | `xva` | CVA, DVA, FCA, FBA, MVA, KVA, total |
+| `price_xva` | `xva` (IM proxy) | CVA, DVA, FCA, FBA, MVA, KVA, total |
 | `xva_sensitivities` | `xva` | bucketed counterparty CS01, own CS01, funding spread 01 |
 | `allocate_xva` | `xva` | per-trade CVA, FCA, KVA (Euler allocation of X5) |
 | `compare_scenarios` | `xva` x 2 | base versus scenario, differences per adjustment |

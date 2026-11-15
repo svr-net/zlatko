@@ -46,7 +46,7 @@ if (expo && expoCsa) {
 }
 const coll = fused('collateral', { samplePaths: 12 });
 if (coll) {
-  check(coll.variants.length === 5 && coll.variants[0].eepeVsNoCsa === 1, 'CSA variants');
+  check(coll.variants.length === 7 && coll.variants[0].eepeVsNoCsa === 1 && coll.variants[5].csa.collateral.startsWith('bond'), 'CSA variants (cash, bond and asset collateral)');
   check(coll.variants[2].profile.eepe1y < coll.variants[0].profile.eepe1y && coll.nettedSamples.length === 12, 'zero-threshold CSA; samples');
 }
 const alloc = fused('allocation');
@@ -56,9 +56,15 @@ if (cva) {
   check(cva.bilateral && cva.bilateral.dva > 0 && cva.cva > 0, 'CVA and DVA positive');
   near(cva.cumulativeCva[cva.cumulativeCva.length - 1], cva.cva, 1e-9 * cva.cva, 'cumulative CVA ends at CVA');
 }
-const xva = fused('xva');
-if (xva) {
+const xvaSim = { ...spec.sim, numPaths: 1000 };
+const xva = fused('xva', { imInnerPaths: 16, sim: xvaSim });
+const xvaProxy = fused('xva', { imMethod: 'proxy', sim: xvaSim });
+if (xva && xvaProxy) {
   const x = xva.xva;
+  check(xva.imMethod === 'nested' && xva.initialMarginBands.length === 3 && xvaProxy.imMethod === 'proxy', 'nested and proxy initial margin');
+  // The nested run adds the t + MPR dates to the grid, so its paths (and its proxy MVA) differ by Monte Carlo noise.
+  near(xva.mvaProxy, xvaProxy.xva.mva, 0.05 * xvaProxy.xva.mva, 'the proxy MVA is reported alongside the nested one');
+  check(xva.xva.mva > 0 && Math.abs(xva.xva.mva / xvaProxy.xva.mva - 1) < 1, `nested MVA ${xva.xva.mva} vs proxy ${xvaProxy.xva.mva}`);
   near(x.total, x.cva - x.dva + x.fca - x.fba + x.mva + x.kva, 1e-6 * Math.abs(x.total), 'XVA identity');
   near(sum(xva.trades.map((t) => t.cva)), x.cva, 1e-4 * x.cva, 'XVA allocation adds up (f32)');
 }

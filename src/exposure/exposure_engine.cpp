@@ -60,7 +60,17 @@ ExposureResult ExposureEngine::run(const NettingSet& nettingSet, double pfeQuant
   result.nettedValue = netValues(result.tradeValues);
 
   if (nettingSet.collateral) {
-    result.collateral = simulateCollateral(*nettingSet.collateral, result.nettedValue, s.grid);
+    const CollateralAgreement& csa = *nettingSet.collateral;
+    Matrix price;
+    if (csa.type == CollateralAgreement::Type::Bond) {
+      if (csa.bondMaturity < s.grid.horizon() - 1e-10) throw std::invalid_argument("the collateral bond must mature after the horizon");
+      price = Matrix(s.numPaths, s.numTimes());
+      for (std::size_t p = 0; p < s.numPaths; ++p)
+        for (std::size_t j = 0; j < s.numTimes(); ++j) price(p, j) = s.zeroBond(p, j, csa.bondMaturity);
+    } else if (csa.type == CollateralAgreement::Type::Asset) {
+      price = s.assetValues.at(csa.assetIndex);
+    }
+    result.collateral = simulateCollateral(csa, result.nettedValue, s.grid, csa.type == CollateralAgreement::Type::Cash ? nullptr : &price);
   } else {
     result.collateral = Matrix(s.numPaths, s.numTimes(), 0.0);
   }

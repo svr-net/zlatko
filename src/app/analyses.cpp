@@ -206,6 +206,19 @@ CollateralAgreement parseCsa(const val& c) {
   csa.minimumTransferAmount = num(c, "mta", 0.0);
   csa.independentAmount = num(c, "independentAmount", 0.0);
   csa.marginPeriodOfRisk = num(c, "mpr", 10.0 / 250.0);
+  // What the margin is posted in: "cash" (default), "bond" (government zero-coupon bond of
+  // maturity bondMaturity) or "asset" (the FX / equity factor named by collateralAsset).
+  const std::string type = str(c, "collateral", "cash");
+  csa.haircut = num(c, "haircut", 0.0);
+  if (type == "bond") {
+    csa.type = CollateralAgreement::Type::Bond;
+    csa.bondMaturity = num(c, "bondMaturity", 10.0);
+  } else if (type == "asset") {
+    csa.type = CollateralAgreement::Type::Asset;
+    csa.assetIndex = static_cast<std::size_t>(num(c, "collateralAssetIndex", 0));
+  } else if (type != "cash") {
+    throw std::invalid_argument("unknown collateral '" + type + "' (cash, bond or asset)");
+  }
   return csa;
 }
 
@@ -587,8 +600,22 @@ std::vector<CsaVariant> csaVariants(const val& spec) {
   zero.thresholdCounterparty = zero.thresholdOwn = zero.minimumTransferAmount = 0.0;
   mpr20.marginPeriodOfRisk = 20.0 / 250.0;
   oneWay.thresholdOwn = std::numeric_limits<double>::infinity();
-  return {{"no CSA", std::nullopt}, {"specified CSA", c}, {"zero threshold & MTA", zero}, {"MPR 20 days", mpr20},
-          {"one-way (we never post)", oneWay}};
+  std::vector<CsaVariant> v = {{"no CSA", std::nullopt}, {"specified CSA", c}, {"zero threshold & MTA", zero},
+                                {"MPR 20 days", mpr20}, {"one-way (we never post)", oneWay}};
+  // Securities collateral: the specified CSA posted in a government bond (2% haircut) and in the
+  // first FX / equity asset (15% haircut), whose value moves over the margin period of risk.
+  CollateralAgreement bond = c, asset = c;
+  bond.type = CollateralAgreement::Type::Bond;
+  bond.haircut = 0.02;
+  bond.bondMaturity = std::max(10.0, num(spec["grid"], "horizon", 10.0));
+  v.push_back({"bond collateral (2% haircut)", bond});
+  if (spec["assets"].size() > 0) {
+    asset.type = CollateralAgreement::Type::Asset;
+    asset.haircut = 0.15;
+    asset.assetIndex = 0;
+    v.push_back({str(spec["assets"][0], "name", "asset") + " collateral (15% haircut)", asset});
+  }
+  return v;
 }
 
 std::vector<double> wwrRhos(const val& spec) {
@@ -612,6 +639,17 @@ Value shockedSpec(const Value& spec) {
     if (k != "marketState" && k != "shockState") s.set(k, v);
   s.set("marketState", spec["shockState"]);
   return withMarketState(s);
+}
+
+// The kernels' views for XVA: per-trade statistics (allocation), the IM proxy and, unless
+// spec.imMethod is "proxy", the conditional initial margin by nested Monte Carlo.
+void xvaOptions(const val& spec, gpu::FusedOptions& o) {
+  o.perTrade = true;
+  o.imQuantile = num(spec, "imQuantile", 0.99);
+  if (str(spec, "imMethod", "nested") == "nested") {
+    o.imInnerPaths = static_cast<std::size_t>(num(spec, "imInnerPaths", 128));
+    o.imMarginPeriod = num(spec, "imMprDays", 10.0) / 250.0;
+  }
 }
 
 struct BermudanSpec {
@@ -649,11 +687,11 @@ std::vector<Job> analysisJobs(const val& spec, const Env& env, const std::string
     o.collateralBands = env.csa.has_value();
   } else if (analysis == "cva" || analysis == "validation" || analysis == "xva") {
     jobs.push_back(makeJob("base", env, fixed(gen), env.sim, env.csa));
-    if (analysis == "xva") jobs.back().options.perTrade = true, jobs.back().options.imQuantile = num(spec, "imQuantile", 0.99);
+    if (analysis == "xva") xvaOptions(spec, jobs.back().options);
   } else if (analysis == "xvaCompare") {
     // The base market and the shocked one (spec.shockState) as two jobs of one analysis.
     jobs.push_back(makeJob("base", env, fixed(gen), env.sim, env.csa));
-    jobs.back().options.perTrade = true, jobs.back().options.imQuantile = num(spec, "imQuantile", 0.99);
+    xvaOptions(spec, jobs.back().options);
     const Env shocked = parseEnv(shockedSpec(spec));
     jobs.push_back(makeJob("shocked", shocked, [g = shocked.generator()] { return g; }, shocked.sim, shocked.csa,
                            shocked.nettingSet(false)));
@@ -884,6 +922,10 @@ val csaToJs(const std::optional<CollateralAgreement>& c) {
     o.set("oneWay", !std::isfinite(c->thresholdOwn));
     o.set("mta", c->minimumTransferAmount);
     o.set("mprDays", c->marginPeriodOfRisk * 250.0);
+    o.set("collateral", c->type == CollateralAgreement::Type::Cash ? "cash"
+                        : c->type == CollateralAgreement::Type::Bond ? "bond " + std::to_string(static_cast<int>(c->bondMaturity)) + "y"
+                                                                     : "asset");
+    o.set("haircut", c->haircut);
   }
   return o;
 }
@@ -905,14 +947,26 @@ val xvaResult(const val& spec, const Env& env, const JobResult& r) {
   const auto& times = r.profile.times;
   // Initial margin: the |dV| quantile scaled to the margin period of risk, discounted with E[D].
   const double mpr = num(spec, "imMprDays", 10.0) / 250.0;
-  std::vector<double> im(times.size(), 0.0);
+  std::vector<double> proxy(times.size(), 0.0);
   for (std::size_t k = 1; k < times.size() && k < r.valueChangeQuantile.size(); ++k)
-    im[k] = r.valueChangeQuantile[k] * std::sqrt(mpr / (times[k] - times[k - 1])) * r.meanDeflator[k];
+    proxy[k] = r.valueChangeQuantile[k] * std::sqrt(mpr / (times[k] - times[k - 1])) * r.meanDeflator[k];
+  // MVA funds the discounted initial margin: E[D(t) IM(t, path)] with the conditional IM of the
+  // nested simulation (IM depends on each path's state), or the unconditional proxy.
+  const bool nested = !r.fused.conditionalImDiscounted.empty();
+  const std::vector<double> im = nested ? r.fused.conditionalImDiscounted : proxy;
   const Xva total = xva(r.profile, im, cc, rec, own, env.ownRecovery, params);
 
   val out = val::object();
   out.set("profile", profileToJs(r.profile));
   out.set("initialMargin", arr(im));
+  out.set("imMethod", nested ? "nested" : "proxy");
+  out.set("initialMarginProxy", arr(proxy));
+  out.set("mvaProxy", xva(r.profile, proxy, cc, rec, own, env.ownRecovery, params).mva);
+  if (nested) {
+    out.set("imInnerPaths", num(spec, "imInnerPaths", 128));
+    out.set("initialMarginMean", arr(r.fused.conditionalImMean));
+    out.set("initialMarginBands", arrOfArr(r.fused.conditionalImBands));
+  }
   out.set("xva", xvaToJs(total));
   out.set("identityHolds", std::fabs(total.cva - total.dva + total.fca - total.fba + total.mva + total.kva - total.total()) <=
                                1e-6 * std::max(1.0, std::fabs(total.total())));

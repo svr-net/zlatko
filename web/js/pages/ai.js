@@ -13,7 +13,7 @@ const page = initPage({
     'Two uses of AI around the XVA engine. <b>1. Surrogates:</b> a polynomial and a neural network learn the map from a market state to the six adjustments of the default netting set ' +
     'from full Monte Carlo prices, and are <i>back tested</i> on a 250-day market path that includes a stress episode outside the training range. ' +
     '<b>2. Agent skill:</b> typed tools, a SKILL.md and a tool-use loop that let any LLM price, shock and explain XVA by calling the engine, never by guessing numbers. ' +
-    'The ground truth is the library\'s own Monte Carlo (generated natively with <code>examples/xva_ai_dataset.cpp</code>, committed as <code>web/js/ai/backtest-data.js</code>). ' +
+    'The ground truth is the library\'s own Monte Carlo (generated natively with <code>examples/xva_ai_dataset.cpp</code>, committed as <code>web/js/ai/backtest-data.js</code>); its MVA, like the agent tools\', uses the unconditional initial-margin proxy, not the nested conditional IM of the XVA page. ' +
     '<b>The market path is synthetic, not market history, and the page measures surrogates and the tool layer, not the accuracy of any language model.</b>',
 });
 

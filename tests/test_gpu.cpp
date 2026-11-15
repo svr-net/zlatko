@@ -68,7 +68,7 @@ TEST(gpu_plan_layout) {
   CHECK(plan.unsupported.empty());
   CHECK(plan.header.size() == gpu::kHeaderWords);
   CHECK(plan.header[0] == 1000u && plan.header[1] == nT && plan.header[15] == plan.numWorkgroups());
-  CHECK(plan.indices.size() == 3 * nT + 1);
+  CHECK(plan.indices.size() == 4 * nT + 1);  // + the date of t + MPR (nested initial margin)
   CHECK(plan.indices[nT] == plan.numTerms());
   CHECK(plan.steps.size() == nT * gpu::kStepStride);
   CHECK(plan.reporting.size() == s.engine.reportingGrid(s.nettingSet).size());
@@ -390,4 +390,70 @@ TEST(gpu_path_views_match_exposure_engine) {
   CHECK(F.rateSamples.size() == 5 && F.rateBands.size() == 5 && F.incrementCorrelation.rows() == 3);
   CHECK_NEAR(F.incrementCorrelation(0, 1), 0.2, 0.05);
   CHECK_NEAR(F.incrementCorrelation(0, 2), 0.0, 0.05);
+}
+
+TEST(gpu_securities_collateral_matches_exposure_engine) {
+  // Variation margin posted in a government bond or in the FX asset, with haircuts: units fixed
+  // at the call date and revalued at close-out, in the fused kernels and in ExposureEngine.
+  for (const auto type : {CollateralAgreement::Type::Bond, CollateralAgreement::Type::Asset}) {
+    auto s = gpuSetup(8000, true);
+    auto& csa = *s.nettingSet.collateral;
+    csa.type = type;
+    csa.haircut = type == CollateralAgreement::Type::Bond ? 0.02 : 0.15;
+    csa.bondMaturity = 10.0;
+    csa.assetIndex = 0;
+    csa.marginPeriodOfRisk = 20.0 / 250.0;
+    const auto plan = gpu::compile(s.engine, s.nettingSet);
+    CHECK(plan.securitiesCollateral && plan.valsBytes() == 2 * plan.numPaths * plan.numDates() * 4);
+    const auto fused = gpu::summarise(plan, gpu::runFusedReference(plan)).profile;
+    const auto cpu = s.engine.run(s.nettingSet, 0.95).profile;
+    CHECK_NEAR(fused.expectedValue[0], cpu.expectedValue[0], 1e-5 * 1.9e6);
+    const double scale = *std::max_element(cpu.expectedExposure.begin(), cpu.expectedExposure.end());
+    double worst = 0.0;
+    for (std::size_t k = 0; k < cpu.times.size(); ++k) worst = std::max(worst, std::fabs(fused.expectedExposure[k] - cpu.expectedExposure[k]));
+    CHECK(worst < 6.0 / std::sqrt(8000.0) * scale);
+  }
+  // Cash with a zero haircut is the old cash CSA exactly; a bond maturing before the horizon is refused.
+  auto s = gpuSetup(1000, true);
+  const auto cash = gpu::runFusedReference(gpu::compile(s.engine, s.nettingSet));
+  s.nettingSet.collateral->type = CollateralAgreement::Type::Bond;
+  s.nettingSet.collateral->bondMaturity = 2.0;
+  CHECK_THROWS(gpu::compile(s.engine, s.nettingSet));
+  CHECK_THROWS(s.engine.run(s.nettingSet, 0.95));
+  CHECK(!cash.values.empty());
+}
+
+TEST(gpu_nested_initial_margin_matches_the_analytic_conditional_quantile) {
+  // An FX forward with (almost) deterministic rates: over the margin period h the value moves by
+  // N Q(t, T) S(t) (e^{sigma sqrt(h) Z + ...} - 1), so the conditional 99% quantile of |dV| is
+  // 2.5758 N Q(t, T) S(t) sigma sqrt(h) to first order, and E[D IM(t)] = 2.5758 N sigma sqrt(h) S0 Q(0, T)
+  // on every date before the maturity: the nested estimate must reproduce it.
+  const auto yc = std::make_shared<YieldCurve>(YieldCurve::flat(0.02));
+  const auto foreign = std::make_shared<YieldCurve>(YieldCurve::flat(0.01));
+  const auto hw = std::make_shared<HullWhite1F>(yc, 0.05, 1e-5);
+  const double sigma = 0.12, S0 = 1.1, N = 1e6, T = 3.0, h = 10.0 / 250.0;
+  const auto fx = std::make_shared<LognormalAsset>("FX", S0, sigma, foreign);
+  NettingSet ns;
+  ns.trades.push_back(std::make_shared<AssetForward>("fwd", "FX", N, 1.1, T));
+  const ExposureEngine engine(ScenarioGenerator(hw, {fx}, {}, Matrix::identity(2)), {2000, 7, true}, TimeGrid::standardExposureGrid(5.0));
+  gpu::FusedOptions o;
+  o.imQuantile = 0.99;
+  o.imInnerPaths = 512;
+  o.imMarginPeriod = h;
+  const auto plan = gpu::compile(engine, ns, o);
+  CHECK(plan.imInnerPaths == 512 && plan.rows.conditionalIm != gpu::kNoRow);
+  const auto f = gpu::summarise(plan, gpu::runFusedReference(plan));
+  const double exact = 2.5758 * N * sigma * std::sqrt(h) * S0 * foreign->discount(T);
+  std::size_t checked = 0;
+  for (std::size_t k = 0; k < f.profile.times.size(); ++k) {
+    if (f.profile.times[k] + h > T) continue;
+    CHECK_NEAR(f.conditionalImDiscounted[k], exact, 0.04 * exact);
+    CHECK(f.conditionalImBands[0][k] <= f.conditionalImBands[1][k] && f.conditionalImBands[1][k] <= f.conditionalImBands[2][k]);
+    ++checked;
+  }
+  CHECK(checked > 20);
+  // Too few inner paths for the quantile (it keeps the 8 largest samples) is refused.
+  o.imInnerPaths = 1000;
+  o.imQuantile = 0.9;
+  CHECK_THROWS(gpu::compile(engine, ns, o));
 }

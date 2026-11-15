@@ -45,14 +45,17 @@ constexpr std::size_t kMaxSwapSlots = 32;    ///< swaps with a running fixing
 constexpr std::size_t kMaxNormals = 64;      ///< normals drawn per path and step
 constexpr std::size_t kCholeskyStride = 8;  ///< padded row length of the Cholesky factor (two vec4s)
 /// Floats per date in the step table, as six vec4s: HW (e, sd x, c1, c2), HW (int phi, (1-e)/a, dt, 0),
-/// carry[4], vol sqrt(dt)[4], vol^2 dt / 2[4], CIR++ shift[2] + padding.
+/// carry[4], vol sqrt(dt)[4], vol^2 dt / 2[4], CIR++ shift[2] + collateral bond (A, B).
 constexpr std::size_t kStepStride = 24;
-constexpr std::size_t kParamCount = 16 + kCholeskyStride * kCholeskyStride;
+/// CIR x2 | CSA | spots | Cholesky rows | collateral security (type, asset, haircut, -).
+constexpr std::size_t kParamCount = 16 + kCholeskyStride * kCholeskyStride + 4;
 constexpr std::size_t kTermStride = 8;
 constexpr std::size_t kHeaderWords = 32;
 constexpr std::size_t kPfeBins = 3072;       ///< histogram bins of the row-statistics kernel (12 KiB of workgroup storage)
 constexpr std::size_t kPfeWorkgroupSize = 256;
 constexpr std::size_t kMaxSamples = 64;      ///< sample paths of the path views
+constexpr std::size_t kMaxInnerPaths = 1024; ///< inner paths of the nested initial margin
+constexpr std::size_t kInnerTop = 16;        ///< largest inner samples kept for the quantile
 constexpr std::size_t kRequestStride = 8;    ///< (op, row, row2, count) (level, lo, hi, out) per request, as f32
 constexpr std::uint32_t kNoRow = 0xFFFFFFFFu;
 
@@ -82,6 +85,7 @@ struct RowLayout {
   std::uint32_t gross = kNoRow;             ///< sum_i max(V_i, 0)
   std::uint32_t trades = kNoRow;            ///< V_i, trade-major
   std::uint32_t exercise = kNoRow;          ///< one row per Bermudan: exercise index, -1 if never exercised
+  std::uint32_t conditionalIm = kNoRow;     ///< IM(t, path) of the nested initial margin
   std::uint32_t total = 0;                  ///< rows of the exposure buffer, probes included
 };
 
@@ -94,6 +98,8 @@ struct ProfileOutputs {
 struct ViewOutputs {
   static constexpr std::size_t none = static_cast<std::size_t>(-1);
   std::size_t pfe = 0, valueChange = none;
+  std::size_t conditionalIm = none, conditionalImMean = none;  ///< E[D IM], E[IM] per reporting date
+  std::vector<std::size_t> conditionalImBands;                 ///< 5 / 50 / 95% of IM per reporting date
   std::size_t samples = 0;                                   ///< paths per sample block
   std::size_t exposureSamples = none, nettedSamples = none, collateralSamples = none;  ///< [date][path]
   std::vector<std::size_t> collateralBands;                  ///< per level: [date]
@@ -163,12 +169,14 @@ struct FusedPlan {
   std::uint32_t seed = 0;
   bool antithetic = true;
   bool hasCsa = false;
+  bool securitiesCollateral = false;  ///< the CSA collateral is a bond or an asset, not cash
   double pfeQuantile = 0.95;
   /// Quantile of |V(t_k) - V(t_{k-1})| between reporting dates (initial margin proxy); 0 if off.
   double imQuantile = 0.0;
   /// Trades with their own statistics (per-trade mode), 0 if off; netting-set order.
   std::size_t numTradeGroups = 0;
   std::size_t statsPerDate = kStatsPerDate;
+  std::size_t imInnerPaths = 0;         ///< nested initial margin (0: off)
   RowLayout rows;
   std::vector<float> requests;          ///< row-statistics requests (kRequestStride floats each)
   std::size_t numOutputs = 0;           ///< floats the row-statistics kernel writes
@@ -176,7 +184,7 @@ struct FusedPlan {
 
   // GPU buffers, in the exact binary layout of the WGSL kernels.
   std::vector<std::uint32_t> header;    ///< uniform block (kHeaderWords words; the quantile as f32 bits)
-  std::vector<std::uint32_t> indices;   ///< termStart[nT+1] | callIndex[nT] | reportingSlot[nT] (1 + rank, 0 if not reported)
+  std::vector<std::uint32_t> indices;   ///< termStart[nT+1] | callIndex[nT] | reportingSlot[nT] (1 + rank, 0 if not reported) | imTarget[nT] (date of t + MPR)
   std::vector<float> params;            ///< CIR parameters x2 | CSA terms | spots | Cholesky rows (kCholeskyStride)
   std::vector<float> steps;             ///< per-date transition coefficients (kStepStride per date, vec4-aligned)
   std::vector<float> terms;             ///< valuation terms (kTermStride per term)
@@ -200,7 +208,8 @@ struct FusedPlan {
   bool perTrade() const { return numTradeGroups > 0; }
   /// Buffer sizes in bytes. The netted values are kept only for the margin-call look-back
   /// (with a CSA), and the positive exposure only on the reporting dates (for the PFE).
-  std::size_t valsBytes() const { return hasCsa ? numPaths * numDates() * 4 : 16; }
+  /// Netted values (and, for securities collateral, the unit price) for the margin-call look-back.
+  std::size_t valsBytes() const { return hasCsa ? numPaths * numDates() * 4 * (securitiesCollateral ? 2 : 1) : 16; }
   std::size_t expoBytes() const { return std::max<std::size_t>(16, numPaths * rows.total * 4); }
   std::size_t cubeBytes() const { return std::max(valsBytes(), expoBytes()); }  ///< largest storage binding
   std::size_t partialsBytes() const { return numWorkgroups() * numDates() * statsPerDate * 4; }
@@ -227,6 +236,9 @@ struct FusedResult {
   std::vector<double> meanDeflator;
   /// Quantile of |V(t_k) - V(t_{k-1})| of the uncollateralised netted value (0 at k = 0); empty if off.
   std::vector<double> valueChangeQuantile;
+  /// Nested conditional initial margin: E[D IM(t)] (for MVA), E[IM(t)] and its 5 / 50 / 95% bands.
+  std::vector<double> conditionalImDiscounted, conditionalImMean;
+  std::vector<std::vector<double>> conditionalImBands;
 
   /// Per-trade statistics of trade i with value V_i in the netting set V (uncollateralised):
   struct TradeStats {
@@ -278,6 +290,11 @@ struct FusedOptions {
   double imQuantile = 0.0;
   /// Statistics per trade (allocation); at most kMaxTradeGroups trades.
   bool perTrade = false;
+  /// > 0: conditional initial margin by nested Monte Carlo: from every path on every reporting
+  /// date, this many inner paths (antithetic pairs) over imMarginPeriod revalue the netting set,
+  /// and IM(t, path) is the imQuantile of |V(t + MPR) - V(t)| over them (at most kMaxInnerPaths).
+  std::size_t imInnerPaths = 0;
+  double imMarginPeriod = 10.0 / 250.0;
   // Path views (each adds rows to the exposure buffer and requests to the row-statistics kernel):
   std::size_t samples = 0;           ///< sample paths of V - C, V and C (at most kMaxSamples)
   double histogramTime = -1.0;       ///< >= 0: histogram of V - C on the reporting date on or before it
