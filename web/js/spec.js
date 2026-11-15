@@ -37,6 +37,7 @@ export function defaultSpec() {
     ],
     csa: { enabled: false, thresholdCounterparty: 250e3, thresholdOwn: 250e3, mta: 50e3, independentAmount: 0, mpr: 10 / 250 },
     own: { recovery: 0.4, quotes: [{ maturity: 5, spread: 0.006 }] },
+    xva: { fundingSpreadBorrow: 0.01, fundingSpreadLend: 0.0, marginFundingSpread: 0.01, hurdleRate: 0.1, capitalRatio: 0.08, riskWeight: 1, alpha: 1.4 },
     pfeQuantile: 0.95,
     counterparty: 0,
   };

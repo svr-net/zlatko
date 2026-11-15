@@ -23,7 +23,8 @@ const DESCRIPTIONS = {
   allocation: 'Marginal (Euler), incremental and standalone allocation of exposure and CVA.',
   cva: 'Unilateral and bilateral CVA/DVA, term structure, running spread, recovery sensitivity.',
   wwr: 'Pathwise CVA with a stochastic intensity correlated with the exposure drivers.',
-  hedging: 'Bucketed CS01, CDS hedge notionals, delta with and without common random numbers.',
+  xva: 'CVA, DVA, FVA (FCA/FBA), MVA and KVA with funding, margin and capital inputs, sensitivities and trade allocation.',
+  hedging: 'Bucketed CS01, CDS hedge notionals, XVA credit and funding sensitivities, delta with and without common random numbers.',
   gpu: 'The whole exposure pipeline fused into one WebGPU kernel, validated against WASM and benchmarked.',
 };
 

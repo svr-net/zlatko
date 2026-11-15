@@ -12,6 +12,7 @@ const pages = {
   allocation: () => import('./pages/allocation.js'),
   cva: () => import('./pages/cva.js'),
   wwr: () => import('./pages/wwr.js'),
+  xva: () => import('./pages/xva.js'),
   hedging: () => import('./pages/hedging.js'),
   gpu: () => import('./pages/gpu.js'),
 };

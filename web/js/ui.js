@@ -33,7 +33,8 @@ export const PAGES = [
     items: [
       { id: 'cva', href: 'cva.html', title: 'CVA / DVA' },
       { id: 'wwr', href: 'wwr.html', title: 'Wrong-way risk' },
-      { id: 'hedging', href: 'hedging.html', title: 'CVA hedging' },
+      { id: 'xva', href: 'xva.html', title: 'XVA (FVA, MVA, KVA)' },
+      { id: 'hedging', href: 'hedging.html', title: 'XVA hedging' },
     ],
   },
   { group: 'Acceleration', items: [{ id: 'gpu', href: 'gpu.html', title: 'WebGPU fused kernels' }] },
@@ -208,7 +209,7 @@ const TRADE_DEFAULTS = {
 
 /**
  * Collapsible editor for the shared specification.
- * sections: subset of ['market','assets','credit','correlation','simulation','portfolio','csa','own'].
+ * sections: subset of ['market','assets','credit','correlation','simulation','portfolio','csa','own','xva'].
  */
 export function specEditor(page, sections, { open = false, tradeTypes = ['swap', 'forward', 'option'] } = {}) {
   page.spec = loadSpec();
@@ -270,6 +271,17 @@ export function specEditor(page, sections, { open = false, tradeTypes = ['swap',
       const s = sec('Own credit (for DVA)');
       s.append(field('own 5y CDS (bp)', numInput(() => spec.own.quotes[0].spread, (v) => { spec.own.quotes[0].spread = v; changed(); }, { scale: 1e4, digits: 3 })));
       s.append(field('own recovery %', numInput(() => spec.own.recovery, (v) => { spec.own.recovery = v; changed(); }, { scale: 100 })));
+    }
+    if (sections.includes('xva')) {
+      const s = sec('Funding, margin and capital (XVA)');
+      const x = () => (spec.xva = spec.xva || {});
+      s.append(field('funding borrow spread (bp)', numInput(() => x().fundingSpreadBorrow, (v) => { x().fundingSpreadBorrow = v; changed(); }, { scale: 1e4 })));
+      s.append(field('funding lend spread (bp)', numInput(() => x().fundingSpreadLend, (v) => { x().fundingSpreadLend = v; changed(); }, { scale: 1e4 })));
+      s.append(field('margin funding spread (bp)', numInput(() => x().marginFundingSpread, (v) => { x().marginFundingSpread = v; changed(); }, { scale: 1e4 })));
+      s.append(field('hurdle rate % (KVA)', numInput(() => x().hurdleRate, (v) => { x().hurdleRate = v; changed(); }, { scale: 100 })));
+      s.append(field('capital ratio %', numInput(() => x().capitalRatio, (v) => { x().capitalRatio = v; changed(); }, { scale: 100 })));
+      s.append(field('risk weight', numInput(() => x().riskWeight, (v) => { x().riskWeight = v; changed(); }, { step: 0.05 })));
+      s.append(field('EAD multiplier α', numInput(() => x().alpha, (v) => { x().alpha = v; changed(); }, { step: 0.05 })));
     }
     if (sections.includes('correlation')) {
       const s = sec('Correlation of drivers');

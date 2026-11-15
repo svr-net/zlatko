@@ -49,4 +49,30 @@ std::vector<double> cdsHedgeNotionals(const std::vector<double>& cvaSensitivitie
   return solveLinearSystem(transpose(jacobian), cvaSensitivities);
 }
 
+XvaSensitivities xvaSensitivities(const ExposureProfile& profile, const std::vector<double>& discountedInitialMargin,
+                                  const YieldCurve& yc, const std::vector<CdsQuote>& counterpartyQuotes,
+                                  double recoveryCounterparty, const std::vector<CdsQuote>& ownQuotes,
+                                  double recoveryOwn, const XvaParameters& parameters, double bump) {
+  const CreditCurve counterparty = bootstrapCreditCurve(yc, counterpartyQuotes, recoveryCounterparty);
+  const CreditCurve own = bootstrapCreditCurve(yc, ownQuotes, recoveryOwn);
+  auto total = [&](const CreditCurve& c, const CreditCurve& o, const XvaParameters& p) {
+    return xva(profile, discountedInitialMargin, c, recoveryCounterparty, o, recoveryOwn, p).total();
+  };
+  XvaSensitivities s;
+  s.counterpartyCs01 = creditSpreadSensitivities(
+      [&](const CreditCurve& c) { return total(c, own, parameters); }, yc, counterpartyQuotes, recoveryCounterparty,
+      bump);
+  s.ownCs01 = creditSpreadSensitivities([&](const CreditCurve& o) { return total(counterparty, o, parameters); }, yc,
+                                        ownQuotes, recoveryOwn, bump);
+  auto shifted = [&](double h) {
+    XvaParameters p = parameters;
+    p.fundingSpreadBorrow += h;
+    p.fundingSpreadLend += h;
+    p.marginFundingSpread += h;
+    return total(counterparty, own, p);
+  };
+  s.fundingSpread01 = 0.5 * (shifted(bump) - shifted(-bump));
+  return s;
+}
+
 }  // namespace ccr

@@ -5,12 +5,12 @@ import { card, grid, initPage, passFail, runButton, specEditor, table, tiles } f
 const page = initPage({
   id: 'allocation',
   title: 'Allocating exposure and CVA to trades',
-  context: 'ccr/exposure: marginalExposureContributions · incrementalExposure',
+  context: 'ccr/exposure: marginalExposureContributions · incrementalExposure · ccr/xva: allocateExposureXva',
   description: 'Netting makes the netting-set CVA smaller than the sum of the standalone CVAs, so it has to be split among the trades. The marginal (Euler) ' +
     'contribution E[D·V<sub>i</sub>·1{V &gt; 0}] adds up exactly to the total. The incremental CVA is the change from removing a trade, ' +
     'which is the right price for a new deal but does not add up. Hedging trades get negative contributions.',
 });
-specEditor(page, ['market', 'assets', 'credit', 'simulation', 'portfolio']);
+specEditor(page, ['market', 'assets', 'credit', 'own', 'xva', 'simulation', 'portfolio']);
 
 runButton(page, 'Allocate', async (spec) => {
   const r = await run('allocation', spec);
@@ -39,5 +39,10 @@ runButton(page, 'Allocate', async (spec) => {
   table(box, ['trade', 'marginal', 'share', 'incremental', 'standalone'], [
     ...r.trades.map((tr) => [tr.id, fmt.num(tr.marginalCva), fmt.pct(tr.marginalCva / r.totalCva, 1), fmt.num(tr.incrementalCva), fmt.num(tr.standaloneCva)]),
     ['total', fmt.num(sum('marginalCva')), passFail(Math.abs(sum('marginalCva') - r.totalCva) < 1e-6 * Math.abs(r.totalCva), 'adds up'), fmt.num(sum('incrementalCva')), fmt.num(sum('standaloneCva'))],
+  ]);
+  const xvaBox = card(g, 'XVA allocation', 'CVA, FCA and KVA are linear in the discounted EE, so the marginal contributions allocate them exactly.');
+  table(xvaBox, ['trade', 'CVA', 'FCA', 'KVA'], [
+    ...r.trades.map((tr) => [tr.id, fmt.num(tr.marginalCva), fmt.num(tr.marginalFca), fmt.num(tr.marginalKva)]),
+    ['netting set', fmt.num(r.totalCva), fmt.num(r.totalFca), fmt.num(r.totalKva)],
   ]);
 });
