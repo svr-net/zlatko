@@ -97,6 +97,8 @@ endif()
 if(CCR_BUILD_EXAMPLES)
   add_executable(counterparty_exposure_demo examples/counterparty_exposure_demo.cpp)
   target_link_libraries(counterparty_exposure_demo PRIVATE ccr)
+  add_executable(xva_ai_dataset examples/xva_ai_dataset.cpp)
+  target_link_libraries(xva_ai_dataset PRIVATE ccr)
 endif()
 
 include(GNUInstallDirs)

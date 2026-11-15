@@ -46,7 +46,7 @@ const pairSpec = { sim: { numPaths: 4000, seed: 11, antithetic: true } };
 // WebGPU kernels on desktop too; each also runs once forced onto WebAssembly.
 const enginePages = ['index', 'exposure', 'collateral', 'cva', 'wwr', 'hedging'];
 const cases = [
-  ...['index', 'core', 'market', 'models', 'instruments', 'amc', 'exposure', 'collateral', 'allocation', 'cva', 'xva', 'wwr', 'hedging']
+  ...['index', 'core', 'market', 'models', 'instruments', 'amc', 'exposure', 'collateral', 'allocation', 'cva', 'xva', 'ai', 'wwr', 'hedging']
     .map((name) => ({ name, file: name, spec: testSpec, ...(enginePages.includes(name) ? { engine: 'auto', expectEngine: 'WebGPU' } : {}) })),
   ...['index', 'collateral', 'wwr'].map((name) => ({ name: `${name}-wasm`, file: name, spec: testSpec, engine: 'wasm', expectEngine: 'WebAssembly' })),
   // A first visit (nothing stored): the default is Auto, which must dispatch the fused kernels.

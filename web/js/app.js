@@ -13,6 +13,7 @@ const pages = {
   cva: () => import('./pages/cva.js'),
   wwr: () => import('./pages/wwr.js'),
   xva: () => import('./pages/xva.js'),
+  ai: () => import('./pages/ai.js'),
   hedging: () => import('./pages/hedging.js'),
   gpu: () => import('./pages/gpu.js'),
 };
