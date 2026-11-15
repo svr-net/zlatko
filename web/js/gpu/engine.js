@@ -18,12 +18,12 @@ const ADAPTER_OPTIONS = [
 ];
 
 // What the fused kernels need beyond the compatibility-mode defaults: 7 storage buffers in the
-// fused kernel, 256-invocation workgroups in pfe-quantile and its 13 KiB histogram.
+// fused kernel, 256-invocation workgroups in pfe-quantile and its 12 KiB histogram (+ scalars).
 const KERNEL_LIMITS = {
   maxStorageBuffersPerShaderStage: 7,
   maxComputeInvocationsPerWorkgroup: 256,
   maxComputeWorkgroupSizeX: 256,
-  maxComputeWorkgroupStorageSize: 13316,
+  maxComputeWorkgroupStorageSize: 12352,
 };
 
 /** The kernel limits this adapter cannot meet, e.g. ["maxStorageBuffersPerShaderStage 4 < 7"]. */
@@ -148,8 +148,8 @@ export class GpuEngine {
       params: this.upload(plan.params, S, 'params'),
       steps: this.upload(plan.steps, S, 'steps'),
       terms: this.upload(plan.terms, S, 'terms'),
-      vals: scratch(bytes.cube, S, 'vals'),
-      expo: scratch(bytes.cube, S, 'expo'),
+      vals: scratch(bytes.vals ?? bytes.cube, S, 'vals'),  // margin-call look-back (16 bytes without a CSA)
+      expo: scratch(bytes.expo ?? bytes.cube, S, 'expo'),  // positive exposure on the reporting dates
       partials: scratch(bytes.partials, S, 'partials'),
       sums: scratch(bytes.sums, S | GPUBufferUsage.COPY_SRC, 'sums'),
       pfe: scratch(bytes.pfe, S | GPUBufferUsage.COPY_SRC, 'pfe'),

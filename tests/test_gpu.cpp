@@ -2,6 +2,7 @@
 #include <cmath>
 #include <memory>
 
+#include "ccr/core/math.hpp"
 #include "ccr/cva/cva.hpp"
 #include "ccr/exposure/exposure_engine.hpp"
 #include "ccr/gpu/fused_exposure.hpp"
@@ -73,6 +74,11 @@ TEST(gpu_plan_layout) {
   CHECK(gpu::limitation(s.engine, s.nettingSet).empty());
   CHECK(gpu::fusedExposureKernel().find("fn main") != std::string::npos);
   CHECK(gpu::pfeQuantileKernel().find("3072") != std::string::npos);
+  // Netted values are kept only for the CSA look-back, exposures only on the reporting dates.
+  CHECK(plan.valsBytes() == 1000 * nT * 4);
+  CHECK(plan.expoBytes() == 1000 * plan.reporting.size() * 4);
+  CHECK(plan.pfeDispatch() == plan.reporting.size());
+  CHECK(gpu::compile(gpuSetup(1000, false).engine, gpuSetup(1000, false).nettingSet).valsBytes() == 16);
 
   // A Bermudan needs AMC: reported, left out of the plan.
   NettingSet withBermudan = s.nettingSet;
@@ -146,4 +152,52 @@ TEST(gpu_fused_kernel_split_across_workers_is_exact) {
   }
   // Slices that leave a gap are rejected.
   CHECK_THROWS(gpu::finishFused(plan, {gpu::runFusedWorkgroups(plan, 0, numWG / 2)}));
+}
+
+TEST(gpu_terms_are_merged_per_cash_flow_date) {
+  // Identical swaps share every cash-flow date: their terms merge into one set, so the plan
+  // does not grow with the number of trades, and offsetting trades leave no bond terms at all.
+  const auto s = gpuSetup(256, false);
+  NettingSet tripled = s.nettingSet, offset = s.nettingSet;
+  const auto pay = InterestRateSwap::vanilla("p2", 1e6, 0.028, 0.0, 5.0, 2, InterestRateSwap::Direction::PayFixed);
+  const auto rec = InterestRateSwap::vanilla("r2", 1e6, 0.028, 0.0, 5.0, 2, InterestRateSwap::Direction::ReceiveFixed);
+  tripled.trades.push_back(std::make_shared<InterestRateSwap>(pay));
+  tripled.trades.push_back(std::make_shared<InterestRateSwap>(pay));
+  offset.trades.push_back(std::make_shared<InterestRateSwap>(rec));
+  const auto base = gpu::compile(s.engine, s.nettingSet), three = gpu::compile(s.engine, tripled),
+             zero = gpu::compile(s.engine, offset);
+  auto count = [](const gpu::FusedPlan& p, int kind) {
+    std::size_t n = 0;
+    for (std::size_t t = 0; t < p.numTerms(); ++t) n += static_cast<int>(p.terms[t * gpu::kTermStride]) == kind;
+    return n;
+  };
+  CHECK(count(three, gpu::kBond) == count(base, gpu::kBond));
+  CHECK(count(three, gpu::kFixedFloat) == 3 * count(base, gpu::kFixedFloat));  // one per swap (own fixing)
+  CHECK(count(zero, gpu::kBond) < count(base, gpu::kBond));
+  // The merged plan prices the same book: t = 0 values against the double-precision engine.
+  for (const auto* ns : {&tripled, &offset}) {
+    const auto plan = gpu::compile(s.engine, *ns);
+    const double fused = gpu::summarise(plan, gpu::runFusedReference(plan)).profile.expectedValue[0];
+    const double exact = s.engine.run(*ns, 0.95).profile.expectedValue[0];
+    CHECK_NEAR(fused, exact, 2e-6 * 3e6);
+  }
+}
+
+TEST(gpu_pfe_kernel_is_the_interpolated_empirical_quantile) {
+  // The two-level histogram of the PFE kernel reproduces ccr::quantile (linear interpolation
+  // between order statistics) of the very exposures the fused kernel produced, to f32 rounding.
+  for (const bool csa : {false, true})
+    for (const double level : {0.5, 0.95, 0.99}) {
+      const auto s = gpuSetup(3000, csa);
+      const auto plan = gpu::compile(s.engine, s.nettingSet, level, 0);
+      const auto slice = gpu::runFusedWorkgroups(plan, 0, plan.numWorkgroups());
+      const auto out = gpu::finishFused(plan, {slice});
+      CHECK(out.pfe.size() == plan.reporting.size());
+      const std::size_t nP = plan.numPaths;
+      for (std::size_t r = 0; r < plan.reporting.size(); ++r) {
+        const std::vector<double> e(slice.exposure.begin() + r * nP, slice.exposure.begin() + (r + 1) * nP);
+        const double exact = quantile(e, level), mx = *std::max_element(e.begin(), e.end());
+        CHECK_NEAR(out.pfe[r], exact, 1e-6 * std::max(mx, 1.0));
+      }
+    }
 }

@@ -1479,6 +1479,8 @@ val planToJs(const gpu::FusedPlan& p, const std::string& label) {
   o.set("dispatch", dispatch);
   val bytes = val::object();
   bytes.set("cube", static_cast<double>(p.cubeBytes()));
+  bytes.set("vals", static_cast<double>(p.valsBytes()));
+  bytes.set("expo", static_cast<double>(p.expoBytes()));
   bytes.set("partials", static_cast<double>(p.partialsBytes()));
   bytes.set("sums", static_cast<double>(p.sumsBytes()));
   bytes.set("pfe", static_cast<double>(p.pfeBytes()));

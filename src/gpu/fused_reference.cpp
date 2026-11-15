@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <limits>
 #include <stdexcept>
 
 #include "ccr/gpu/fused_exposure.hpp"
@@ -69,7 +70,7 @@ struct PlanView {
 };
 
 // fused-exposure for one path (invocation p): the per-date statistics into `stats`
-// ([nT][kStatsPerDate]) and the positive exposure into expo[j * stride].
+// ([nT][kStatsPerDate]) and the positive exposure of reporting date r into expo[r * stride].
 void simulatePath(const PlanView& v, std::uint32_t p, float* stats, float* expo, std::size_t stride, float* vals) {
   const auto& IDX = v.plan.indices;
   const auto& FP = v.plan.params;
@@ -83,8 +84,8 @@ void simulatePath(const PlanView& v, std::uint32_t p, float* stats, float* expo,
     if ((p & 1u) == 1u) sign = -1.0f;
   }
   const std::uint32_t stream = pcg(pcg(v.seed) ^ pcg(pathStream + 0x9E3779B9u));
-  float x = 0.0f, D = 1.0f;
-  float S[kMaxAssets], y[kMaxCredits], Y[kMaxCredits], fix[kMaxSwapSlots] = {}, z[kMaxNormals] = {}, w[kCholeskyStride];
+  float x = 0.0f, lnD = 0.0f, D = 1.0f;
+  float S[kMaxAssets], lnS[kMaxAssets] = {}, y[kMaxCredits], Y[kMaxCredits], fix[kMaxSwapSlots] = {}, z[kMaxNormals] = {}, w[kCholeskyStride];
   for (std::uint32_t a = 0; a < kMaxAssets; ++a) S[a] = FP[12 + a];
   for (std::uint32_t c = 0; c < kMaxCredits; ++c) y[c] = FP[4 * c + 3], Y[c] = 0.0f;
   float held = 0.0f, prevDE = 0.0f, prevQ = 1.0f;
@@ -106,9 +107,12 @@ void simulatePath(const PlanView& v, std::uint32_t p, float* stats, float* expo,
       }
       const float integratedRate = x * STEPS[base + 5] + STEPS[base + 2] * w[0] + STEPS[base + 3] * z[nCorr] + STEPS[base + 4];
       x = x * STEPS[base] + STEPS[base + 1] * w[0];
-      D = D * std::exp(-integratedRate);
-      for (std::uint32_t a = 0; a < kMaxAssets; ++a)
-        S[a] = S[a] * std::exp(integratedRate - STEPS[base + 8 + a] - STEPS[base + 16 + a] + STEPS[base + 12 + a] * w[1 + a]);
+      lnD = lnD - integratedRate;
+      D = std::exp(lnD);
+      for (std::uint32_t a = 0; a < kMaxAssets; ++a) {
+        lnS[a] = lnS[a] + (integratedRate - STEPS[base + 8 + a] - STEPS[base + 16 + a] + STEPS[base + 12 + a] * w[1 + a]);
+        S[a] = FP[12 + a] * std::exp(lnS[a]);
+      }
       const float dt = STEPS[base + 6];
       std::uint32_t off = nCorr + 1;
       for (std::uint32_t c = 0; c < nC; ++c) {
@@ -141,9 +145,9 @@ void simulatePath(const PlanView& v, std::uint32_t p, float* stats, float* expo,
       const float bond = TERMS[r + 3] * std::exp(-TERMS[r + 4] * x);
       switch (kind) {
         case kBond: value += c * bond; break;
-        case kFixedFloat: value += c * fix[slot] * bond; break;
+        case kFixedFloat: value += (c * fix[slot] + TERMS[r + 5]) * bond; break;
         case kAsset: value += c * S[slot] * TERMS[r + 3]; break;
-        case kSetFixing: fix[slot] = (bond / (TERMS[r + 5] * std::exp(-TERMS[r + 6] * x)) - 1.0f) / c; break;
+        case kSetFixing: fix[slot] = (bond - 1.0f) / c; break;
         default: {
           const float p3 = TERMS[r + 7];
           value += c * black(S[slot] * TERMS[r + 5] / bond, TERMS[r + 6], std::fabs(p3), bond, p3 > 0.0f);
@@ -165,10 +169,11 @@ void simulatePath(const PlanView& v, std::uint32_t p, float* stats, float* expo,
       collateral = held + ia;
     }
     const float e = value - collateral, ep = std::max(e, 0.0f), en = std::min(e, 0.0f);
-    expo[std::size_t(j) * stride] = ep;
+    const std::uint32_t rs = IDX[v.offReporting + j];
+    if (rs > 0) expo[std::size_t(rs - 1) * stride] = ep;
 
     float cvaInc = 0.0f;
-    if (IDX[v.offReporting + j] == 1u) {
+    if (rs > 0) {
       const float de = D * ep;
       if (j > 0) cvaInc = 0.5f * (prevDE + de) * (prevQ - Q);
       prevDE = de;
@@ -190,9 +195,9 @@ FusedSlice runFusedWorkgroups(const FusedPlan& plan, std::size_t wgBegin, std::s
   slice.wgEnd = wgEnd;
   slice.pathBegin = std::min<std::size_t>(wgBegin * kWorkgroupSize, v.nP);
   slice.pathEnd = std::min<std::size_t>(wgEnd * kWorkgroupSize, v.nP);
-  const std::size_t count = slice.pathEnd - slice.pathBegin, nT = v.nT;
+  const std::size_t count = slice.pathEnd - slice.pathBegin, nT = v.nT, nR = plan.reporting.size();
   slice.partials.assign((wgEnd - wgBegin) * nT * kStatsPerDate, 0.0f);
-  slice.exposure.assign(nT * count, 0.0f);
+  slice.exposure.assign(nR * count, 0.0f);
 
   std::vector<float> stats(kWorkgroupSize * nT * kStatsPerDate), vals(nT), red(kWorkgroupSize * kStatsPerDate);
   for (std::size_t g = wgBegin; g < wgEnd; ++g) {
@@ -219,11 +224,11 @@ FusedSlice runFusedWorkgroups(const FusedPlan& plan, std::size_t wgBegin, std::s
 
 FusedOutput finishFused(const FusedPlan& plan, const std::vector<FusedSlice>& slices) {
   const PlanView v(plan);
-  const std::size_t nT = v.nT, n = nT * kStatsPerDate;
+  const std::size_t nT = v.nT, n = nT * kStatsPerDate, nR = plan.reporting.size();
   std::size_t next = 0;
   for (const auto& s : slices) {
     if (s.wgBegin != next || s.partials.size() != (s.wgEnd - s.wgBegin) * n ||
-        s.exposure.size() != nT * (s.pathEnd - s.pathBegin))
+        s.exposure.size() != nR * (s.pathEnd - s.pathBegin))
       throw std::invalid_argument("finishFused: slices must cover the workgroups in order");
     next = s.wgEnd;
   }
@@ -244,40 +249,74 @@ FusedOutput finishFused(const FusedPlan& plan, const std::vector<FusedSlice>& sl
     out.sums[i] = sum / static_cast<float>(v.nP);
   }
 
-  // pfe-quantile: histogram of the positive exposure on [0, max] per date.
-  out.pfe.resize(nT);
+  // pfe-quantile, as the kernel: the order statistics k = floor(rank) and k + 1 from a coarse
+  // and a fine histogram and the extremes of k's fine bin, interpolated as ccr::quantile.
+  out.pfe.resize(nR);
   std::vector<std::uint32_t> hist(kPfeBins);
-  for (std::size_t j = 0; j < nT; ++j) {
-    float mx = 0.0f;
+  const float bins = static_cast<float>(kPfeBins), big = std::numeric_limits<float>::max();
+  const std::uint32_t last = kPfeBins - 1;
+  auto forEach = [&](std::size_t r, auto&& f) {
     for (const auto& s : slices) {
       const std::size_t count = s.pathEnd - s.pathBegin;
-      for (std::size_t k = 0; k < count; ++k) mx = std::max(mx, s.exposure[j * count + k]);
+      for (std::size_t k = 0; k < count; ++k) f(s.exposure[r * count + k]);
     }
+  };
+  const float rank = v.quantileLevel * static_cast<float>(v.nP - 1);
+  const std::uint32_t k = std::min(static_cast<std::uint32_t>(std::floor(rank)), v.nP - 1);
+  const float frac = rank - static_cast<float>(k);
+  for (std::size_t r = 0; r < nR; ++r) {
+    float mx = 0.0f, mn = big;
+    forEach(r, [&](float e) {
+      mx = std::max(mx, e);
+      if (e > 0.0f) mn = std::min(mn, e);
+    });
+    auto coarseBin = [&](float e) { return std::min(static_cast<std::uint32_t>(e / mx * bins), last); };
     std::fill(hist.begin(), hist.end(), 0u);
     std::uint32_t zeros = 0;
-    for (const auto& s : slices) {
-      const std::size_t count = s.pathEnd - s.pathBegin;
-      for (std::size_t k = 0; k < count; ++k) {
-        const float e = s.exposure[j * count + k];
-        if (e <= 0.0f) ++zeros;
-        else ++hist[std::min(static_cast<std::uint32_t>(e / mx * static_cast<float>(kPfeBins)), std::uint32_t(kPfeBins - 1))];
-      }
+    forEach(r, [&](float e) {
+      if (e <= 0.0f) ++zeros;
+      else ++hist[coarseBin(e)];
+    });
+    if (k < zeros) {
+      out.pfe[r] = k + 1 >= zeros && k + 1 < v.nP && frac > 0.0f ? frac * mn : 0.0f;
+      continue;
     }
-    const float rank = v.quantileLevel * static_cast<float>(v.nP - 1);
-    float cum = static_cast<float>(zeros), result = 0.0f;
-    if (rank >= cum && mx > 0.0f) {
-      result = mx;
-      const float width = mx / static_cast<float>(kPfeBins);
-      for (std::uint32_t b = 0; b < kPfeBins; ++b) {
-        const float c = static_cast<float>(hist[b]);
-        if (cum + c > rank) {
-          result = (static_cast<float>(b) + (rank - cum + 0.5f) / c) * width;
-          break;
-        }
-        cum += c;
-      }
+    std::uint32_t below = zeros, cb = 0;
+    for (; cb < last; ++cb) {
+      if (below + hist[cb] > k) break;
+      below += hist[cb];
     }
-    out.pfe[j] = result;
+    // Fine histogram inside coarse bin cb.
+    std::fill(hist.begin(), hist.end(), 0u);
+    const float width = mx / bins, lo = static_cast<float>(cb) * width;
+    auto fineBin = [&](float e) { return std::min(static_cast<std::uint32_t>(std::clamp((e - lo) / width, 0.0f, 1.0f) * bins), last); };
+    forEach(r, [&](float e) {
+      if (e > 0.0f && coarseBin(e) == cb) ++hist[fineBin(e)];
+    });
+    std::uint32_t fb = 0, c = 0;
+    for (; fb < kPfeBins; ++fb) {
+      c = hist[fb];
+      if (below + c > k) break;
+      below += c;
+    }
+    fb = std::min(fb, last);
+    // Extremes of k's fine bin and the next exposure above it.
+    float bLo = big, bHi = 0.0f, above = big;
+    forEach(r, [&](float e) {
+      if (e <= 0.0f) return;
+      const std::uint32_t eb = coarseBin(e), ef = eb == cb ? fineBin(e) : 0;
+      if (eb == cb && ef == fb) bLo = std::min(bLo, e), bHi = std::max(bHi, e);
+      else if (eb > cb || (eb == cb && ef > fb)) above = std::min(above, e);
+    });
+    const std::uint32_t i = k - below;
+    const float spread = bHi - bLo;
+    const float ek = c > 1 ? bLo + spread * static_cast<float>(i) / static_cast<float>(c - 1) : bHi;
+    float result = ek;
+    if (frac > 0.0f && k + 1 < v.nP) {
+      const float ek1 = i + 1 < c ? bLo + spread * static_cast<float>(i + 1) / static_cast<float>(c - 1) : above;
+      result = ek + frac * (ek1 - ek);
+    }
+    out.pfe[r] = result;
   }
   return out;
 }

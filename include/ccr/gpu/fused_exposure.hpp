@@ -1,5 +1,6 @@
 #pragma once
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <string>
@@ -46,7 +47,12 @@ constexpr std::size_t kHeaderWords = 16;
 constexpr std::size_t kPfeBins = 3072;       ///< histogram bins of the PFE kernel (12 KiB of workgroup storage)
 constexpr std::size_t kPfeWorkgroupSize = 256;
 
-/// Valuation term kinds in the term table.
+/// Valuation term kinds in the term table, as (kind, slot, c, A) (B, p1, p2, p3):
+///  kBond        c A e^{-B x}                          (bonds of one maturity merged, c A pre-multiplied)
+///  kFixedFloat  (c fix[slot] + p1) A e^{-B x}         (running floating coupon with its fixed leg folded in)
+///  kAsset       c S[slot] A                            (forwards on one asset merged)
+///  kSetFixing   fix[slot] = (A e^{-B x} - 1) / c       (A, B: the ratio P(t, ts) / P(t, te))
+///  kOption      c Black(S[slot] p1 / bond, p2, |p3|)   (call when p3 > 0)
 enum TermKind : int { kBond = 0, kFixedFloat = 1, kAsset = 2, kSetFixing = 3, kOption = 4 };
 
 struct FusedPlan {
@@ -63,7 +69,7 @@ struct FusedPlan {
 
   // GPU buffers, in the exact binary layout of the WGSL kernels.
   std::vector<std::uint32_t> header;    ///< uniform block (kHeaderWords words; the quantile as f32 bits)
-  std::vector<std::uint32_t> indices;   ///< termStart[nT+1] | callIndex[nT] | isReporting[nT]
+  std::vector<std::uint32_t> indices;   ///< termStart[nT+1] | callIndex[nT] | reportingSlot[nT] (1 + rank, 0 if not reported)
   std::vector<float> params;            ///< CIR parameters x2 | CSA terms | spots | Cholesky rows (kCholeskyStride)
   std::vector<float> steps;             ///< per-date transition coefficients (kStepStride per date, vec4-aligned)
   std::vector<float> terms;             ///< valuation terms (kTermStride per term)
@@ -79,18 +85,21 @@ struct FusedPlan {
   /// Workgroups to dispatch for the fused, reduce and PFE kernels.
   std::size_t fusedDispatch() const { return numWorkgroups(); }
   std::size_t reduceDispatch() const { return (numDates() * kStatsPerDate + 63) / 64; }
-  std::size_t pfeDispatch() const { return numDates(); }
-  /// Buffer sizes in bytes.
-  std::size_t cubeBytes() const { return numPaths * numDates() * 4; }
+  std::size_t pfeDispatch() const { return reporting.size(); }
+  /// Buffer sizes in bytes. The netted values are kept only for the margin-call look-back
+  /// (with a CSA), and the positive exposure only on the reporting dates (for the PFE).
+  std::size_t valsBytes() const { return hasCsa ? numPaths * numDates() * 4 : 16; }
+  std::size_t expoBytes() const { return std::max<std::size_t>(16, numPaths * reporting.size() * 4); }
+  std::size_t cubeBytes() const { return std::max(valsBytes(), expoBytes()); }  ///< largest storage binding
   std::size_t partialsBytes() const { return numWorkgroups() * numDates() * kStatsPerDate * 4; }
   std::size_t sumsBytes() const { return numDates() * kStatsPerDate * 4; }
-  std::size_t pfeBytes() const { return numDates() * 4; }
+  std::size_t pfeBytes() const { return reporting.size() * 4; }
 };
 
 /// What the GPU returns: the per-date means of the kStatsPerDate statistics and the PFE.
 struct FusedOutput {
   std::vector<float> sums;  ///< [date][stat], already divided by the number of paths
-  std::vector<float> pfe;   ///< [date]
+  std::vector<float> pfe;   ///< [reporting date]
 };
 
 /// Exposure statistics on the reporting dates.
@@ -125,7 +134,7 @@ struct FusedSlice {
   std::size_t wgBegin = 0, wgEnd = 0;      ///< workgroups covered
   std::size_t pathBegin = 0, pathEnd = 0;  ///< paths covered
   std::vector<float> partials;             ///< [workgroup][date][stat]
-  std::vector<float> exposure;             ///< [date][path - pathBegin]
+  std::vector<float> exposure;             ///< [reporting date][path - pathBegin]
 };
 
 /// Runs workgroups [wgBegin, wgEnd) of the fused kernel on the CPU in single precision.

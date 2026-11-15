@@ -150,17 +150,17 @@ The JavaScript layer (`web/js/gpu`, about 200 lines) only routes calls and talks
 
 **WebGPU fused kernels** (`include/ccr/gpu/fused_exposure.hpp`). `compile()` uses the library's own models to turn the netting set into flat tables:
 - exact Hull–White step coefficients;
-- per-date bond terms `A·e^(−Bx)`, fixing records and option terms;
+- per-date bond terms `A·e^(−Bx)`, fixing records and option terms. Terms are merged per cash-flow date in double precision: bonds of one maturity become a single term, a running coupon carries its fixed leg, forwards on one asset are summed and a fixing is one bond ratio. The kernel evaluates one exponential per distinct date instead of one per cash flow, and offsetting flows cancel before the f32 cast (a 10-swap book drops from 31,849 to 2,237 terms);
 - the margin-call look-back;
 - the Cholesky factor and the CIR++ shift.
 
 Three WGSL compute kernels (`src/gpu/fused_kernels.cpp`) then run on these tables:
 1. **fused-exposure** runs once per path. It draws counter-based normals, correlates them, steps rates, FX and CIR++,
-   revalues the netting set, applies the CSA and reduces E[V−C]/EE/ENE/EE*/ENE*/pathwise-CVA/E[Q] across the workgroup. It never builds a scenario cube.
+   revalues the netting set, applies the CSA and reduces E[V−C]/EE/ENE/EE*/ENE*/pathwise-CVA/E[Q] across the workgroup. It never builds a scenario cube: it writes the netted value only when a CSA needs the margin-call look-back, and the positive exposure only on the reporting dates. The discount factor and the asset levels are accumulated as sums of logs, so their f32 error does not compound date by date.
    - *Vector unrolling:* normals come in Box–Muller pairs packed four to a `vec4` (one hash pair, one `log` and one `sqrt` per two normals). Each Cholesky row is two `vec4` dot products. The four FX/equity factors step as one `vec4`, and the statistics reduce as two `vec4`s per invocation.
    - *Matrix tiling:* inputs that every path reads are staged once per workgroup in shared memory instead of being fetched by each of the 64 invocations. That covers the Cholesky factor, each date's step row and the valuation-term table. The term table of a date (terms × 8) streams through in tiles of 64 terms, loaded cooperatively as `vec4`s, and each invocation applies the tile to its own path state.
 2. **reduce-partials** sums the workgroup results.
-3. **pfe-quantile** builds a histogram per date and reads off the quantile.
+3. **pfe-quantile** finds the empirical quantile per reporting date without sorting. A coarse histogram over [0, max] locates the order statistic, a fine histogram splits that bin 3,072 ways, and a last pass reads the neighbouring order statistics, which are interpolated as `ccr::quantile` does. PFE matches the library's quantile of the same exposures to f32 rounding (about 5e-8, previously about 1e-3 from the bin width).
 
 `runFusedReference()` (`src/gpu/fused_reference.cpp`) executes the same three kernels on the CPU in single precision, so the unit tests check the kernel algorithm natively against `ExposureEngine`. It is split into `runFusedWorkgroups()` (any range of workgroups) and `finishFused()` (the reduce and PFE kernels). That split is the CPU backend: the WASM entry points `cpuKernelSlices` and `cpuKernelAnalyse` run it across Web Workers. The GPU works in f32 with its own random number generator, so it agrees with the double-precision engine within Monte Carlo error.
 
