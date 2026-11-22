@@ -22,6 +22,7 @@ const DESCRIPTIONS = {
   exposure: 'EE, ENE, PFE, EPE, effective EPE, netting benefit and the exposure distribution.',
   collateral: 'Thresholds, minimum transfer amount, independent amount, margin period of risk, and cash, bond or equity collateral with haircuts.',
   allocation: 'Marginal (Euler), incremental and standalone allocation of exposure and CVA.',
+  nested: 'EE* and PFE with V(t, path) unknown: a regression proxy, an audit of its bias, and inner paths only where they move the statistic, against the closed form and the classical nest.',
   cva: 'Unilateral and bilateral CVA/DVA, term structure, running spread, recovery sensitivity.',
   wwr: 'Pathwise CVA with a stochastic intensity correlated with the exposure drivers.',
   xva: 'CVA, DVA, FVA (FCA/FBA), MVA from nested conditional initial margin, and KVA, with sensitivities and trade allocation.',

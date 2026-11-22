@@ -26,6 +26,7 @@ export const PAGES = [
       { id: 'exposure', href: 'exposure.html', title: 'Exposure & netting' },
       { id: 'collateral', href: 'collateral.html', title: 'Collateral (CSA)' },
       { id: 'allocation', href: 'allocation.html', title: 'Exposure allocation' },
+      { id: 'nested', href: 'nested.html', title: 'Adaptive nested Monte Carlo' },
     ],
   },
   {

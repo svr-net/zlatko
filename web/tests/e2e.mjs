@@ -67,7 +67,7 @@ const bookSpec = (analysisSpec) => ({
 // WebGPU kernels on desktop too; some also run once forced onto the CPU fused kernels.
 const enginePages = ['index', 'portfolio', 'instruments', 'amc', 'models', 'exposure', 'collateral', 'allocation', 'cva', 'xva', 'wwr', 'hedging'];
 const cases = [
-  ...['index', 'core', 'market', 'models', 'instruments', 'amc', 'exposure', 'collateral', 'allocation', 'cva', 'xva', 'ai', 'wwr', 'hedging']
+  ...['index', 'core', 'market', 'models', 'instruments', 'amc', 'exposure', 'collateral', 'allocation', 'nested', 'cva', 'xva', 'ai', 'wwr', 'hedging']
     .map((name) => ({ name, file: name, spec: testSpec, ...(enginePages.includes(name) ? { engine: 'auto', expectEngine: 'WebGPU' } : {}) })),
   ...['index', 'collateral', 'wwr', 'models', 'amc'].map((name) => ({ name: `${name}-cpu`, file: name, spec: testSpec, engine: 'cpu', expectEngine: 'CPU fused kernels' })),
   // The portfolio page: XVA of the book on Auto (WebGPU) and exposure on the CPU kernels; the
