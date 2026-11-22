@@ -177,6 +177,8 @@ struct FusedPlan {
   std::size_t numTradeGroups = 0;
   std::size_t statsPerDate = kStatsPerDate;
   std::size_t imInnerPaths = 0;         ///< nested initial margin (0: off)
+  /// Audit of the nested initial margin (FusedOptions::imAuditPaths, imAuditInnerPaths); 0: off.
+  std::size_t imAuditPaths = 0, imAuditInnerPaths = 0;
   RowLayout rows;
   std::vector<float> requests;          ///< row-statistics requests (kRequestStride floats each)
   std::size_t numOutputs = 0;           ///< floats the row-statistics kernel writes
@@ -237,8 +239,13 @@ struct FusedResult {
   /// Quantile of |V(t_k) - V(t_{k-1})| of the uncollateralised netted value (0 at k = 0); empty if off.
   std::vector<double> valueChangeQuantile;
   /// Nested conditional initial margin: E[D IM(t)] (for MVA), E[IM(t)] and its 5 / 50 / 95% bands.
+  /// With the audit (FusedPlan::imAuditPaths) they are scaled by conditionalImAuditRatio.
   std::vector<double> conditionalImDiscounted, conditionalImMean;
   std::vector<std::vector<double>> conditionalImBands;
+  /// Audit of the nested initial margin: per reporting date, E[D IM] with imAuditInnerPaths inner
+  /// paths over E[D IM] with the kernel's imInnerPaths, on the plan's first imAuditPaths paths (the
+  /// same inner samples, extended), and E[D IM] before the correction. Empty without the audit.
+  std::vector<double> conditionalImAuditRatio, conditionalImDiscountedUncorrected;
 
   /// Per-trade statistics of trade i with value V_i in the netting set V (uncollateralised):
   struct TradeStats {
@@ -295,6 +302,14 @@ struct FusedOptions {
   /// and IM(t, path) is the imQuantile of |V(t + MPR) - V(t)| over them (at most kMaxInnerPaths).
   std::size_t imInnerPaths = 0;
   double imMarginPeriod = 10.0 / 250.0;
+  /// > 0 (with imInnerPaths): audit of the nested initial margin's small-sample bias (chapter X11).
+  /// The empirical quantile of imInnerPaths inner samples is biased low by O(1 / imInnerPaths), and
+  /// MVA is linear in IM, so the bias does not average out across paths. summarise() reruns the
+  /// first imAuditPaths paths on the CPU with imAuditInnerPaths inner paths (the kernel's inner samples
+  /// extended: the two estimates are paired) and scales the conditional IM on every reporting date by
+  /// the ratio of their E[D IM]. The kernel itself is unchanged.
+  std::size_t imAuditPaths = 0;
+  std::size_t imAuditInnerPaths = 1024;
   /// Simulation-only dates merged into the grid (not reporting dates). A book gives every netting
   /// set the union of all their simulation dates, so that all draw the same scenarios: the
   /// normals of the kernel are keyed by path and date index.
@@ -331,8 +346,14 @@ TimeGrid simulationGrid(const ExposureEngine& engine, const NettingSet& nettingS
 /// Why `compile` cannot run this setup on the GPU, or an empty string if it can.
 std::string limitation(const ExposureEngine& engine, const NettingSet& nettingSet, bool perTrade = false);
 
-/// Turns the GPU read-back into an exposure profile on the reporting dates.
+/// Turns the GPU read-back into an exposure profile on the reporting dates. With the audit of the
+/// nested initial margin it also runs auditConditionalIm (on the CPU).
 FusedResult summarise(const FusedPlan& plan, const FusedOutput& output);
+
+/// The audit of the nested initial margin (FusedOptions::imAuditPaths): per reporting date, the ratio
+/// of E[D IM] with plan.imAuditInnerPaths inner paths to E[D IM] with plan.imInnerPaths, both on the
+/// plan's first imAuditPaths paths, run on `pool` (1 where the second is 0). Empty without the audit.
+std::vector<double> auditConditionalIm(const FusedPlan& plan, SpinPool& pool = defaultPool());
 
 /// The fused-exposure kernel for workgroups [wgBegin, wgEnd) on the CPU: their partial
 /// statistics and the positive exposure of their paths ([date][path in the slice]).

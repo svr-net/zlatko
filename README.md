@@ -128,7 +128,7 @@ Every Monte Carlo page runs one analysis of the library (`spec.analysis`) on the
 | `allocation.html` | Marginal (Euler), incremental and standalone CVA | `allocation` |
 | `cva.html` | Unilateral/bilateral CVA, term structure, running spread | `cva` |
 | `wwr.html` | Pathwise CVA against exposure–intensity correlation | `wrongWayRisk` |
-| `xva.html` | CVA, DVA, FVA, MVA (nested conditional IM, the proxy alongside) and KVA with cumulative profiles, sweeps, allocation and sensitivities | `xva` |
+| `xva.html` | CVA, DVA, FVA, MVA (nested conditional IM with its bias audit, the proxy alongside) and KVA with cumulative profiles, sweeps, allocation and sensitivities; EE*, PFE and CVA by adaptive nested Monte Carlo against the closed form (chapter X11) | `xva` · `nestedExposure` (CPU) |
 | `hedging.html` | CS01 buckets, CDS hedge, CRN vs independent-seed deltas, XVA credit and funding sensitivities | `hedging` |
 | `ai.html` | Surrogate XVA (ridge, MLP) fitted and back tested in C++, and a provider-neutral LLM agent skill (OpenAI, Anthropic, Gemini, MCP) whose tools call `xva` / `xvaCompare` | `surrogateBacktest` · dataset from `xva_ai_dataset` |
 | `gpu.html` | Fused WebGPU kernels validated against the same kernels in C++, with a benchmark | `validation` |
@@ -208,13 +208,14 @@ node web/tests/e2e.mjs                   # every page in headless Chromium (Play
 | Pricing counterparty risk | `cva/cva.hpp` | Unilateral CVA, CVA term structure, bilateral CVA/DVA with first-to-default, CVA as a running spread |
 | Wrong-way risk | `cva/cva.hpp` (`pathwiseCva`) | Path-by-path CVA using the simulated survival probabilities, with the intensity correlated to the exposure drivers |
 | GPU exposure | `gpu/fused_exposure.hpp` | The exposure pipeline as fused WGSL kernels: plan compiler, kernel sources, read-back summary, and a CPU reference of the kernels |
-| XVA | `xva/xva.hpp` | FCA, FBA (FVA), MVA from nested conditional initial margin (inner simulation per path and date in the fused kernels) or the unconditional proxy, KVA, the combined total, and exact allocation of CVA, FCA and KVA to trades |
+| XVA | `xva/xva.hpp` | FCA, FBA (FVA), MVA from nested conditional initial margin (inner simulation per path and date in the fused kernels, with an audit of its small-sample bias) or the unconditional proxy, KVA, the combined total, and exact allocation of CVA, FCA and KVA to trades |
+| Adaptive nested Monte Carlo | `nested/adaptive_nested.hpp`, `nested/nested_exposure.hpp` | A least-squares proxy on the outer paths' own discounted cash flows, a per-bin audit of its bias, and inner simulations restarted from a path's state only where EE* or PFE need them; compared with the closed form, the regression alone and the classical nest (chapter X11) |
 | Hedging | `hedging/sensitivities.hpp` | XVA credit (counterparty and own) and funding sensitivities; bucketed CS01 of CVA with re-bootstrapped curves, CDS hedge notionals from the hedge Jacobian, and market-risk deltas by bump-and-revalue with common random numbers |
 
 ## Proposed extension chapters: XVA
 
 The book stops at CVA/DVA, wrong-way risk and hedging. [`docs/xva_chapters.md`](docs/xva_chapters.md)
-proposes ten chapters that extend it, in the same style (definition, formula, discretisation on the
+proposes eleven chapters that extend it, in the same style (definition, formula, discretisation on the
 exposure grid, Monte Carlo estimator, worked example, code and page), to cover everything implemented
 in `xva/xva.hpp`, `hedging/sensitivities.hpp` and [`web/xva.html`](web/xva.html):
 
@@ -227,9 +228,10 @@ in `xva/xva.hpp`, `hedging/sensitivities.hpp` and [`web/xva.html`](web/xva.html)
 | X5. XVA allocation to trades | Exact Euler allocation of CVA, FCA, KVA; incremental XVA | `allocateExposureXva`, [allocation](web/allocation.html) |
 | X6. XVA sensitivities and hedging | Bucketed CS01, CDS hedge notionals, own-credit paradox, common random numbers | [hedging](web/hedging.html) |
 | X7. Numerical practice | Monte Carlo error, grid, regression, validation checks, engines | [gpu](web/gpu.html) |
-| X8. Nested Monte Carlo in XVA | Inner/outer simulation, bias and the `B^{-2/3}` convergence, bias reduction, regression versus nesting, conditional initial margin, dual bounds, design | nested conditional IM in the fused kernels (`FusedOptions::imInnerPaths`), [xva](web/xva.html); bias corrections and dual bounds open |
+| X8. Nested Monte Carlo in XVA | Inner/outer simulation, bias and the `B^{-2/3}` convergence, bias reduction, regression versus nesting, conditional initial margin, dual bounds, design | nested conditional IM in the fused kernels (`FusedOptions::imInnerPaths`), [xva](web/xva.html); Richardson corrections and dual bounds open |
 | X9. Beyond this implementation | Collateralised funding, SA-CCR capital, stochastic spreads, AAD | open |
 | X10. Artificial intelligence and XVA | Surrogates, differential ML, generative scenarios, deep hedging, LLM agent skill, model risk, back test | [ai](web/ai.html) · `examples/xva_ai_dataset.cpp` · `web/js/ai/` |
+| X11. Adaptive nested Monte Carlo | One ordinary simulation as a nest with one inner path; proxy, bias audit, precision blending, two sample folds, refinement rules for EE* and PFE; the audit of the conditional IM; validation against closed forms | `nested/adaptive_nested.hpp`, `nested/nested_exposure.hpp`, `FusedOptions::imAuditPaths`, [xva](web/xva.html) |
 
 ## Conventions
 

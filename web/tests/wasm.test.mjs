@@ -23,7 +23,7 @@ function run(name, fn) {
 }
 const fused = (analysis, extra = {}) => run(`cpuKernels ${analysis}`, () => call('cpuKernels', { ...spec, analysis, ...extra }));
 
-check(Array.from(mod.functions()).join() === 'version,coreDemo,marketDemo,gpuKernels,gpuJobs,gpuAnalyse,cpuKernels,surrogateBacktest', 'entry points');
+check(Array.from(mod.functions()).join() === 'version,coreDemo,marketDemo,gpuKernels,gpuJobs,gpuAnalyse,cpuKernels,surrogateBacktest,nestedExposure', 'entry points');
 const ver = run('version', () => call('version'));
 const cmakeVersion = (await import('node:fs')).readFileSync(new URL('../../CMakeLists.txt', import.meta.url), 'utf8').match(/^\s*VERSION ([0-9.]+)$/m)[1];
 if (ver) check(ver.library === `zlatko ccr ${cmakeVersion}`, `version() reports the CMake project version: ${ver.library}`);
@@ -67,6 +67,19 @@ if (xva && xvaProxy) {
   check(xva.xva.mva > 0 && Math.abs(xva.xva.mva / xvaProxy.xva.mva - 1) < 1, `nested MVA ${xva.xva.mva} vs proxy ${xvaProxy.xva.mva}`);
   near(x.total, x.cva - x.dva + x.fca - x.fba + x.mva + x.kva, 1e-6 * Math.abs(x.total), 'XVA identity');
   near(sum(xva.trades.map((t) => t.cva)), x.cva, 1e-4 * x.cva, 'XVA allocation adds up (f32)');
+}
+// Chapter X11: the audit of the nested initial margin, and the exposure by adaptive nested Monte Carlo.
+const audited = fused('xva', { imInnerPaths: 32, imAudit: true, imAuditPaths: 64, imAuditInnerPaths: 256, sim: xvaSim });
+if (audited) {
+  check(audited.imAudit && audited.imAudit.ratio.length === audited.profile.times.length, 'IM audit ratio per date');
+  check(audited.imAudit.mvaUncorrected < audited.xva.mva, `audited MVA ${audited.xva.mva} above the 32-path one ${audited.imAudit.mvaUncorrected}`);
+}
+const nest = run('nestedExposure', () => call('nestedExposure', { ...spec, nested: { dates: 5, numPaths: 600, innerPerScenario: 40 } }));
+if (nest) {
+  check(nest.times.length === 6 && nest.ee.adaptive.length === 6 && nest.unsupported.length === 0, 'nested exposure profiles');
+  check(nest.rmsError.adaptive.ee < 0.08 && nest.rmsError.adaptive.pfe < 0.08, `adaptive nest error ${JSON.stringify(nest.rmsError.adaptive)}`);
+  check(Array.from(nest.innerPaths).every((n) => n <= nest.innerBudgetPerDate), 'inner paths within the budget per date');
+  check(nest.cva.adaptive > 0 && nest.cva.exact > 0, 'CVA of the nested profiles');
 }
 // A book: two netting sets with two counterparties on common scenarios. The second holds the trades
 // of the first and one more, so its expected value is the first's plus that trade's on every date.

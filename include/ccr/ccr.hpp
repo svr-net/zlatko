@@ -37,3 +37,6 @@
 #include "ccr/hedging/sensitivities.hpp"
 
 #include "ccr/gpu/fused_exposure.hpp"
+
+#include "ccr/nested/adaptive_nested.hpp"
+#include "ccr/nested/nested_exposure.hpp"

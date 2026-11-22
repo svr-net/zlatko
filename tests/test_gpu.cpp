@@ -457,3 +457,48 @@ TEST(gpu_nested_initial_margin_matches_the_analytic_conditional_quantile) {
   o.imQuantile = 0.9;
   CHECK_THROWS(gpu::compile(engine, ns, o));
 }
+
+TEST(gpu_nested_initial_margin_audit_removes_the_small_sample_bias) {
+  // The same FX forward with only 64 inner paths: the empirical 99% quantile of 64 samples is several
+  // percent low on every path, and MVA (linear in IM) keeps that bias. The audit (chapter X11) reruns
+  // the first 128 paths with 512 inner paths, the kernel's 64 extended, and scales by the ratio.
+  const auto yc = std::make_shared<YieldCurve>(YieldCurve::flat(0.02));
+  const auto foreign = std::make_shared<YieldCurve>(YieldCurve::flat(0.01));
+  const auto hw = std::make_shared<HullWhite1F>(yc, 0.05, 1e-5);
+  const double sigma = 0.12, S0 = 1.1, N = 1e6, T = 3.0, h = 10.0 / 250.0;
+  const auto fx = std::make_shared<LognormalAsset>("FX", S0, sigma, foreign);
+  NettingSet ns;
+  ns.trades.push_back(std::make_shared<AssetForward>("fwd", "FX", N, 1.1, T));
+  const ExposureEngine engine(ScenarioGenerator(hw, {fx}, {}, Matrix::identity(2)), {1000, 7, true}, TimeGrid::uniform(2.5, 10));
+  gpu::FusedOptions o;
+  o.imQuantile = 0.99;
+  o.imInnerPaths = 64;
+  o.imMarginPeriod = h;
+  const auto plain = gpu::compile(engine, ns, o);
+  CHECK(plain.imAuditPaths == 0 && gpu::auditConditionalIm(plain).empty());
+  CHECK(gpu::summarise(plain, gpu::runFusedReference(plain)).conditionalImAuditRatio.empty());
+  o.imAuditPaths = 128;
+  o.imAuditInnerPaths = 512;
+  const auto plan = gpu::compile(engine, ns, o);
+  CHECK(plan.imAuditPaths == 128 && plan.imAuditInnerPaths == 512 && plan.header == plain.header);
+  const auto f = gpu::summarise(plan, gpu::runFusedReference(plan));
+  const double exact = 2.5758 * N * sigma * std::sqrt(h) * S0 * foreign->discount(T);
+  double raw = 0.0, corrected = 0.0;
+  std::size_t n = 0;
+  for (std::size_t k = 0; k < f.profile.times.size(); ++k) {
+    if (f.profile.times[k] + h > T) continue;
+    CHECK(f.conditionalImAuditRatio[k] > 1.0);
+    CHECK_NEAR(f.conditionalImDiscounted[k], f.conditionalImAuditRatio[k] * f.conditionalImDiscountedUncorrected[k], 1e-9 * exact);
+    raw += f.conditionalImDiscountedUncorrected[k] / exact - 1.0;
+    corrected += f.conditionalImDiscounted[k] / exact - 1.0;
+    ++n;
+  }
+  CHECK(n >= 9);
+  CHECK(raw / static_cast<double>(n) < -0.05);
+  CHECK_NEAR(corrected / static_cast<double>(n), 0.0, 0.025);
+  // The audit needs more inner paths than the kernel, within the kernel's limits.
+  o.imAuditInnerPaths = 64;
+  CHECK_THROWS(gpu::compile(engine, ns, o));
+  o.imAuditInnerPaths = 2048;
+  CHECK_THROWS(gpu::compile(engine, ns, o));
+}
