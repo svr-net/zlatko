@@ -944,9 +944,11 @@ of a 10.4 s CPU-kernel run.
 `auditConditionalIm`). The front end's entry point `nestedExposure` (spec.nested: `dates`, `numPaths`,
 `innerPerScenario`, `degree`) runs on the CPU in the worker: the nest is not a fused-kernel job. The
 XVA analysis audits the conditional IM with `spec.imAudit` (`imAuditPaths` = 32, `imAuditInnerPaths` =
-512 by default). [`web/xva.html`](../web/xva.html) turns the audit on and shows its ratio per date, the
-MVA before and after it, and, below the XVA charts, EE* and PFE by the closed form, the regression, the
-classical nest and the adaptive nest, their errors, where the inner paths went and the CVA of each.
+512 by default). [`web/nested.html`](../web/nested.html) (menu: Exposure → Adaptive nested Monte Carlo)
+shows EE* and PFE by the closed form, the regression, the classical nest and the adaptive nest, their
+errors, the CVA of each and, per date, where the inner paths went and why the loop stopped; its settings
+are the `spec.nested` fields above. [`web/xva.html`](../web/xva.html) turns the IM audit on and shows its
+ratio per date and the MVA before and after it.
 
 **Further reading.** Broadie, Du and Moallemi (2011) "Efficient risk estimation via nested sequential
 simulation", *Management Science* 57(6); Broadie, Du and Moallemi (2015) "Risk estimation via

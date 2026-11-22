@@ -63,7 +63,7 @@ npm --prefix tools/standalone ci && node tools/standalone/build.mjs
 
 ```
 dist/standalone/
-  index.html, core.html, ... xva.html      16 pages
+  index.html, core.html, ... xva.html      17 pages
   assets/app.<hash>.js                     all pages (classic script, ~85 KiB)
   assets/ccr-runtime.<hash>.js             WASM worker with embedded library (~360 KiB)
   assets/style.<hash>.css
@@ -126,9 +126,10 @@ Every Monte Carlo page runs one analysis of the library (`spec.analysis`) on the
 | `exposure.html` | EE/ENE/PFE/EPE/EEPE, sample paths, netting benefit, per-trade profiles, distribution | `exposure` |
 | `collateral.html` | Thresholds, MTA, independent amount, margin period of risk; cash, bond or equity collateral with haircuts | `collateral` |
 | `allocation.html` | Marginal (Euler), incremental and standalone CVA | `allocation` |
+| `nested.html` | Adaptive nested Monte Carlo of EE*, PFE and CVA against the closed form, the regression alone and the classical nest with the same inner paths; where the inner paths went, per date (chapter X11) | `nestedExposure` (CPU) |
 | `cva.html` | Unilateral/bilateral CVA, term structure, running spread | `cva` |
 | `wwr.html` | Pathwise CVA against exposure–intensity correlation | `wrongWayRisk` |
-| `xva.html` | CVA, DVA, FVA, MVA (nested conditional IM with its bias audit, the proxy alongside) and KVA with cumulative profiles, sweeps, allocation and sensitivities; EE*, PFE and CVA by adaptive nested Monte Carlo against the closed form (chapter X11) | `xva` · `nestedExposure` (CPU) |
+| `xva.html` | CVA, DVA, FVA, MVA (nested conditional IM with its bias audit, the proxy alongside) and KVA with cumulative profiles, sweeps, allocation and sensitivities | `xva` |
 | `hedging.html` | CS01 buckets, CDS hedge, CRN vs independent-seed deltas, XVA credit and funding sensitivities | `hedging` |
 | `ai.html` | Surrogate XVA (ridge, MLP) fitted and back tested in C++, and a provider-neutral LLM agent skill (OpenAI, Anthropic, Gemini, MCP) whose tools call `xva` / `xvaCompare` | `surrogateBacktest` · dataset from `xva_ai_dataset` |
 | `gpu.html` | Fused WebGPU kernels validated against the same kernels in C++, with a benchmark | `validation` |
@@ -231,7 +232,7 @@ in `xva/xva.hpp`, `hedging/sensitivities.hpp` and [`web/xva.html`](web/xva.html)
 | X8. Nested Monte Carlo in XVA | Inner/outer simulation, bias and the `B^{-2/3}` convergence, bias reduction, regression versus nesting, conditional initial margin, dual bounds, design | nested conditional IM in the fused kernels (`FusedOptions::imInnerPaths`), [xva](web/xva.html); Richardson corrections and dual bounds open |
 | X9. Beyond this implementation | Collateralised funding, SA-CCR capital, stochastic spreads, AAD | open |
 | X10. Artificial intelligence and XVA | Surrogates, differential ML, generative scenarios, deep hedging, LLM agent skill, model risk, back test | [ai](web/ai.html) · `examples/xva_ai_dataset.cpp` · `web/js/ai/` |
-| X11. Adaptive nested Monte Carlo | One ordinary simulation as a nest with one inner path; proxy, bias audit, precision blending, two sample folds, refinement rules for EE* and PFE; the audit of the conditional IM; validation against closed forms | `nested/adaptive_nested.hpp`, `nested/nested_exposure.hpp`, `FusedOptions::imAuditPaths`, [xva](web/xva.html) |
+| X11. Adaptive nested Monte Carlo | One ordinary simulation as a nest with one inner path; proxy, bias audit, precision blending, two sample folds, refinement rules for EE* and PFE; the audit of the conditional IM; validation against closed forms | `nested/adaptive_nested.hpp`, `nested/nested_exposure.hpp`, `FusedOptions::imAuditPaths`, [nested](web/nested.html), [xva](web/xva.html) |
 
 ## Conventions
 

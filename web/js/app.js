@@ -11,6 +11,7 @@ const pages = {
   exposure: () => import('./pages/exposure.js'),
   collateral: () => import('./pages/collateral.js'),
   allocation: () => import('./pages/allocation.js'),
+  nested: () => import('./pages/nested.js'),
   cva: () => import('./pages/cva.js'),
   wwr: () => import('./pages/wwr.js'),
   xva: () => import('./pages/xva.js'),
