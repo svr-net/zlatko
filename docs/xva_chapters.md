@@ -1,7 +1,7 @@
 # Proposed extension chapters: XVA
 
 *Modelling, Pricing, and Hedging Counterparty Credit Exposure* ends with CVA/DVA, wrong-way risk and
-hedging of credit risk. The nine chapters below extend it in the same style: a definition, the
+hedging of credit risk. The eleven chapters below extend it in the same style: a definition, the
 continuous-time formula, the discretisation on the exposure grid, the Monte Carlo estimator, a worked
 example, and the pointer to the code (`include/ccr/xva/xva.hpp`, `include/ccr/hedging/sensitivities.hpp`)
 and to the page of the web front end that reproduces it. The chapters are not numbered against the book.
@@ -480,6 +480,8 @@ regression*, Broadie, Du and Moallemi 2015) get the robustness of the first at a
 - *Adaptive nesting.* Outer scenarios far from the kink (deep in or out of the money) need few inner
   paths. Allocate `N_i(ω) ∝ σ(V(ω))/|V(ω)|` or use sequential stopping on the standard error of the inner
   estimate (Broadie, Du and Moallemi 2011, "Efficient risk estimation via nested sequential simulation").
+  Implemented in X11 on top of the regression: a proxy, an audit of its bias, and inner paths only for
+  the scenarios whose sign or tail membership is uncertain.
 - *Re-use of the outer paths.* The inner simulation from `t_k` can re-use the outer paths from `t_k`
   onward as the "inner" ones (a *kernel* or *one-sided* estimator): the inner estimate of the node `ω` is the
   average of the outer continuation over the neighbours of `X(t_k, ω)`. This is the regression with a
@@ -520,7 +522,9 @@ MVA = Σ spread · E[D(t) IM(t)] Δt. The XVA analysis (`spec.imMethod`, `"neste
 both profiles. The unit test `gpu_nested_initial_margin_matches_the_analytic_conditional_quantile`
 checks an FX forward against the analytic conditional quantile. The low-biased empirical quantile
 (about −4% at 128 inner paths, −1.3% at 512, −0.6% at 1024) is the inner bias discussed above.
-Not implemented: the Richardson or multilevel bias corrections and the nested dual bound.
+The audit of X11 (`FusedOptions::imAuditPaths`) measures and removes that bias on the first paths with
+many more inner paths. Not implemented: the Richardson or multilevel bias corrections and the nested
+dual bound.
 
 **Further reading.** Gordy and Juneja (2010) "Nested simulation in portfolio risk measurement",
 *Management Science* 56(10); Broadie, Du and Moallemi (2011) "Efficient risk estimation via nested
@@ -552,8 +556,8 @@ simplifications made above.
    CVA of the Wrong-way risk page.
 4. **Conditional initial margin, beyond nesting.** The nested IM per path is implemented (X8); open
    are a regression-based IM (SIMM sensitivities with the Longstaff–Schwartz machinery), the
-   full-revaluation historical VaR of CCPs, bias corrections of the nested quantile, and the IM that we
-   *receive* with its rehypothecation.
+   full-revaluation historical VaR of CCPs, bias corrections of the nested quantile beyond the audit of
+   X11, and the IM that we *receive* with its rehypothecation.
 5. **XVA as a coherent measure with feedback.** The semi-linear PDE of Burgard–Kjaer with the
    cross-dependence of the funding rate on the adjusted value (the non-linearity, fixed here by taking
    the exposure at the risk-free value). Solvable by BSDE and regression (Henry-Labordère 2012;
@@ -775,6 +779,186 @@ management*; Bank of England PRA SS1/23 (2023) *Model risk management principles
 
 ---
 
+## X11. Adaptive nested Monte Carlo
+
+**Motivation.** X8 leaves adaptive nesting as an outlook: outer scenarios far from the kink need few
+inner paths, so a fixed `N_i` per scenario spends most of the budget where it changes nothing. This
+chapter builds the adaptive estimator on top of the *non-nested* simulation the library already runs, so
+that an existing engine needs only one more ability: to restart its paths from a given state.
+
+**One ordinary simulation is a nest with one inner path.** An outer path from `0` to `T` passes through
+`t`. Its own cash flows after `t`, discounted to `t`,
+
+```
+Y(t, ω) = Σ_{t_j > t} D(t, t_j; ω) CF_j(ω),        E[ Y(t) | X(t) ] = V(t, X(t))
+```
+
+are an unbiased one-sample estimate of the conditional value at that path's state `X(t)`. Far too noisy
+scenario by scenario, but a regression across the scenarios removes most of the noise (the
+Longstaff–Schwartz idea of X8). The adaptive estimator starts from this regression, measures how wrong
+it is, and spends inner paths only on the scenarios whose error could move the statistic.
+
+**The estimator, on one date `t`** (`nested::estimateAdaptive`):
+
+1. *Split.* A seeded shuffle splits the outer scenarios into a training half and an evaluation half
+   (`trainingFraction`). The proxy never sees an evaluation scenario's `Y`, so `Y` stays an independent
+   sample of that scenario, and the regression's in-sample optimism does not enter.
+2. *Proxy.* Least squares of `Y` on probabilists' Hermite polynomials of the standardised features, all
+   products up to a total degree (`HermiteProxy`, degree 3 by default, lowered until there are two
+   training rows per basis function), with the heteroscedasticity-robust (HC0) variance of each
+   prediction:
+
+   ```
+   μ(x) = φ(x)ᵀ β̂,   Cov(β̂) = G⁻¹ (Σ_i e_i² φ_i φ_iᵀ) G⁻¹,   v(x) = φ(x)ᵀ Cov(β̂) φ(x),   G = ΦᵀΦ + λ I
+   ```
+
+   `v` covers finite training data only, not the misspecification of the basis.
+3. *Bins.* The evaluation scenarios are binned by proxy value at the probabilities 0.5%, 1%, 2.5%, 5%,
+   10%, 25%, 50%, 75%, 90%, 95%, 97.5%, 99%, 99.5% (14 bins, fine in both tails, where PFE and IM live).
+   The training residuals give the payoff noise `r_b²` per bin.
+4. *Audit.* A few random scenarios per bin (16, at most a fifth of the budget) get inner paths whatever
+   the statistic. On every scenario with enough inner samples, `d_i = m̄_i − μ_i` (inner mean minus proxy)
+   measures the proxy's error. Per bin, the mean of `d` is the proxy's *systematic* bias `δ_b`, which
+   shifts the proxy, and the rest of its spread is the proxy's error variance:
+
+   ```
+   δ_b = mean(d_i),     τ_b² = max(0, mean((d_i − δ_b)²) − mean(s_i²/n_i + v_i)),     σ_p,i² = v_i + τ_b²
+   ```
+
+   Both are re-estimated after every refinement round from all scenarios with inner paths: those are
+   chosen from proxy values and uncertainties, never from their unseen inner results, so within a bin
+   they measure the proxy's error without selection bias, where the decisions are made.
+5. *Blend.* Each scenario's estimate weighs the shifted proxy and its own pooled sample mean (the outer
+   payoff and the inner paths) by precision:
+
+   ```
+   Ṽ_i = μ'_i + w_i (m̄_i − μ'_i),   w_i = σ_p,i² / (σ_p,i² + s_i²/n_i),   Var(Ṽ_i) = σ_p,i² (s_i²/n_i) / (σ_p,i² + s_i²/n_i)
+   ```
+
+   with `μ'_i = μ_i + δ_b`. Where the proxy is precise the estimate stays close to it (it pools all
+   training paths: with a payoff standard deviation of 10 and a proxy error of 0.1, matching the proxy
+   takes 10,000 inner paths); where the audit found it wrong, the inner mean takes over. The *refinement
+   gain* `G_i = 1 − Var(Ṽ_i at the cap) / Var(Ṽ_i now)` says how much of the error more inner paths
+   could remove (`maxInnerPerScenario` = 4,096).
+6. *Two folds.* Every inner batch is split: its first half goes to fold 0 (with the outer payoff), its
+   second half to fold 1. A statistic that *selects* scenarios (a sign, a tail) and then *averages* them
+   selects with the proxy and fold 0 and values with fold 1, so the samples that put a scenario in never
+   also value it. Without the split, `E[max(m̄, 0)] > max(V, 0)` near zero by about 0.4 standard errors (a
+   winner's curse), and refining the scenarios near the kink *raises* EE instead of correcting it.
+7. *Refine.* Each statistic says which scenarios it wants refined; each round takes the requests of the
+   statistics in turns (so one statistic's urgencies cannot crowd out another's), up to 2,000
+   scenarios, one batch of 64 inner paths each, until no statistic asks, the budget is spent, the
+   requesting scenarios are all at the cap, or 50 rounds have run. Evaluation scenarios whose features lie
+   outside the training range are refined first: a polynomial is least reliable where it extrapolates.
+
+**Refinement rules.** With `e(g, se) = g Φ(−g/se)`, the expected error of a scenario at distance `g` from a
+cutoff (it moves the statistic by about `g`, with the probability of being on the wrong side):
+
+- `PositivePart` (EE, and EE* with the weight `w_i = D(0, t)`): `EE = (1/n) Σ_i w_i 1{Ṽ_i^sel > 0} V̂_i^val`.
+  Half the tolerance (1% of EE, or 0.1% of the size of the discounted cash flows) goes to the sampling
+  noise `√(Σ w_i² Var V̂_i^val) / n` of the values counted, refining the noisiest to an equal share of it;
+  half to the expected misclassification `Σ_i w_i e(|Ṽ_i|, se_i) / n`, refining the largest
+  reducible contributions `e_i G_i` (skipping `G_i < 0.05`) until they cover the excess.
+- `Quantile` (PFE, a quantile of `max(V, 0)`): refine scenario `i` while
+  `G_i Φ(−|Ṽ_i − q̂| / se_i) > Φ(−2)`, i.e. while it may be on the wrong side of the quantile and more inner
+  paths would remove a useful part of its error. The probability is at most ½, so refinement stops by
+  itself once `G_i < 0.046`.
+
+**The netting set** (`nested::nestedExposure`). The features are the *Markov* state at `t`: the
+Hull–White `x(t)`, the log spot of every asset a live trade refers to, and the fixing of every coupon
+fixed before `t` and paid after it (its value no longer follows from `x(t)`). The outer simulation is the
+library's `ScenarioGenerator` on the reporting dates merged with every fixing and payment date; the
+inner paths restart the Hull–White and log-normal models from a path's state with their *exact*
+transitions between the cash-flow dates, correlated as the outer simulation, with counter-based normals
+seeded by `(date, scenario, batch)`, so the result is the same on any number of threads (tested).
+Swaps, asset forwards and European options are nested; all three have closed forms on the scenarios,
+so EE* and PFE are compared with the exact statistic *on the same evaluation scenarios*, which removes
+the outer sampling error from the comparison. (The option's closed form ignores the rate volatility in
+the forward's volatility; the nest simulates the full dynamics.) At `t = 0` every path has the same
+state and the estimate is plain Monte Carlo on the outer payoffs.
+
+**Conditional initial margin: the audit.** For MVA the adaptive loop reduces to its audit. MVA is
+linear in `IM(t, ω)`: no sign or tail decides which scenarios count, so no scenario is more urgent than
+another, and the noise of the per-path IM averages out over the paths. What does not average out is the
+bias of the per-path estimator, the empirical 99% quantile of `N_i` inner samples, which is low by
+`O(1/N_i)` (X8: about −4% at 128 inner paths, −9% at 64). The audit measures it on the plan's first `M`
+paths with `N_a > N_i` inner paths, the kernel's own samples extended (the kernel's normals are keyed by
+path, date and inner index, so the two estimates are paired), and scales IM per reporting date:
+
+```
+c(t) = E_M[ D(t) IM_{N_a}(t) ] / E_M[ D(t) IM_{N_i}(t) ],      IM*(t) = c(t) E[ D(t) IM_{N_i}(t) ]
+```
+
+`summarise` runs it on the CPU (`gpu::auditConditionalIm`); the fused kernels and their WGSL are
+unchanged, so the GPU and the CPU kernels produce the same read-backs and the same correction.
+
+**Validation** (`tests/test_nested.cpp`, `tests/test_gpu.cpp`, `tests/test_app.cpp`; native runs).
+
+| Case | Regression only | Classical nest, same inner paths | Adaptive |
+|---|---|---|---|
+| Default portfolio, EE*, 2,000 outer paths (1,000 evaluated), 60 inner paths per evaluated scenario, semiannual dates to 10y, 5 seeds | 3.9% | 1.2% | 0.74% |
+| The same, PFE 95% | 3.7% | 1.7% | 0.96% |
+| The same with a degree-1 proxy (3 seeds), EE* / PFE | 3.9% / 5.3% | 1.4% / 1.7% | 0.74% / 0.75% |
+| 30 inner paths per scenario (3 seeds), EE* / PFE | 4.3% / 4.6% | 2.7% / 2.8% | 3.1% / 1.3% |
+
+Relative root-mean-square error against the closed form over the dates. The default portfolio is the one
+of the web front end (10y payer and 5y receiver swaps, a 3y FX forward and a short 2y FX call; Hull–White
+and EURUSD, correlation 0.2). The toy unit test with a quadratic `V` and a linear proxy shows the same
+pattern in a sharper form: the regression misses the 95% quantile by more than 15%, the adaptive nest is
+within 2% and closer than the classical nest with the same inner paths.
+
+| Initial margin (FX forward, analytic conditional quantile) | Kernel `N_i` | Before the audit | After the audit |
+|---|---|---|---|
+| Audit 256 paths × 1,024 inner paths | 64 | −9.3% | −0.4% |
+| Audit 256 paths × 1,024 inner paths | 128 | −4.0% | −0.6% |
+| Audit 128 paths × 512 inner paths | 64 | −9.3% | −0.8% |
+| Audit 128 paths × 512 inner paths | 128 | −4.0% | −1.0% |
+
+Mean relative error of E[D IM] over the dates before maturity (2,000 paths). The audit's own `N_a`
+keeps a small bias of its own (about −1% at 512 inner paths). On the default XVA
+specification (128 inner paths, 59 reporting dates) the audit raises MVA by 2.6%, from 14,371 to 14,748
+with 32 audit paths, 14,782 with 64 and 14,775 with 128, for 0.5 s, 1.6 s and 4.2 s on one thread on top
+of a 10.4 s CPU-kernel run.
+
+**What the tests show, and their limits.**
+
+- The adaptive nest wins where the statistic depends on a *decision* (PFE's tail, EE's sign) and where
+  the proxy is misspecified: it measures the bias and corrects it, while the regression alone keeps it.
+- With a small budget, EE* is not better than the classical nest: the values of the scenarios it does
+  not refine come from their single outer payoff, which is noisy, while the classical nest averages a few
+  inner paths for every scenario. In the tests the crossover was between 30 and 60 inner paths per
+  evaluated scenario; PFE gained at both.
+- The bias is modelled per bin of proxy values. A proxy wrong in one corner of a high-dimensional state
+  can be missed if no audited or refined scenario lands there.
+- The quantile of blended estimates keeps a small `O(Var)` nested bias, and whether a scenario gets
+  another batch depends on its earlier samples (an optional-stopping effect); neither was visible in the
+  tests.
+- The IM audit corrects the mean (MVA) per date; it assumes the relative bias is the same on every path
+  of a date, which holds for location-scale value changes and less well for books of options far from
+  and close to the money. The IM bands are scaled by the same factor.
+
+**Code / page.** `include/ccr/nested/adaptive_nested.hpp` (the estimator: `HermiteProxy`,
+`ScenarioEstimates`, `PositivePart`, `Quantile`, `estimateAdaptive`, `estimateUniform`),
+`include/ccr/nested/nested_exposure.hpp` (`nestedExposure`), the IM audit in
+`include/ccr/gpu/fused_exposure.hpp` (`FusedOptions::imAuditPaths`, `imAuditInnerPaths`,
+`auditConditionalIm`). The front end's entry point `nestedExposure` (spec.nested: `dates`, `numPaths`,
+`innerPerScenario`, `degree`) runs on the CPU in the worker: the nest is not a fused-kernel job. The
+XVA analysis audits the conditional IM with `spec.imAudit` (`imAuditPaths` = 32, `imAuditInnerPaths` =
+512 by default). [`web/xva.html`](../web/xva.html) turns the audit on and shows its ratio per date, the
+MVA before and after it, and, below the XVA charts, EE* and PFE by the closed form, the regression, the
+classical nest and the adaptive nest, their errors, where the inner paths went and the CVA of each.
+
+**Further reading.** Broadie, Du and Moallemi (2011) "Efficient risk estimation via nested sequential
+simulation", *Management Science* 57(6); Broadie, Du and Moallemi (2015) "Risk estimation via
+regression", *Operations Research* 63(5); Gordy and Juneja (2010); Liu and Staum (2010) "Stochastic
+kriging for efficient nested simulation of expected shortfall", *Journal of Risk* 12(3); Hong, Juneja
+and Liu (2017) "Kernel smoothing for nested estimation with application to portfolio risk
+measurement", *Operations Research* 65(3); Giles and Haji-Ali (2019); Chernozhukov et al. (2018)
+"Double/debiased machine learning for treatment and structural parameters", *The Econometrics
+Journal* 21(1) (sample splitting against selection bias).
+
+---
+
 ## References
 
 - Andersen, L., Duffie, D., Song, Y. (2019). Funding value adjustments. *Journal of Finance* 74(1).
@@ -786,6 +970,7 @@ management*; Bank of England PRA SS1/23 (2023) *Model risk management principles
 - Brigo, D., Morini, M. (2011). Close-out convention tensions. *Risk*, December.
 - Burgard, C., Kjaer, M. (2011). In the balance. *Risk*, October; (2013) Funding strategies, funding costs. *Risk*, December.
 - Capriotti, L., Giles, M. (2012). Algorithmic differentiation: adjoint Greeks made easy. *Risk*, September.
+- Chernozhukov, V., Chetverikov, D., Demirer, M., Duflo, E., Hansen, C., Newey, W., Robins, J. (2018). Double/debiased machine learning for treatment and structural parameters. *The Econometrics Journal* 21(1).
 - Caspers, P., Giltinan, P., Lichters, R., Mazzoni, N. (2017). Forecasting initial margin requirements – a model evaluation. *Journal of Financial Risk Management*.
 - Fujii, M., Shimada, Y., Takahashi, A. (2010). A note on construction of multiple swap curves with and without collateral. CARF working paper.
 - Giles, M., Haji-Ali, A.-L. (2019). Multilevel nested simulation for efficient risk estimation. *SIAM/ASA Journal on Uncertainty Quantification* 7(2).
@@ -795,8 +980,10 @@ management*; Bank of England PRA SS1/23 (2023) *Model risk management principles
 - Green, A., Kenyon, C., Dennis, C. (2014). KVA: capital valuation adjustment. *Risk*, December.
 - Gregory, J. (2020). *The xVA Challenge*, 4th ed. Wiley.
 - Henry-Labordère, P. (2012). Cutting CVA's complexity. *Risk*, July.
+- Hong, L. J., Juneja, S., Liu, G. (2017). Kernel smoothing for nested estimation with application to portfolio risk measurement. *Operations Research* 65(3).
 - Hull, J., White, A. (2012). The FVA debate. *Risk*, July; (2014) Valuing derivatives: funding value adjustments and fair value. *Financial Analysts Journal* 70(3).
 - Kenyon, C., Green, A. (2013). Regulatory costs break risk neutrality. *Risk*, September.
+- Liu, M., Staum, J. (2010). Stochastic kriging for efficient nested simulation of expected shortfall. *Journal of Risk* 12(3).
 - Longstaff, F., Schwartz, E. (2001). Valuing American options by simulation. *Review of Financial Studies* 14(1).
 - Pallavicini, A., Perini, D., Brigo, D. (2012). Funding, collateral and hedging: uncovering the bilateral risk. arXiv:1210.3811.
 - Piterbarg, V. (2010). Funding beyond discounting: collateral agreements and derivatives pricing. *Risk*, February.

@@ -650,6 +650,13 @@ void xvaOptions(const val& spec, gpu::FusedOptions& o) {
   if (str(spec, "imMethod", "nested") == "nested") {
     o.imInnerPaths = static_cast<std::size_t>(num(spec, "imInnerPaths", 128));
     o.imMarginPeriod = num(spec, "imMprDays", 10.0) / 250.0;
+    // spec.imAudit: the audit of the conditional IM's small-sample bias (chapter X11), on the first
+    // imAuditPaths paths with imAuditInnerPaths inner paths; skipped when the kernel already uses as many.
+    const auto auditInner = static_cast<std::size_t>(num(spec, "imAuditInnerPaths", 512));
+    if (has(spec, "imAudit") && spec["imAudit"].as<bool>() && auditInner > o.imInnerPaths) {
+      o.imAuditPaths = static_cast<std::size_t>(num(spec, "imAuditPaths", 32));
+      o.imAuditInnerPaths = auditInner;
+    }
   }
 }
 
@@ -967,6 +974,16 @@ val xvaResult(const val& spec, const Env& env, const JobResult& r) {
     out.set("imInnerPaths", num(spec, "imInnerPaths", 128));
     out.set("initialMarginMean", arr(r.fused.conditionalImMean));
     out.set("initialMarginBands", arrOfArr(r.fused.conditionalImBands));
+    if (!r.fused.conditionalImAuditRatio.empty()) {
+      // The audit's correction of the small-sample bias of the conditional IM, and the MVA without it.
+      val audit = val::object();
+      audit.set("ratio", arr(r.fused.conditionalImAuditRatio));
+      audit.set("initialMarginUncorrected", arr(r.fused.conditionalImDiscountedUncorrected));
+      audit.set("mvaUncorrected", xva(r.profile, r.fused.conditionalImDiscountedUncorrected, cc, rec, own, env.ownRecovery, params).mva);
+      audit.set("paths", num(spec, "imAuditPaths", 32));
+      audit.set("innerPaths", num(spec, "imAuditInnerPaths", 512));
+      out.set("imAudit", audit);
+    }
   }
   out.set("xva", xvaToJs(total));
   out.set("identityHolds", std::fabs(total.cva - total.dva + total.fca - total.fba + total.mva + total.kva - total.total()) <=
@@ -1423,6 +1440,87 @@ val combine(const val& spec, const Env& env, const std::string& analysis, const 
   }
   (void)jobs;
   return out;
+}
+
+// ------------------------------------------------------------------ adaptive nested Monte Carlo (X11)
+
+// Exposure of the netting set (uncollateralised) by adaptive nested Monte Carlo on the CPU, against
+// the closed form, the regression alone and the classical nest with the same inner paths. spec.nested:
+// { dates, numPaths, innerPerScenario, degree }. Swaps, forwards and European options are nested;
+// other trades are left out and listed.
+val nestedExposureAnalysis(val spec) {
+  return guarded([&] {
+    const double t0 = nowMs();
+    const Env env = parseEnv(spec);
+    const val cfg = spec["nested"];
+    const auto dates = std::max<std::size_t>(1, static_cast<std::size_t>(num(cfg, "dates", 10)));
+    SimulationConfig sim = env.sim;
+    sim.numPaths = static_cast<std::size_t>(num(cfg, "numPaths", static_cast<double>(std::min<std::size_t>(env.sim.numPaths, 1000))));
+    nested::NestedExposureOptions o;
+    o.pfeQuantile = env.pfeQuantile;
+    o.adaptive.hermiteDegree = static_cast<std::size_t>(num(cfg, "degree", 3));
+    o.adaptive.seed = sim.seed;
+    const double perScenario = num(cfg, "innerPerScenario", 60.0);
+    const double evaluated = std::round(static_cast<double>(sim.numPaths) * (1.0 - o.adaptive.trainingFraction));
+    o.adaptive.innerBudget = static_cast<std::size_t>(std::max(1.0, perScenario * evaluated));
+    const TimeGrid reporting = TimeGrid::uniform(env.baseGrid.horizon(), dates);
+    const nested::NestedExposureResult r = nested::nestedExposure(env.generator(), env.nettingSet(false), reporting, sim, o);
+
+    const std::vector<std::pair<const char*, const ExposureProfile*>> methods = {
+        {"exact", &r.exact}, {"regression", &r.regression}, {"uniform", &r.uniform}, {"adaptive", &r.adaptive}};
+    val out = val::object();
+    out.set("times", arr(r.exact.times));
+    val ee = val::object(), pfe = val::object(), cva = val::object(), rms = val::object();
+    for (const auto& [name, profile] : methods) {
+      ee.set(name, arr(profile->discountedExpectedExposure));
+      pfe.set(name, arr(profile->potentialFutureExposure));
+      if (!env.creditCurves.empty()) cva.set(name, unilateralCva(*profile, env.cptyCurve(), env.cptyRecovery()));
+      // Relative root-mean-square error against the closed form over the dates.
+      double se = 0.0, sp = 0.0, re = 0.0, rp = 0.0;
+      for (std::size_t k = 0; k < r.points.size(); ++k) {
+        const double de = profile->discountedExpectedExposure[k] - r.exact.discountedExpectedExposure[k];
+        const double dp = profile->potentialFutureExposure[k] - r.exact.potentialFutureExposure[k];
+        se += de * de, sp += dp * dp;
+        re += r.exact.discountedExpectedExposure[k] * r.exact.discountedExpectedExposure[k];
+        rp += r.exact.potentialFutureExposure[k] * r.exact.potentialFutureExposure[k];
+      }
+      val e = val::object();
+      e.set("ee", re > 0.0 ? std::sqrt(se / re) : 0.0);
+      e.set("pfe", rp > 0.0 ? std::sqrt(sp / rp) : 0.0);
+      rms.set(name, e);
+    }
+    out.set("ee", ee);
+    out.set("pfe", pfe);
+    if (!env.creditCurves.empty()) out.set("cva", cva);
+    out.set("rmsError", rms);  // not "error", which the front end reads as a failure
+    std::vector<double> inner, audit, uniformPer, refined, bias;
+    val stops = val::array();
+    for (const auto& p : r.points) {
+      inner.push_back(static_cast<double>(p.innerPaths));
+      audit.push_back(static_cast<double>(p.auditInnerPaths));
+      uniformPer.push_back(static_cast<double>(p.uniformInnerPerScenario));
+      refined.push_back(p.evaluated ? static_cast<double>(p.refined) / static_cast<double>(p.evaluated) : 0.0);
+      bias.push_back(p.maxBiasRms);
+      stops.push(std::string(p.live && p.innerPaths ? nested::toString(p.stop) : "no inner paths"));
+    }
+    out.set("innerPaths", arr(inner));
+    out.set("auditInnerPaths", arr(audit));
+    out.set("uniformInnerPerScenario", arr(uniformPer));
+    out.set("refinedShare", arr(refined));
+    out.set("maxBiasRms", arr(bias));
+    out.set("stop", stops);
+    out.set("totalInnerPaths", static_cast<double>(r.innerPaths));
+    out.set("innerBudgetPerDate", static_cast<double>(o.adaptive.innerBudget));
+    out.set("outerPaths", static_cast<double>(r.outerPaths));
+    out.set("evaluatedPerDate", evaluated);
+    out.set("pfeQuantile", o.pfeQuantile);
+    val unsupported = val::array();
+    for (const auto& id : r.unsupported) unsupported.push(id);
+    out.set("unsupported", unsupported);
+    out.set("csaIgnored", env.csa.has_value());
+    out.set("elapsedMs", nowMs() - t0);
+    return out;
+  });
 }
 
 // ------------------------------------------------------------------ WebGPU entry points
@@ -2287,6 +2385,8 @@ const std::vector<std::pair<std::string, Entry>>& table() {
       {"gpuAnalyse", &gpuAnalyse},
       {"cpuKernels", &cpuKernels},
       {"surrogateBacktest", &surrogateBacktest},
+      // Adaptive nested Monte Carlo (chapter X11) runs on the CPU: the nest is not a fused-kernel job.
+      {"nestedExposure", &nestedExposureAnalysis},
   };
   return t;
 }

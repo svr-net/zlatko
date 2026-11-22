@@ -130,3 +130,45 @@ TEST(app_book_xva_and_cva_add_up_by_netting_set_and_counterparty) {
   CHECK(!book(baseSpec(), sets, "models")["error"].isUndefined());  // not a portfolio analysis
   CHECK(!book(baseSpec(), list({nettingSet("x", "C", list({swap("s", 1e6, 5, "payer")}))}), "cva")["error"].isUndefined());
 }
+
+TEST(app_nested_exposure_entry_point_compares_four_methods) {
+  Value spec = baseSpec();
+  spec.set("trades", list({swap("s", 1e7, 4, "payer"), forward("f", 5e6, 3)}));
+  spec.set("nested", obj({{"dates", 4}, {"numPaths", 600}, {"innerPerScenario", 40}}));
+  const Value r = ccr::app::call("nestedExposure", spec);
+  CHECK(r["error"].isUndefined());
+  CHECK(r["times"].size() == 5 && r["unsupported"].size() == 0 && r["outerPaths"].numberData() == 600);
+  for (const char* m : {"exact", "regression", "uniform", "adaptive"}) {
+    CHECK(r["ee"][m].size() == 5 && r["pfe"][m].size() == 5);
+    CHECK(r["cva"][m].numberData() > 0.0);
+  }
+  CHECK(r["rmsError"]["exact"]["ee"].numberData() == 0.0);
+  CHECK(r["rmsError"]["adaptive"]["ee"].numberData() < 0.06 && r["rmsError"]["adaptive"]["pfe"].numberData() < 0.06);
+  const std::vector<double> inner = numbers(r["innerPaths"]);
+  for (double n : inner) CHECK(n <= r["innerBudgetPerDate"].numberData());
+  CHECK(inner[0] == 0.0 && inner[1] > 0.0);  // t = 0 is plain Monte Carlo
+  bool listed = false;
+  for (const auto& f : ccr::app::functions()) listed = listed || f == "nestedExposure";
+  CHECK(listed);
+}
+
+TEST(app_xva_audits_the_nested_initial_margin) {
+  Value spec = baseSpec();
+  spec.set("trades", list({swap("s", 1e7, 4, "payer"), forward("f", 5e6, 3)}));
+  spec.set("analysis", "xva");
+  spec.set("imInnerPaths", 32);
+  spec.set("imAudit", true);
+  spec.set("imAuditPaths", 64);
+  spec.set("imAuditInnerPaths", 256);
+  const Value x = ccr::app::call("cpuKernels", spec);
+  CHECK(x["error"].isUndefined());
+  const Value& audit = x["imAudit"];
+  CHECK(!audit.isUndefined() && audit["paths"].numberData() == 64);
+  const std::vector<double> ratio = numbers(audit["ratio"]);
+  double mean = 0.0;
+  for (double c : ratio) mean += c / static_cast<double>(ratio.size());
+  CHECK(mean > 1.0);  // 32 inner samples underestimate the 99% quantile
+  CHECK(audit["mvaUncorrected"].numberData() < x["xva"]["mva"].numberData());
+  spec.set("imAudit", false);
+  CHECK(ccr::app::call("cpuKernels", spec)["imAudit"].isUndefined());
+}

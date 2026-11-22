@@ -45,6 +45,8 @@ add_library(ccr
   src/gpu/fused_exposure.cpp
   src/gpu/fused_kernels.cpp
   src/gpu/fused_reference.cpp
+  src/nested/adaptive_nested.cpp
+  src/nested/nested_exposure.cpp
 )
 add_library(ccr::ccr ALIAS ccr)
 target_compile_definitions(ccr PRIVATE CCR_VERSION="${PROJECT_VERSION}")
@@ -100,6 +102,7 @@ if(CCR_BUILD_TESTS)
     tests/test_parallel.cpp
     tests/test_ai.cpp
     tests/test_app.cpp
+    tests/test_nested.cpp
   )
   target_link_libraries(ccr_tests PRIVATE ccr)
   add_test(NAME ccr_tests COMMAND ccr_tests)

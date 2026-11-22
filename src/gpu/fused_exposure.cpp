@@ -231,11 +231,19 @@ FusedPlan compile(const ExposureEngine& engine, const NettingSet& nettingSet, co
 
   const TimeGrid reporting = engine.reportingGrid(nettingSet);
   if (options.imInnerPaths > 0) {
-    if (options.imInnerPaths > kMaxInnerPaths || options.imInnerPaths < 2)
-      throw std::invalid_argument("nested initial margin: 2 to 1024 inner paths");
-    const double rank = options.imQuantile * static_cast<double>(options.imInnerPaths - 1);
-    if (static_cast<double>(options.imInnerPaths - 1) - std::floor(rank) >= static_cast<double>(kInnerTop - 1))
-      throw std::invalid_argument("nested initial margin: the quantile needs more inner paths (keeps the 16 largest)");
+    // The kernel keeps the 16 largest inner samples, so the quantile's order statistic must be among them.
+    auto checkInner = [&](std::size_t n) {
+      if (n > kMaxInnerPaths || n < 2) throw std::invalid_argument("nested initial margin: 2 to 1024 inner paths");
+      const double rank = options.imQuantile * static_cast<double>(n - 1);
+      if (static_cast<double>(n - 1) - std::floor(rank) >= static_cast<double>(kInnerTop - 1))
+        throw std::invalid_argument("nested initial margin: the quantile needs more inner paths (keeps the 16 largest)");
+    };
+    checkInner(options.imInnerPaths);
+    if (options.imAuditPaths > 0) {
+      checkInner(options.imAuditInnerPaths);
+      if (options.imAuditInnerPaths <= options.imInnerPaths)
+        throw std::invalid_argument("nested initial margin: the audit needs more inner paths than the kernel");
+    }
   }
   const TimeGrid grid = simulationGrid(engine, nettingSet, options);
   const std::size_t nT = grid.size();
@@ -449,6 +457,10 @@ FusedPlan compile(const ExposureEngine& engine, const NettingSet& nettingSet, co
     termsAt[j].push_back({double(kProbe), double(what + 16 * static_cast<int>(index)), offset, A, B, double(row), 0.0, 0.0, 0.0, 0.0, 0.0});
   };
   plan.imInnerPaths = options.imInnerPaths;
+  if (options.imInnerPaths > 0 && options.imAuditPaths > 0) {
+    plan.imAuditPaths = options.imAuditPaths;
+    plan.imAuditInnerPaths = options.imAuditInnerPaths;
+  }
   if (options.imInnerPaths > 0) L.conditionalIm = block(nR);
   std::uint32_t deflatorRows = kNoRow;
   if (options.gross || options.tradeViews || options.factorViews || options.imInnerPaths > 0) {
@@ -841,7 +853,36 @@ FusedResult summarise(const FusedPlan& plan, const FusedOutput& output) {
     r.conditionalDiscountedEe.push_back(k && pd > 0 ? r.cvaIncrements[k] / pd : std::numeric_limits<double>::quiet_NaN());
   }
   if (plan.numCredits == 0) r.cvaIncrements.assign(r.cvaIncrements.size(), std::numeric_limits<double>::quiet_NaN());
+  if (plan.imAuditPaths > 0 && !r.conditionalImDiscounted.empty()) {
+    r.conditionalImAuditRatio = auditConditionalIm(plan);
+    r.conditionalImDiscountedUncorrected = r.conditionalImDiscounted;
+    for (std::size_t k = 0; k < r.conditionalImAuditRatio.size(); ++k) {
+      const double c = r.conditionalImAuditRatio[k];
+      r.conditionalImDiscounted[k] *= c;
+      r.conditionalImMean[k] *= c;
+      for (auto& band : r.conditionalImBands) band[k] *= c;
+    }
+  }
   return r;
+}
+
+std::vector<double> auditConditionalIm(const FusedPlan& plan, SpinPool& pool) {
+  if (plan.imAuditPaths == 0 || plan.imInnerPaths == 0 || plan.rows.conditionalIm == kNoRow) return {};
+  // The plan's first paths: the kernel's normals are keyed by path, date and inner index, so these are
+  // the same outer paths, and the audit's first imInnerPaths inner samples are the kernel's own.
+  FusedPlan sub = plan;
+  sub.imAuditPaths = 0;  // no audit of the audit
+  sub.numPaths = std::min(plan.numPaths, plan.imAuditPaths);
+  sub.header[0] = static_cast<std::uint32_t>(sub.numPaths);
+  sub.header[15] = static_cast<std::uint32_t>(sub.numWorkgroups());
+  const std::vector<double> base = summarise(sub, runFusedReference(sub, pool)).conditionalImDiscounted;
+  sub.imInnerPaths = plan.imAuditInnerPaths;
+  sub.header[30] = static_cast<std::uint32_t>(plan.imAuditInnerPaths);
+  const std::vector<double> audited = summarise(sub, runFusedReference(sub, pool)).conditionalImDiscounted;
+  std::vector<double> ratio(base.size(), 1.0);
+  for (std::size_t k = 0; k < base.size(); ++k)
+    if (base[k] > 0.0 && audited[k] > 0.0) ratio[k] = audited[k] / base[k];
+  return ratio;
 }
 
 double FusedResult::pathwiseCva(double recovery) const {
